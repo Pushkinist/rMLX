@@ -89,7 +89,7 @@ These flags exist only in a binary built with
 | `--gpu-capture-skip` | u32 | `4` | Decode steps before the window. Requires `--gpu-capture`. |
 | `--gpu-capture-steps` | u32 | `8` | Decode steps in the window. Requires `--gpu-capture`. |
 
-The process needs `MTL_CAPTURE_ENABLED=1` at launch; `scripts/gpu_capture.sh`
+The process needs `MTL_CAPTURE_ENABLED=1` at launch; `scripts/profile/capture.sh gputrace`
 (`make profile-gputrace`) sets it. These fail before the model loads: no
 capture layer, an occupied destination, a missing parent directory, an empty
 window. So does a `--max-tokens` below `skip + steps + 2`.

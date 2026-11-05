@@ -237,7 +237,7 @@ gc_traces() {
 		reason[i]=""
 	done
 	# Only the bundles this tool can evict count: .rmlx/traces/mst/ holds Metal System Trace
-	# bundles with their own retention in scripts/mst_capture.sh.
+	# bundles with their own retention in scripts/profile/capture.sh.
 	total_before=$running_total
 
 	max_total_kb=$((MAX_TOTAL_GB * 1024 * 1024))

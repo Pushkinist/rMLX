@@ -13,11 +13,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `codec_smoke_runner_selftest.sh` | make codec-smoke-runner-selftest | scripts/codec_smoke_runner_selftest.sh — recall test for the verdict of |
 | `convert_silero_vad.py` | by hand | Convert Silero VAD v4 ONNX weights (16kHz branch only) to safetensors. |
 | `gen_lloyd_codebook.py` | none | Generate Lloyd-Max optimal N(0,1) centroids for TurboQuant codebook. |
-| `gpu_capture.sh` | make profile-gputrace, run_class_selftest.sh | Capture a Metal GPU trace of a bounded window of steady-state decode, for |
-| `gputrace_preflight.sh` | make build-capture, make gputrace-preflight, gpu_capture.sh | Check the host prerequisites for Apple's GPU tools to work with a Metal capture of this binary. |
-| `mst_capture.sh` | make profile-mst, run_class_selftest.sh | Record a Metal System Trace of a live rmlx run, export the GPU-interval table |
 | `perf_ceiling.py` | check/engine_parity_selftest.sh, published/table.py | Theoretical decode/prefill ceiling calculator for rMLX on Apple Silicon. |
-| `rmlx-capture.entitlements` | make build-capture | Debug-only entitlement for the GPU-capture binary (`make build-capture`). |
 | `run_class_selftest.sh` | make run-class-selftest | run_class_selftest.sh — the producers that run `rmlx` record their runs under |
 | `schema_constraint_canary.sh` | make schema-constraint-canary | Real-model proof for the json_schema constrained-decoding path: two probes, two architectures. |
 | `sdpa_headdim_bench.py` | none | What MLX's SDPA dispatch costs as a function of `head_dim`. |
@@ -78,7 +74,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
-| `host/gc.sh` | make target-gc, make target-size-report, make traces-gc, gpu_capture.sh, host/gc_selftest.sh | Bound a regenerable directory: prune stale target/ profiles, or evict old .rmlx/traces bundles. |
+| `host/gc.sh` | make target-gc, make target-size-report, make traces-gc, host/gc_selftest.sh, profile/capture.sh | Bound a regenerable directory: prune stale target/ profiles, or evict old .rmlx/traces bundles. |
 | `host/gc_selftest.sh` | make gc-selftest | Recall test for the cleanup tools: planted scratch trees, never the real target/ or traces. |
 | `host/mlx_restore_pin.sh` | make mlx-restore-pin, host/mlx_restore_pin_selftest.sh | Restore the MLX and mlx-c pair named by crates/rmlx-mlx/mlx-pin.txt, then link and pin those kegs. |
 | `host/mlx_restore_pin_selftest.sh` | make mlx-restore-pin-selftest | Recall test for mlx_restore_pin.sh: throwaway prefixes, stub brew, asserting exit and records. |
@@ -108,13 +104,12 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/kv_boundary_default.py` | ingest/ingest.py | The engine's default KV boundary-layer counts, read from the engine. |
 | `lib/metal_dirs.sh` | check/kernel_dispatch.sh, check/metal_kernels.sh, check/metal_kernels_selftest.sh, +1 more scripts | The directories holding gated .metal kernels; sourced by the metal gates. |
 | `lib/mlx_pin.sh` | crates/rmlx-mlx/src/pin_tests.rs, host/mlx_restore_pin.sh | Read the validated MLX / mlx-c pair from its one declaration. |
-| `lib/prefill_ms.py` | mst_capture.sh | Read the prefill time of an rmlx run out of its log: `generate: prefill{prefill_ms}`. |
-| `lib/published_run_log.py` | lib/prefill_ms.py, published/bench.sh, published/binary_identity.py, +1 more scripts | Read one rmlx run log back as a per-request table. |
+| `lib/published_run_log.py` | profile/prefill_ms.py, published/bench.sh, published/binary_identity.py, +1 more scripts | Read one rmlx run log back as a per-request table. |
 | `lib/record_pending.sh` | crates/rmlx-cli/src/exit_tests.rs, bench/ab.sh, bench/baseline_cells.sh, bench/prefill_chunk_sweep.sh, +3 more scripts | The exit code `rmlx baseline --record` and `rmlx eval ppl --corpus` give a |
 | `lib/recorder_check.py` | ingest/ingest.py, ingest/llama_bench.py | Refuse a recorder that cannot state a run class. |
 | `lib/rmlx_home.py` | ingest/ingest.py, ingest/llama_bench.py | Resolve the runtime home the way the binary does. |
 | `lib/run_log_for_pid.py` | lib/bench_server.sh | Pick the run log a given process wrote, out of the candidates on stdin. |
-| `lib/selftest_support.sh` | bench/baseline_cells_selftest.sh, bench/cross_backend_selftest.sh, bench/llama_ab_selftest.sh, +21 more scripts | The case runner and shims the self-tests share; source it. |
+| `lib/selftest_support.sh` | bench/baseline_cells_selftest.sh, bench/cross_backend_selftest.sh, bench/llama_ab_selftest.sh, +22 more scripts | The case runner and shims the self-tests share; source it. |
 | `lib/server_kv_quant.py` | lib/bench_server.sh, published/binary_identity.py, ssd_canary.sh | Read the KV codec a run resolved out of its rmlx run log. |
 | `lib/server_sampling.py` | crates/rmlx-server/src/engine/sampler_event_tests.rs, bench/serve_bench.sh, lib/published_run_log.py | Read whether a run's requests were sampled, out of its rmlx run log. |
 | `lib/skip_notice_patterns.sh` | check/gpu_tests.sh, suite/run_gpu_tests.sh | The SKIP and WAIVED stand-down notice patterns, defined once for the runner and the gate. |
@@ -127,8 +122,12 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
+| `profile/capture.sh` | make build-capture, make gputrace-preflight, make profile-gputrace, make profile-mst, profile/capture_selftest.sh | Launch rmlx under a GPU instrument: a Metal capture, a Metal System Trace, or the host preflight |
+| `profile/capture_selftest.sh` | make profile-capture-selftest | Recall test for the GPU-instrument launcher: both captures and the host preflight, against shims |
 | `profile/gputrace.sh` | profile/gputrace_selftest.sh | Read a .gputrace bundle offline: the Metal functions it names, a diff of two, or a summary. |
 | `profile/gputrace_selftest.sh` | make gputrace-selftest | Recall test for the .gputrace readers: synthetic bundles, no trace, no Xcode tool, no GPU. |
+| `profile/prefill_ms.py` | profile/capture.sh | Read the prefill time of an rmlx run out of its log: `generate: prefill{prefill_ms}`. |
+| `profile/rmlx-capture.entitlements` | make build-capture | Debug-only entitlement for the GPU-capture binary (`make build-capture`). |
 
 ## scripts/published/
 

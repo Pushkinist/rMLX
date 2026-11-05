@@ -1,11 +1,13 @@
 """Read the prefill time of an rmlx run out of its log: `generate: prefill{prefill_ms}`.
 
+Module of: profile/capture.sh
+
 Nothing in a Metal System Trace marks where prefill ends: weight load submits no
 GPU work, so the traced process's very first row is already prefill. The run
 itself knows the boundary and writes it as the `generate: prefill` event of each
 request, which lands in `<RMLX_HOME>/logs/<run-id>.jsonl` even when
-`xctrace --launch` has swallowed the child's stdout. `scripts/mst_capture.sh`
-uses this to default `--skip-ms` to a measured value rather than a guessed one.
+`xctrace --launch` has swallowed the child's stdout. `capture.sh mst` uses this
+to default `--skip-ms` to a measured value rather than a guessed one.
 
 The event is matched by its exact message, so no other event that happens to
 carry a `prefill_ms` field can be read as this one.
@@ -18,7 +20,7 @@ rather than silently summarising a window that still contains prefill.
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 
 import published_run_log  # noqa: E402
 

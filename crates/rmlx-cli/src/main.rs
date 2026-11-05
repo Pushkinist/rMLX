@@ -1339,7 +1339,7 @@ enum Cmd {
         ///
         /// The process must have been launched with `MTL_CAPTURE_ENABLED=1`;
         /// Metal inserts the capture layer at launch and cannot do so later.
-        /// `scripts/gpu_capture.sh` handles both.
+        /// `scripts/profile/capture.sh gputrace` handles both.
         ///
         /// Capture serialises every dispatch, so every timing this command
         /// measures is false: the run needs `--record --run-class diagnostic`,

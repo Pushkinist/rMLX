@@ -17,15 +17,11 @@ class codec_smoke_runner_selftest.sh
 class convert_silero_vad.py
 class eval/wikitext2_ppl.py
 class gen_lloyd_codebook.py
-class gpu_capture.sh
-class gputrace_preflight.sh
-class mst_capture.sh
 class perf_ceiling.py
 class release_e2e/stage6_perf/codec_smoke_runner.sh
 class release_e2e/stage6_perf/kv_codec_matrix.toml
 class release_e2e/stage6_perf/niah_long_context.sh
 class release_e2e/stage6_perf/smoke_prompts.toml
-class rmlx-capture.entitlements
 class schema_constraint_canary.sh
 class sdpa_headdim_bench.py
 class ssd_canary.sh
@@ -33,8 +29,6 @@ class ssd_canary_selftest.sh
 class run_class_selftest.sh
 purpose bench_identity_selftest.sh
 purpose codec_smoke_runner_selftest.sh
-purpose gpu_capture.sh
-purpose mst_capture.sh
 purpose bench/prefill_chunk_sweep.sh
 purpose lib/record_pending.sh
 purpose run_class_selftest.sh
@@ -46,14 +40,12 @@ usage check/gpu_device_census_selftest.sh
 usage codec_smoke_runner_selftest.sh
 usage eval/wikitext2_ppl.py
 usage suite/eval_lock_stress.sh
-usage lib/prefill_ms.py
 usage lib/published_run_log.py
 usage lib/run_log_for_pid.py
 usage lib/server_kv_quant.py
 usage lib/server_sampling.py
 usage lib/snapshot_identity.py
 usage lib/spec_round_log.py
-usage mst_capture.sh
 usage bench/ab.sh
 usage bench/prefill_chunk_sweep.sh
 usage release/release_cpu.py
@@ -76,8 +68,6 @@ exit-undeclared codec_smoke_runner_selftest.sh 0,1
 exit-undeclared eval/wikitext2_ppl.py 1
 exit-undeclared suite/eval_lock_stress.sh 1
 exit-undeclared gen_lloyd_codebook.py 1
-exit-undeclared gpu_capture.sh 1,2
-exit-undeclared mst_capture.sh 0,1,2,75
 exit-undeclared bench/ab.sh 0,1,125
 exit-undeclared bench/prefill_chunk_sweep.sh 0,125
 exit-undeclared release_e2e/stage6_perf/codec_smoke_runner.sh 0,1,2,3
@@ -102,9 +92,7 @@ recall-missing codec_smoke_runner_selftest.sh default
 recall-missing run_class_selftest.sh default
 silenced published/table.py default
 silenced report/debt_report.py --file-sizes,default
-lib-consumers lib/prefill_ms.py
 lib-consumers lib/run_log_for_pid.py
-lib-run lib/prefill_ms.py mst_capture.sh
 lib-run lib/published_run_log.py published/bench.sh
 lib-run lib/run_log_for_pid.py lib/bench_server.sh
 lib-run lib/server_kv_quant.py lib/bench_server.sh,ssd_canary.sh
@@ -122,9 +110,6 @@ set-mode bench/llama_ab.sh
 set-mode bench/llama_ab_selftest.sh
 set-mode check/gpu_device_census.sh
 set-mode codec_smoke_runner_selftest.sh
-set-mode gpu_capture.sh
-set-mode gputrace_preflight.sh
-set-mode mst_capture.sh
 set-mode bench/ab.sh
 set-mode bench/prefill_chunk_sweep.sh
 set-mode schema_constraint_canary.sh
@@ -135,7 +120,7 @@ set-mode run_class_selftest.sh
 name bench/llama_ab_selftest.sh ROOT
 name eval/wikitext2_ppl.py workspace
 name lib/kv_boundary_default.py _REPO_ROOT
-name rmlx-capture.entitlements hyphen
+name profile/rmlx-capture.entitlements hyphen
 name suite/run_gpu_tests_selftest.sh ROOT
 name spec/broken_engine.sh ROOT
 size bench/ab.sh 1054
@@ -176,9 +161,7 @@ binary-literal bench_identity_selftest.sh 1
 binary-literal bench/llama_ab.sh 2
 binary-literal codec_smoke_runner_selftest.sh 2
 binary-literal eval/wikitext2_ppl.py 2
-binary-literal gpu_capture.sh 1
-binary-literal gputrace_preflight.sh 1
-binary-literal mst_capture.sh 2
+binary-literal profile/capture.sh 2
 binary-literal bench/ab.sh 2
 binary-literal bench/prefill_chunk_sweep.sh 2
 binary-literal release/release.sh 1
@@ -188,7 +171,7 @@ binary-literal schema_constraint_canary.sh 1
 binary-literal bench/serve_bench.sh 1
 binary-literal published/bench.sh 1
 binary-literal ssd_canary.sh 1
-binary-literal run_class_selftest.sh 2
+binary-literal run_class_selftest.sh 1
 env-knob bench/cross_backend.sh CROSS_BENCH_ROOT,LLAMA_CPP_ROOT,LLAMA_CPP_TURBOQUANT_ROOT,MLX_LM_ROOT,MLX_LM_TURBOQUANT_ROOT,OMLX_ROOT,PAROQUANT_ROOT,RMLX_HOME
 env-knob bench/llama_ab.sh RMLX_HOME
 env-knob bench/llama_ab_selftest.sh FORCE_UNMEASURED_ROWS,NO_RECORD_ARGS
@@ -201,7 +184,7 @@ env-knob lib/identity.sh RMLX_IDENTITY_JSON
 env-knob lib/kv_boundary_default.py RMLX_REPO_ROOT
 env-knob lib/selftest_support.sh TOOL
 env-knob host/mlx_restore_pin.sh HOMEBREW_PREFIX
-env-knob mst_capture.sh RMLX_HOME
+env-knob profile/capture.sh RMLX_HOME
 env-knob bench/ab.sh RMLX_HOME,RMLX_O_MODELS_ROOT
 env-knob bench/prefill_chunk_sweep.sh RMLX_HOME
 env-knob published/table_selftest.sh MAKE_ENV
@@ -215,7 +198,6 @@ env-knob ssd_canary.sh PORT,SSD_GB,VERIFIER_MODEL
 env-knob bench_identity_selftest.sh STUB_CRASH_MEASURED,STUB_FAIL_GATE,STUB_FAIL_MEASURED,STUB_TURBO_NO_TPS
 env-knob lib/rmlx_home.py RMLX_HOME
 unguarded-array published/samples_selftest.sh args
-unguarded-array mst_capture.sh run_cmd
 unguarded-array bench/ab.sh A_KV,A_MEM,A_TPS,B_KV,B_MEM,B_TPS,MODELS,record
 unguarded-array bench/ab_selftest.sh COMMON
 unguarded-array published/table_selftest.sh inputs

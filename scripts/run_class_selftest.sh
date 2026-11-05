@@ -5,8 +5,6 @@
 # Each case drives the real script against a stub `rmlx` that logs the argv it
 # was handed, and asserts what the script asked for or wrote:
 #
-#   - gpu_capture.sh and mst_capture.sh run `baseline --record --run-class
-#     diagnostic`, and keep their trace when its record did not land, ending 75.
 #   - bench/baseline_cells.sh --measure inertness records each run as diagnostic,
 #     and keeps a measured run's status apart from its record's (`landed` or
 #     `pending`).
@@ -59,16 +57,10 @@ set -eu
 case "$1" in
 claim) shift 3; exec "$@" ;;
 baseline)
-	if [ "${2:-}" = --help ]; then echo "  --gpu-capture <PATH>  --record  --run-class <CLASS>"; exit 0; fi
 	printf '%s\n' "$*" >>"$ARGV_LOG"
 	case " $* " in *" --kv-quant ${STUB_NO_MEASURE:-none-matches} "*) echo "error: load failed" >&2; exit 1 ;; esac
 	echo "baseline: model=stub  ttft_ms=1  decode_tps=10.0  prefill_tps=1.0  prompt_tokens=4200  kv_cache_bytes=1000"
 	echo "baseline: token_ids=1,2,3"
-	prev=""
-	for a in "$@"; do
-		[ "$prev" = --gpu-capture ] && mkdir -p "$a"
-		prev="$a"
-	done
 	case " $* " in *" --kv-quant ${STUB_NO_INGEST:-none-matches} "*)
 		echo "error: baseline: measured, but the record did not reach runs.db; it is kept at /x/pending/stub.json for \`rmlx metrics record --replay-pending\`" >&2
 		echo "rMLX exits with code 75." >&2
@@ -79,157 +71,6 @@ esac
 STUB
 	chmod +x "$1"
 }
-
-# ── gpu_capture.sh ────────────────────────────────────────────────────────────
-#
-# The script runs the binary at a fixed path under its own repo root, so it is
-# driven from a fake root whose scripts are the real ones, with the host
-# preflight replaced by a stub that passes.
-FAKE="$WORK/repo"
-mkdir -p "$FAKE/scripts" "$FAKE/target/release-debug"
-for f in "$REPO_ROOT"/scripts/*; do
-	ln -s "$f" "$FAKE/scripts/$(basename "$f")"
-done
-rm "$FAKE/scripts/gputrace_preflight.sh"
-printf '#!/usr/bin/env bash\nexit 0\n' >"$FAKE/scripts/gputrace_preflight.sh"
-make_rmlx "$FAKE/target/release-debug/rmlx"
-
-ARGV_LOG="$WORK/gpu_capture.argv"
-: >"$ARGV_LOG"
-set +e
-ARGV_LOG="$ARGV_LOG" bash "$FAKE/scripts/gpu_capture.sh" --kv-quant none --model "$MODEL" \
-	--out-dir "$WORK/traces" --keep-all >"$WORK/gpu_capture.out" 2>&1
-status=$?
-set -e
-bad=""
-[ "$status" -eq 0 ] || bad="exit=$status: $(tail -2 "$WORK/gpu_capture.out" | tr '\n' ' ')"
-grep -q -- '--record --run-class diagnostic --label gpu_capture:' "$ARGV_LOG" ||
-	bad="${bad:+$bad; }baseline argv: $(cat "$ARGV_LOG")"
-verdict gpu_capture_records_diagnostic "the capture run is recorded as diagnostic" "$bad"
-
-set +e
-STUB_NO_INGEST=none ARGV_LOG="$ARGV_LOG" bash "$FAKE/scripts/gpu_capture.sh" --kv-quant none --model "$MODEL" \
-	--out-dir "$WORK/traces_pending" --keep-all >"$WORK/gpu_capture_pending.out" 2>&1
-status=$?
-set -e
-bad=""
-[ "$status" -eq 75 ] || bad="exit=$status (want 75: captured, record pending)"
-grep -q 'WARNING: the capture succeeded, but its diagnostic record did not land' "$WORK/gpu_capture_pending.out" ||
-	bad="${bad:+$bad; }no warning"
-grep -q '^retention:' "$WORK/gpu_capture_pending.out" || bad="${bad:+$bad; }the retention step did not run"
-grep -q '^done: ' "$WORK/gpu_capture_pending.out" || bad="${bad:+$bad; }the trace was not reported"
-verdict gpu_capture_with_a_pending_record_keeps_its_trace "a capture whose record did not land keeps its trace, runs its retention and ends 75" "$bad"
-
-# ── mst_capture.sh ────────────────────────────────────────────────────────────
-#
-# `xcrun` is a shim: `-f xctrace` answers, and `xctrace record --launch -- cmd`
-# logs the launched argv. No trace is written, so the script stops after the
-# recording; the case reads only what it launched.
-mkdir -p "$WORK/xcbin"
-cat >"$WORK/xcbin/xcrun" <<'SHIM'
-#!/usr/bin/env bash
-[ "$1" = -f ] && exit 0
-if [ "$1 $2" = "xctrace record" ]; then
-	while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done
-	shift
-	printf '%s\n' "$*" >>"$XCRUN_LOG"
-fi
-exit 0
-SHIM
-chmod +x "$WORK/xcbin/xcrun"
-MST_BIN="$WORK/rmlx_mst"
-make_rmlx "$MST_BIN"
-XCRUN_LOG="$WORK/mst.launch"
-: >"$XCRUN_LOG"
-set +e
-PATH="$WORK/xcbin:$PATH" XCRUN_LOG="$XCRUN_LOG" ARGV_LOG="$WORK/mst.argv" RMLX_HOME="$WORK/home" \
-	bash "$REPO_ROOT/scripts/mst_capture.sh" --model "$MODEL" --binary "$MST_BIN" \
-	>"$WORK/mst.out" 2>&1
-set -e
-bad=""
-grep -q -- 'baseline --record --run-class diagnostic --label mst_capture:' "$XCRUN_LOG" ||
-	bad="launched argv: $(cat "$XCRUN_LOG"); $(tail -2 "$WORK/mst.out" | tr '\n' ' ')"
-verdict mst_capture_records_diagnostic "the traced run is launched recording as diagnostic" "$bad"
-
-# xctrace hides the child's exit code, so a record that did not land is found as
-# the buffer file carrying this run's label. The shim stands in for the child:
-# it writes under the RMLX_HOME it was handed with --env (else the inherited
-# one), then a second process's newer log and buffer file. A `cargo` stub
-# stands in for the summariser.
-cat >"$WORK/xcbin/xcrun" <<'SHIM'
-#!/usr/bin/env bash
-[ "$1" = -f ] && exit 0
-out="" home="" label=""
-args=("$@")
-for ((i = 0; i < ${#args[@]}; i++)); do
-	case "${args[$i]}" in
-	--output) out="${args[$((i + 1))]}" ;;
-	--env) case "${args[$((i + 1))]}" in RMLX_HOME=*) home="${args[$((i + 1))]#RMLX_HOME=}" ;; esac ;;
-	--label) label="${args[$((i + 1))]}" ;;
-	esac
-done
-case "$1 $2" in
-"xctrace record")
-	mkdir -p "$out"
-	printf '%s\n' "$*" >"$RMLX_HOME.xctrace_argv"
-	home="${home:-$RMLX_HOME}"
-	mkdir -p "$home/logs" "$home/metrics/buffer/pending"
-	this="$home/logs/20261024-000000-9.9.9.jsonl"
-	printf '%s\n' "{\"fields\":{\"message\":\"rmlx start\",\"cmd\":\"Baseline { label: Some(\\\"$label\\\") }\"}}" \
-		'{"fields":{"message":"generate: prefill","prefill_ms":123.4}}' >"$this"
-	if [ "$STUB_MST_MODE" = pending ]; then
-		printf '{"notes": "label=%s"}\n' "$label" >"$home/metrics/buffer/pending/this.json"
-		printf '%s\n' '{"fields":{"message":"baseline: record did not land","buffer":"this.json"}}' >>"$this"
-	else
-		printf '{"notes": "label=perf_ab:other:A:1"}\n' >"$home/metrics/buffer/pending/other.json"
-	fi
-	other="$home/logs/20261024-000001-9.9.9.jsonl"
-	printf '%s\n' '{"fields":{"message":"rmlx start","cmd":"Info"}}' >"$other"
-	[ "$STUB_MST_MODE" = pending ] ||
-		printf '%s\n' '{"fields":{"message":"baseline: record did not land","buffer":"other.json"}}' >>"$other"
-	touch -t 203001010000 "$other"
-	;;
-"xctrace export") [ -n "${STUB_MST_NO_EXPORT:-}" ] || printf '<trace/>\n' >"$out" ;;
-esac
-exit 0
-SHIM
-mkdir -p "$WORK/cargobin"
-printf '#!/usr/bin/env bash\necho "stub summary"\n' >"$WORK/cargobin/cargo"
-chmod +x "$WORK/cargobin/cargo"
-
-# mst_case <mode> <home> [no-export] — runs the script; sets $status and writes <home>.out.
-mst_case() {
-	set +e
-	PATH="$WORK/xcbin:$WORK/cargobin:$PATH" STUB_MST_MODE="$1" STUB_MST_NO_EXPORT="${3:-}" ARGV_LOG="$WORK/mst.argv" RMLX_HOME="$2" \
-		bash "$REPO_ROOT/scripts/mst_capture.sh" --model "$MODEL" --binary "$MST_BIN" \
-		--out-dir "$2.traces" >"$2.out" 2>&1
-	status=$?
-	set -e
-}
-
-mst_case pending "$WORK/mst_home"
-bad=""
-[ "$status" -eq 75 ] || bad="exit=$status (want 75: traced, record pending): $(tail -3 "$WORK/mst_home.out" | tr '\n' ' ')"
-grep -q "^record pending: $WORK/mst_home/metrics/buffer/pending/this.json\$" "$WORK/mst_home.out" ||
-	bad="${bad:+$bad; }this run's buffer file is not named alone"
-grep -q '^bundle: ' "$WORK/mst_home.out" || bad="${bad:+$bad; }the trace was not reported"
-grep -qF -- "--env RMLX_HOME=$WORK/mst_home " "$WORK/mst_home.xctrace_argv" ||
-	bad="${bad:+$bad; }the child was not handed RMLX_HOME"
-grep -q '^skip: *123 ms' "$WORK/mst_home.out" || bad="${bad:+$bad; }the prefill was not read from this run's log"
-verdict mst_capture_with_a_pending_record_keeps_its_trace "a traced run whose record did not land is found by its label, past a newer log of another process, and ends 75" "$bad"
-
-mst_case other "$WORK/mst_home_other"
-bad=""
-[ "$status" -eq 0 ] || bad="exit=$status (want 0: this run's record landed): $(tail -3 "$WORK/mst_home_other.out" | tr '\n' ' ')"
-! grep -q 'record pending' "$WORK/mst_home_other.out" || bad="${bad:+$bad; }another process's buffer file was named as this run's"
-verdict mst_capture_ignores_another_runs_pending_record "a traced run whose record landed is not charged with another process's pending record" "$bad"
-
-mst_case pending "$WORK/mst_home_noexport" 1
-bad=""
-[ "$status" -eq 1 ] || bad="exit=$status (want 1: the export failed)"
-grep -q "^record pending: $WORK/mst_home_noexport/metrics/buffer/pending/this.json\$" "$WORK/mst_home_noexport.out" ||
-	bad="${bad:+$bad; }a failed export hid the pending buffer file"
-verdict mst_capture_names_a_pending_record_when_the_export_fails "a traced run whose export failed still names its pending buffer file" "$bad"
 
 # ── baseline_cells.sh --measure inertness ─────────────────────────────────────
 PROBE_BIN="$WORK/rmlx_probe"

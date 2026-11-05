@@ -250,7 +250,7 @@ pub fn validate(path: &Path, layer_inserted: bool, steps: u32) -> Result<()> {
             "GPU capture requested but Apple's Metal capture layer is not inserted in \
              this process. Relaunch with MTL_CAPTURE_ENABLED=1 in the environment \
              (Metal reads it at launch and it cannot be inserted afterwards), or use \
-             scripts/gpu_capture.sh, which sets it."
+             scripts/profile/capture.sh gputrace, which sets it."
                 .to_owned(),
         ));
     }

@@ -161,14 +161,14 @@ To capture:
    run aborts before loading the model.
 
 For Apple's GPU tools to attach to the process, checked by
-`make gputrace-preflight` (`scripts/gputrace_preflight.sh`):
+`make gputrace-preflight` (`scripts/profile/capture.sh preflight`):
 
 3. Full Xcode selected: `sudo xcode-select -s
    /Applications/Xcode.app/Contents/Developer`.
 4. Developer mode: `sudo DevToolsSecurity -enable`.
 5. The binary signed with `com.apple.security.get-task-allow`. Cargo emits a
    linker-signed binary with no entitlements. `make build-capture` re-signs it
-   with `scripts/rmlx-capture.entitlements`, and re-running it repairs a
+   with `scripts/profile/rmlx-capture.entitlements`, and re-running it repairs a
    binary a plain `cargo build` re-created. Check with
    `codesign -d --entitlements - target/release-debug/rmlx`.
 6. The Metal toolchain, for the shader recompile a replay does
@@ -180,7 +180,7 @@ For Apple's GPU tools to attach to the process, checked by
 ```sh
 make profile-gputrace CODEC=iso3_sym MODEL=/path/to/snapshot
 # or, with the window spelled out:
-bash scripts/gpu_capture.sh --kv-quant iso3_sym --model /path/to/snapshot \
+bash scripts/profile/capture.sh gputrace --kv-quant iso3_sym --model /path/to/snapshot \
   --prompt-tokens 4096 --skip 4 --steps 8
 ```
 
@@ -229,11 +229,11 @@ on the replay's schedule. Host round-trips, such as a blocking
 ```sh
 make profile-mst MODEL=/path/to/snapshot
 # or, spelled out:
-bash scripts/mst_capture.sh --model /path/to/snapshot --kv-quant none \
+bash scripts/profile/capture.sh mst --model /path/to/snapshot --kv-quant none \
   --prompt-tokens 4096 --max-tokens 600 --time-limit 18
 ```
 
-`mst_capture.sh` records the live process, exports the `metal-gpu-intervals`
+`capture.sh mst` records the live process, exports the `metal-gpu-intervals`
 table, parses it and prints a per-channel table and a CSV. The table gives
 each submission's `start` and `duration` in nanoseconds, `gpu-channel-name`,
 `start-latency`, `cmdbuffer-id` and `encoder-id`. One row is one encoder.
@@ -296,7 +296,7 @@ structure it reads and fails by name when the layout moves.
 | `bash scripts/profile/gputrace.sh summary <bundle>` | What was captured (from the harness file name), total and command-stream size, and whether a `.gpuprofiler_raw` is present. |
 | `bash scripts/profile/gputrace.sh kernels <bundle>` | Which Metal functions the window referenced, and which it recorded as unused. `--set used\|unused\|all`, `--names-only`. |
 | `bash scripts/profile/gputrace.sh diff <a> <b>` | What A's window referenced that B's did not, and the reverse. |
-| `bash scripts/gputrace_preflight.sh` | The host prerequisites above, each with its fix. Also `make gputrace-preflight`. |
+| `bash scripts/profile/capture.sh preflight` | The host prerequisites above, each with its fix. Also `make gputrace-preflight`. |
 
 Some function records store their name by object id. The scripts count and
 report those (`… 46 named, 12 stored by object id`), so the named list is a
@@ -305,7 +305,7 @@ answerable offline, how many times is not.
 
 ### Keeping `.rmlx/traces` bounded
 
-- `scripts/gpu_capture.sh` keeps the newest 6 bundles and at most 40 GB after
+- `capture.sh gputrace` keeps the newest 6 bundles and at most 40 GB after
   each capture. Eviction is oldest-first, never the bundle just written, and
   each removal is printed.
 - `--keep-all` (`make profile-gputrace … KEEP_ALL=1`) skips the cap.
@@ -532,8 +532,8 @@ user rather than report the counters as unavailable.
 ### Capture
 
 ```bash
-bash scripts/gputrace_preflight.sh
-bash scripts/gpu_capture.sh --kv-quant <codec> --model <snapshot> \
+bash scripts/profile/capture.sh preflight
+bash scripts/profile/capture.sh gputrace --kv-quant <codec> --model <snapshot> \
      --prompt-tokens 8192 --skip 32 --steps 8 --keep-all
 ```
 

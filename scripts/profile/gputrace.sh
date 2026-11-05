@@ -34,7 +34,7 @@
 #         bash scripts/profile/gputrace.sh summary <bundle.gputrace> [<bundle.gputrace> ...]
 # Exit:   0 done; 1 diff could not make its scratch directory; 2 usage or no such bundle; 3 bundle layout not understood
 # Set:    -uo — a failed parse is a status the code reads and reports, not a reason to stop
-# Not a mode of: gpu_capture.sh — that one records a bundle on the GPU; this one only reads a finished one
+# Not a mode of: profile/capture.sh — that one records a bundle on the GPU; this one only reads a finished one
 
 set -uo pipefail
 

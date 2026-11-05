@@ -757,7 +757,7 @@ change to what `bests` publishes, such as a `METRICS_SCHEMA.md` §4.1 bounds cha
     - `scripts/schema_constraint_canary.sh`: a correctness proof run under
       `--log verbose` in a hermetic `RMLX_HOME` per probe, so that probe's
       log holds its own records only. It measures no rate.
-    - A `scripts/mst_capture.sh` run its `--time-limit` stops: `baseline`
+    - A `scripts/profile/capture.sh mst` run its `--time-limit` stops: `baseline`
       records at exit.
     - A `scripts/bench/ab.sh` arm whose binary predates `--run-class`, and any
       `--synthetic-arms` run: an old binary cannot state a class, and a stub

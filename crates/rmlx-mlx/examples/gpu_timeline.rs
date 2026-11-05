@@ -8,7 +8,7 @@
 //!     --input gpu.xml --process rmlx --csv gpu.csv
 //! ```
 //!
-//! `scripts/mst_capture.sh` drives record + export + this, and is the intended
+//! `scripts/profile/capture.sh mst` drives record + export + this, and is the intended
 //! entry point.
 
 // A user-facing CLI tool: stdout IS its output, which CLAUDE.md permits for

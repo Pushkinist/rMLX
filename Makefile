@@ -95,7 +95,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         build-perf build-debug test-perf ci-perf gpu-test claim-rmlx model-check model-check-full \
         profile-samply profile-samply-debug profile-instruments bench asm perf-iter \
         canary canary-gate canary-ab canary-ab-selftest canary-ab-ingest-selftest ingest-selftest \
-        canary-ab-host-gate-fixtures codec-smoke-runner-selftest llama-ab-selftest spec-bench-selftest bench-identity-selftest baseline-cells-selftest cross-backend-selftest prefill-chunk-sweep-selftest run-class-selftest \
+        canary-ab-host-gate-fixtures codec-smoke-runner-selftest llama-ab-selftest spec-bench-selftest bench-identity-selftest baseline-cells-selftest cross-backend-selftest prefill-chunk-sweep-selftest profile-capture-selftest run-class-selftest \
         spec-bench-published-selftest published-ingest-selftest \
         published-table check-published-table published-table-selftest \
         check-spec-metric-parity check-spec-metric-parity-fixtures \
@@ -162,12 +162,12 @@ target-size-report: ## advisory: print target/ size + hint when over threshold (
 # `cargo build` re-created without it.
 build-capture: ## build + entitle the debug-only GPU-capture binary (release-debug + metal-capture, signed so Apple's GPU tools can attach)
 	cargo build --profile release-debug --features rmlx-cli/metal-capture
-	codesign --force --sign - --entitlements scripts/rmlx-capture.entitlements \
+	codesign --force --sign - --entitlements scripts/profile/rmlx-capture.entitlements \
 		target/release-debug/rmlx
-	@bash scripts/gputrace_preflight.sh --binary target/release-debug/rmlx
+	@bash scripts/profile/capture.sh preflight --binary target/release-debug/rmlx
 
 gputrace-preflight: ## check the GPU-tools prerequisites (developer mode, get-task-allow, Xcode selected, Metal toolchain)
-	@bash scripts/gputrace_preflight.sh $(if $(BIN),--binary $(BIN),)
+	@bash scripts/profile/capture.sh preflight $(if $(BIN),--binary $(BIN),)
 
 traces-gc:       ## report .rmlx/traces against the retention caps (APPLY=1 to prune; MAX_COUNT=/MAX_TOTAL_GB=/MAX_AGE_DAYS= to retune)
 	bash scripts/host/gc.sh traces $(if $(APPLY),--apply,) $(if $(ALL),--all,) \
@@ -191,7 +191,7 @@ profile-gputrace: ## capture a decode-window Metal GPU trace (CODEC= MODEL= requ
 		echo "Needs a binary from \`make build-capture\`."; \
 		exit 2; \
 	fi
-	bash scripts/gpu_capture.sh --kv-quant $(CODEC) --model $(MODEL) \
+	bash scripts/profile/capture.sh gputrace --kv-quant $(CODEC) --model $(MODEL) \
 		$(if $(PROMPT_TOKENS),--prompt-tokens $(PROMPT_TOKENS),) \
 		$(if $(SKIP),--skip $(SKIP),) $(if $(STEPS),--steps $(STEPS),) \
 		$(if $(GEN),--gen $(GEN),) $(if $(KEEP_ALL),--keep-all,)
@@ -210,13 +210,13 @@ profile-gputrace: ## capture a decode-window Metal GPU trace (CODEC= MODEL= requ
 # PROMPT_TOKENS must be a size with a checked-in prompt fixture.
 # MODEL falls back to the workspace default like `make serve` / `make info`, so
 # there is no "MODEL is required" guard to write here — it could never fire.
-# scripts/mst_capture.sh validates the snapshot path and every numeric argument.
+# scripts/profile/capture.sh mst validates the snapshot path and every numeric argument.
 #
 #   make profile-mst MODEL=<snapshot-abs-path> [CODEC=none] [TIME_LIMIT=18]
 #     [SKIP_MS=<default: the run's measured prefill_ms>] [GEN=600] [KEEP=5]
 #     [PROMPT_TOKENS=4096|8192|16384|32768|65536|131072]
 profile-mst: ## record a Metal System Trace of a live rmlx run and summarise GPU time + CPU->GPU gap (CODEC= TIME_LIMIT= SKIP_MS= PROMPT_TOKENS= GEN= KEEP=)
-	bash scripts/mst_capture.sh --model $(MODEL) \
+	bash scripts/profile/capture.sh mst --model $(MODEL) \
 		$(if $(CODEC),--kv-quant $(CODEC),) \
 		$(if $(TIME_LIMIT),--time-limit $(TIME_LIMIT),) \
 		$(if $(SKIP_MS),--skip-ms $(SKIP_MS),) \
@@ -802,6 +802,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@$(MAKE) --no-print-directory baseline-cells-selftest
 	@$(MAKE) --no-print-directory cross-backend-selftest
 	@$(MAKE) --no-print-directory prefill-chunk-sweep-selftest
+	@$(MAKE) --no-print-directory profile-capture-selftest
 	@$(MAKE) --no-print-directory run-class-selftest
 	@$(MAKE) --no-print-directory spec-bench-published-selftest
 	@$(MAKE) --no-print-directory published-ingest-selftest
@@ -1025,7 +1026,10 @@ cross-backend-selftest: ## recall-check the cross-backend cell tool: the codec n
 prefill-chunk-sweep-selftest: ## recall-check the prefill-chunk sweep: slot order, env name, records, paired verdict, exit codes, a refused record (stub rmlx; no GPU, no model, no DB write)
 	bash scripts/bench/prefill_chunk_sweep_selftest.sh
 
-run-class-selftest: ## check that the capture scripts, the inertness sweep and its ingest record under a stated run class, and record a run once (stub binaries; no GPU, no model, no DB write)
+profile-capture-selftest: ## recall-check the GPU-instrument launcher: both captures' argv, bundle directory and retention, every refusal, and the host preflight (shims; no GPU, no Xcode, no model)
+	bash scripts/profile/capture_selftest.sh
+
+run-class-selftest: ## check that the inertness sweep and its ingest record under a stated run class, and record a run once (stub binaries; no GPU, no model, no DB write)
 	bash scripts/run_class_selftest.sh
 
 spec-bench-published-selftest: ## mutation-check the published-protocol bench against a stub server (no GPU, no model)
