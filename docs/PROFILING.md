@@ -14,7 +14,7 @@ arm occupies it. ABBA puts the same arm in slot 2 of every block, so that
 penalty lands on one arm and looks like a clean result.
 
 - **Two arms**: pair every ABBA block with a BAAB block, so each arm holds
-  each slot position equally often. `scripts/perf_ab.sh` alternates ABBA,
+  each slot position equally often. `scripts/bench/ab.sh` alternates ABBA,
   BAAB, ABBA.
 - **Three or more levels**: run a Latin square. The level index is
   `(position + row) % n_levels`, one row per cycle, so every level holds every
@@ -573,4 +573,4 @@ codec layers over 8 steps is 208 encoders. Store exports under
 Under Serial, limiters, occupancy, registers, SIMD groups, kernel identity
 and dtype are precise. Absolute time and bandwidth are not production
 numbers; compare the ON/OFF ratio. Never compare a profiled millisecond with
-a `perf_ab.sh` millisecond.
+a `bench/ab.sh` millisecond.

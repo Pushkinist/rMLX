@@ -16,7 +16,7 @@
 #         Metal claim); 75 a run measured and its record did not land; 125 the binary is missing.
 #         The inertness sweep ends 0 or 75 whatever its runs did: a run that failed keeps its row.
 #         The cache-types matrix ends 0 or 75 whatever its cells did: a cell that failed keeps its row.
-# Not a mode of: perf_ab.sh — that one interleaves the arms of two builds; this one measures one build
+# Not a mode of: bench/ab.sh — that one interleaves the arms of two builds; this one measures one build
 #
 # --preset canary measures the three test-target models (and the 26b MoE with --include-26b), each
 # on the default KV codec and on k8vturbo3: 1 warmup and 3 measured calls, median decode_tps ±
@@ -85,7 +85,7 @@
 # prompts/longctx_<N/1024>k.json; the context is 8192 up to 4096 prompt tokens, 16384 up to 8192,
 # 32768 up to 16384 and twice the prompt above that.
 #
-# This tool measures one build. Comparing two builds needs scripts/perf_ab.sh, which interleaves
+# This tool measures one build. Comparing two builds needs scripts/bench/ab.sh, which interleaves
 # the arms: ordering and thermal drift land on whichever arm ran second here.
 
 set -euo pipefail

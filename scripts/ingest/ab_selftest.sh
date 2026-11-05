@@ -14,7 +14,7 @@
 # Six refusals asserted only by reading the source are six refusals nobody has
 # watched fire.
 #
-# Each case drives the real script over a synthetic `perf_ab.sh` result file and
+# Each case drives the real script over a synthetic `bench/ab.sh` result file and
 # a stub `rmlx` binary, in --dry-run, so nothing here can reach `runs.db`. The
 # suite asserts the exit code AND the reason text, because a guard that refuses
 # for the wrong reason is a guard that will stop refusing when that reason moves.
@@ -41,7 +41,7 @@ STUB_SHA16="$(shasum -a 256 "$STUB" | cut -c1-16)"
 PROMPT="$WORK/prompt.json"
 printf '{"messages":[{"role":"user","content":"hi"}]}' >"$PROMPT"
 
-# make_result <name> [overrides-json] -- a minimal but complete perf_ab.sh
+# make_result <name> [overrides-json] -- a minimal but complete bench/ab.sh
 # result. Overrides are ONE JSON object of dotted paths, e.g.
 # '{"results.0.taint": "busy"}'. A JSON argument rather than key=value pairs
 # because several of the values under test contain spaces.

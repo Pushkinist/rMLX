@@ -83,7 +83,7 @@ cpu_snapshot() {
 # and one exercising its own logic against stub arms. A stub arm is not a
 # workload, so no fact about this machine belongs in that run's answer -- and a
 # gate whose result depends on what else the machine is doing teaches everyone
-# to re-run it until it goes green. Both harnesses (`perf_ab.sh`,
+# to re-run it until it goes green. Both harnesses (`bench/ab.sh`,
 # `bench_llama_ab.sh`) set it from their own `--synthetic-arms` flag; it is read
 # here and in each harness's window classifier, via `window_not_sampled`.
 snapshot_ok() {

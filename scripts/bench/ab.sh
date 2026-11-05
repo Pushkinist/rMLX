@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# perf_ab.sh — ABBA-interleaved A/B comparison of two `rmlx baseline` arms.
+# bench/ab.sh — ABBA-interleaved A/B comparison of two `rmlx baseline` arms.
 #
 # Reached as `make canary-ab`; runnable directly.
 #
@@ -100,7 +100,7 @@
 # so nothing is being waved through here.
 set -eu
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
 # shellcheck source=scripts/lib/record_pending.sh
 . "${REPO_ROOT}/scripts/lib/record_pending.sh"
@@ -132,7 +132,7 @@ MAX_CTX=8192
 
 usage() {
 	cat <<'USAGE'
-usage: scripts/perf_ab.sh [options]
+usage: scripts/bench/ab.sh [options]
 
 Arms (at least one of the two must differ):
   --binary-a PATH        binary for arm A (default: target/release-perf/rmlx)

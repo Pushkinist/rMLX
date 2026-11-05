@@ -259,11 +259,11 @@ why="$(st_check 0 --has 'WARN: recorder rejected record' --has 'stderr: stub: re
 }the rejected record is still in pending"
 st_verdict llama_bench_rejected_record_moves_to_failed "$why" "a rejected record leaves the queue for failed/"
 
-# ── ab: a perf_ab.sh result (--harness rmlx, the default) ─────────────────────
+# ── ab: a bench/ab.sh result (--harness rmlx, the default) ─────────────────────
 
 printf '{"messages":[{"role":"user","content":"hi"}]}' >"$ST_WORK/prompt.json"
 OK_SHA16="$(shasum -a 256 "$OK" | cut -c1-16)"
-cat >"$ST_WORK/perf_ab.json" <<JSON
+cat >"$ST_WORK/ab.json" <<JSON
 {"ts_utc": "20260820T090151Z", "pattern": "ABBA BAAB",
  "shape": {"prompt_tokens": 4096, "max_tokens": 100, "max_ctx": 8192},
  "arm_a": {"label": "none", "binary": "$OK", "sha256_16": "$OK_SHA16", "args": "--kv-quant none"},
@@ -274,10 +274,10 @@ cat >"$ST_WORK/perf_ab.json" <<JSON
   "arm_b": {"median_tps": 110.0, "sd_tps": 1.0, "min_tps": 109.0, "max_tps": 111.0, "n": 4, "median_kv_cache_bytes": 500000123}}]}
 JSON
 AB_FLAGS=(--model snap --weight-quant mxfp8 --arm-a-kv-quant none --arm-b-kv-quant mixed_k8g64_v4g64 --prompt-file "$ST_WORK/prompt.json" --keep-arm B)
-ab() { # ab <home> <args...> — ab over the perf_ab result
+ab() { # ab <home> <args...> — ab over the ab result
     local home="$1"
     shift
-    ingest_in "$home" ab "$ST_WORK/perf_ab.json" "${AB_FLAGS[@]}" "$@"
+    ingest_in "$home" ab "$ST_WORK/ab.json" "${AB_FLAGS[@]}" "$@"
 }
 
 home="$(fresh_home ab_fields)"
@@ -286,14 +286,14 @@ st_case ab_record_fields 0 --what "the kept arm is one gate record, its identity
     --has '"model_namespace": "mlx-community"' --has '"weight_quant": "mxfp8"' --has '"ctx_max": 8192' \
     --has '"prompt_tokens": 3770' --has '"max_tokens": 100' --has '"ts_utc": "2026-08-20T09:01:51Z"' \
     --has '"name": "decode_tps_warm"' --has '"value": 110.0' --has '"value": 500000123' \
-    --has '"decode_config": null' --has 'perf_ab.sh ABBA BAAB n=4/arm' --has '<45 chars>' \
+    --has '"decode_config": null' --has 'bench/ab.sh ABBA BAAB n=4/arm' --has '<45 chars>' \
     -- ab "$home" --dry-run
-st_case ab_harness_rmlx_is_the_default 0 --what "--harness rmlx reads a perf_ab.sh result as the default does" \
+st_case ab_harness_rmlx_is_the_default 0 --what "--harness rmlx reads a bench/ab.sh result as the default does" \
     --has '"kv_quant": "mixed_k8g64_v4g64"' \
-    -- ingest_in "$home" ab --harness rmlx "$ST_WORK/perf_ab.json" "${AB_FLAGS[@]}" --dry-run
+    -- ingest_in "$home" ab --harness rmlx "$ST_WORK/ab.json" "${AB_FLAGS[@]}" --dry-run
 st_case ab_unknown_harness 2 --what "a harness that is neither rmlx nor llama is a usage error" \
     --has 'invalid choice' \
-    -- ingest_in "$home" ab --harness cuda "$ST_WORK/perf_ab.json" "${AB_FLAGS[@]}" --dry-run
+    -- ingest_in "$home" ab --harness cuda "$ST_WORK/ab.json" "${AB_FLAGS[@]}" --dry-run
 st_run ab "$home" --record --rmlx-bin "$OLD_RECORDER"
 why="$(st_check 1 --has 'rmlx_old has no `metrics record --run-class`')"
 [ ! -d "$home/bench" ] || why="${why:+$why

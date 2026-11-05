@@ -18,9 +18,6 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `gpu_capture.sh` | make profile-gputrace, run_class_selftest.sh | Capture a Metal GPU trace of a bounded window of steady-state decode, for |
 | `gputrace_preflight.sh` | make build-capture, make gputrace-preflight, gpu_capture.sh | Check the host prerequisites for Apple's GPU tools to work with a Metal capture of this binary. |
 | `mst_capture.sh` | make profile-mst, run_class_selftest.sh | Record a Metal System Trace of a live rmlx run, export the GPU-interval table |
-| `perf_ab.sh` | make canary-ab, perf_ab_host_gate_fixtures.sh, perf_ab_selftest.sh | perf_ab.sh — ABBA-interleaved A/B comparison of two `rmlx baseline` arms. |
-| `perf_ab_host_gate_fixtures.sh` | make canary-ab-host-gate-fixtures | Recall test for the perf_ab.sh boundary: --synthetic-arms gives the same verdict on any host. |
-| `perf_ab_selftest.sh` | make canary-ab-selftest | perf_ab_selftest.sh — mutation check for `scripts/perf_ab.sh`. |
 | `perf_ceiling.py` | check/engine_parity_selftest.sh, published/table.py | Theoretical decode/prefill ceiling calculator for rMLX on Apple Silicon. |
 | `prefill_chunk_sweep.sh` | none | prefill_chunk_sweep.sh — Latin-square sweep of one architecture's prefill |
 | `rmlx-capture.entitlements` | make build-capture | Debug-only entitlement for the GPU-capture binary (`make build-capture`). |
@@ -34,6 +31,8 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
+| `bench/ab.sh` | make canary-ab, bench/ab_selftest.sh | bench/ab.sh — ABBA-interleaved A/B comparison of two `rmlx baseline` arms. |
+| `bench/ab_selftest.sh` | make canary-ab-host-gate-fixtures, make canary-ab-selftest | Recall test for the A/B harness: its logic over stub arms, its host gates over shimmed hosts |
 | `bench/baseline_cells.sh` | make bench-codec-cell, make canary, bench/baseline_cells_selftest.sh, run_class_selftest.sh | baseline_cells.sh — `rmlx baseline` cells: canary, one codec, inertness sweep, cache-type matrix |
 | `bench/baseline_cells_selftest.sh` | make baseline-cells-selftest | Recall test for the baseline cells tool: canary rows, argv, records and exit codes under a stub rmlx |
 | `bench/cache_types.py` | bench/baseline_cells.sh | Python half of baseline_cells.sh --preset cache-types: a cell's run record and a smoke text check. |
@@ -101,15 +100,15 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 |---|---|---|
 | `lib/awk_text.sh` | crates/rmlx-models/tests/common/stop_scan.rs, check/gpu_device_census.sh, check/gpu_tests.sh, check/kernel_dispatch.sh, +2 more scripts | Line readers for Rust-scanning gates: code without comments, without string bodies, bodiless fns. |
 | `lib/bench_server.sh` | bench/baseline_cells.sh, bench/cross_backend.sh, bench/serve_bench.sh, +1 more scripts | Start, wait for and identify one rmlx server, for bench harnesses; source it. |
-| `lib/busiest_between.awk` | bench_llama_ab.sh, perf_ab.sh, perf_ab_selftest.sh, +2 more scripts | Which process burned the most CPU between two cpu_snapshot files. |
-| `lib/cpu_snapshot.sh` | bench_llama_ab.sh, perf_ab.sh, perf_ab_selftest.sh, +2 more scripts | Per-process cumulative CPU seconds, for interference gates; source it. |
+| `lib/busiest_between.awk` | bench/ab.sh, bench/ab_selftest.sh, bench_llama_ab.sh, +2 more scripts | Which process burned the most CPU between two cpu_snapshot files. |
+| `lib/cpu_snapshot.sh` | bench/ab.sh, bench/ab_selftest.sh, bench_llama_ab.sh, +2 more scripts | Per-process cumulative CPU seconds, for interference gates; source it. |
 | `lib/identity.sh` | bench/baseline_cells.sh, bench/cross_backend.sh, bench/serve_bench.sh, +3 more scripts | Shared §8.5 run-identity for rMLX bench scripts. |
 | `lib/kv_boundary_default.py` | ingest/ingest.py | The engine's default KV boundary-layer counts, read from the engine. |
 | `lib/metal_dirs.sh` | check/kernel_dispatch.sh, check/metal_kernels.sh, check/metal_kernels_selftest.sh, +1 more scripts | The directories holding gated .metal kernels; sourced by the metal gates. |
 | `lib/mlx_pin.sh` | crates/rmlx-mlx/src/pin_tests.rs, host/mlx_restore_pin.sh | Read the validated MLX / mlx-c pair from its one declaration. |
 | `lib/prefill_ms.py` | mst_capture.sh | Read the prefill time of an rmlx run out of its log: `generate: prefill{prefill_ms}`. |
 | `lib/published_run_log.py` | lib/prefill_ms.py, published/bench.sh, published/binary_identity.py, +1 more scripts | Read one rmlx run log back as a per-request table. |
-| `lib/record_pending.sh` | crates/rmlx-cli/src/exit_tests.rs, bench/baseline_cells.sh, bench/serve_bench.sh, gpu_capture.sh, +2 more scripts | The exit code `rmlx baseline --record` and `rmlx eval ppl --corpus` give a |
+| `lib/record_pending.sh` | crates/rmlx-cli/src/exit_tests.rs, bench/ab.sh, bench/baseline_cells.sh, bench/serve_bench.sh, +2 more scripts | The exit code `rmlx baseline --record` and `rmlx eval ppl --corpus` give a |
 | `lib/recorder_check.py` | ingest/ingest.py, ingest/llama_bench.py | Refuse a recorder that cannot state a run class. |
 | `lib/rmlx_home.py` | ingest/ingest.py, ingest/llama_bench.py | Resolve the runtime home the way the binary does. |
 | `lib/run_log_for_pid.py` | lib/bench_server.sh | Pick the run log a given process wrote, out of the candidates on stdin. |

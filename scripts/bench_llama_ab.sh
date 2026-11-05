@@ -3,7 +3,7 @@
 #
 # WHY THIS EXISTS
 #
-# `scripts/perf_ab.sh` is the ABBA harness for two `rmlx baseline` arms: it
+# `scripts/bench/ab.sh` is the ABBA harness for two `rmlx baseline` arms: it
 # parses that binary's stdout, forbids its `--metrics` flag and compares its
 # token-id line. None of that exists for `llama-server`, whose measurement
 # surface is an HTTP `/completion` response. The measurement *discipline* is
@@ -11,7 +11,7 @@
 # `scripts/lib/cpu_snapshot.sh` + `scripts/lib/busiest_between.awk` pair, on
 # the same cumulative-CPU-seconds criterion and the same default threshold.
 #
-# What is genuinely different, and why this cannot be a flag on perf_ab.sh:
+# What is genuinely different, and why this cannot be a flag on bench/ab.sh:
 #
 #   * an arm is a (binary, server flags) pair launched as a daemon, probed for
 #     readiness and shut down again, not a one-shot CLI invocation;
@@ -62,7 +62,7 @@
 # not consulted at all, the run says so on stdout and in `synthetic_arms` in the
 # result file, and `ingest/ingest.py` refuses to promote it. The
 # arm-reading preconditions are untouched. The boundary itself is shared with
-# `perf_ab.sh` through `scripts/lib/cpu_snapshot.sh` rather than restated here.
+# `bench/ab.sh` through `scripts/lib/cpu_snapshot.sh` rather than restated here.
 #
 # Exit codes:
 #   0   — ran cleanly; verdict on stdout
@@ -216,7 +216,7 @@ fi
 # llama-server's parser. `--args-b "-c 2048"` would run arm B at another context
 # while the report, the result JSON's `n_ctx` and every ingested row still claim
 # `$N_CTX` -- two arms silently become a different experiment, and a wrong
-# `ctx_max` lands in an append-only table. `perf_ab.sh` refuses `--metrics` in
+# `ctx_max` lands in an append-only table. `bench/ab.sh` refuses `--metrics` in
 # arm arguments for exactly this reason.
 PINNED_FLAGS="--model -m --port --host -c --ctx-size -np --parallel -fa --flash-attn -ngl --n-gpu-layers -t --threads"
 refuse_pinned() { # <label> <args>

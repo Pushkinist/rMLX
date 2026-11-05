@@ -7,7 +7,7 @@
 # GGUF, no metrics database — and asserts the exit code AND the reason text, so
 # a guard that starts failing for a different reason does not read as passing.
 #
-# Its sibling `perf_ab_selftest.sh` does the same for `perf_ab.sh`.
+# Its sibling `bench/ab_selftest.sh` does the same for `bench/ab.sh`.
 #
 # Exit 0 = every case produced its expected exit code and message.
 
@@ -162,7 +162,7 @@ chmod +x "$CLAIM_STUB"
 # again. The cases whose subject IS the taint path say REALHOST and supply the
 # machine as a `ps` shim on PATH; that is enforced below, not trusted. (This
 # harness has no exclusivity gate, so `ps` is the whole host surface here --
-# unlike `perf_ab_selftest.sh`, which must shim the claim holder as well.)
+# unlike `bench/ab_selftest.sh`, which must shim the claim holder as well.)
 #
 # FORCE_UNMEASURED_ROWS drives the harness down its TAINTED path on demand and
 # without an interferer. `cpu_snapshot` refuses a process table shorter than

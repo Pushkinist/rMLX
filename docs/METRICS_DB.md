@@ -738,7 +738,7 @@ change to what `bests` publishes, such as a `METRICS_SCHEMA.md` §4.1 bounds cha
     never from a literal (§8.5.1).
 21. **Record every measurement run, under its class** (§8.5). `gate`: a
     canary, a release gate, the surviving arm of an A/B recorded once.
-    `ab_arm`: every A/B slot; `scripts/perf_ab.sh` records each slot, and
+    `ab_arm`: every A/B slot; `scripts/bench/ab.sh` records each slot, and
     `scripts/bench_llama_ab.sh` each arm's medians. `diagnostic`: profiling,
     traced and investigation runs, among them the canary's warmup and
     measured calls, a GPU capture, an inertness sweep and the server's live
@@ -759,7 +759,7 @@ change to what `bests` publishes, such as a `METRICS_SCHEMA.md` §4.1 bounds cha
       log holds its own records only. It measures no rate.
     - A `scripts/mst_capture.sh` run its `--time-limit` stops: `baseline`
       records at exit.
-    - A `scripts/perf_ab.sh` arm whose binary predates `--run-class`, and any
+    - A `scripts/bench/ab.sh` arm whose binary predates `--run-class`, and any
       `--synthetic-arms` run: an old binary cannot state a class, and a stub
       measures nothing.
 22. **A new rule, metric or backend** updates this doc or `METRICS_SCHEMA.md`,

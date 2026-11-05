@@ -12,7 +12,7 @@ Exit:   0 records written, printed or filed; 1 the recorder refused a record, or
 Not a mode of: bench/baseline_cells.sh — that one runs a model and measures; this one
         promotes a finished result into records
 
-`ab` takes a `perf_ab.sh` result (`--harness rmlx`, the default) or a `bench_llama_ab.sh` result
+`ab` takes a `bench/ab.sh` result (`--harness rmlx`, the default) or a `bench_llama_ab.sh` result
 (`--harness llama`). Both harnesses write each slot as an `ab_arm` row, which reaches no champion
 and no gate; `--keep-arm A|B` promotes the surviving arm as one `gate` record. The llama harness
 runs this itself, without `--keep-arm`, after every real run: both arms are then `ab_arm`.
@@ -175,7 +175,7 @@ def run_ab(argv: list[str]) -> int:
 
 
 def ab_rmlx(argv: list[str]) -> int:
-    """Promote the surviving arm of a `perf_ab.sh` result into one `gate` record.
+    """Promote the surviving arm of a `bench/ab.sh` result into one `gate` record.
 
     The result is `rmlx baseline` slots, so the identity block comes from the measured binary
     itself (`rmlx metrics identity --json`) and the residency column is the harness's own
@@ -192,7 +192,7 @@ def ab_rmlx(argv: list[str]) -> int:
     row lands under the wrong cell key.
     """
     p = argparse.ArgumentParser(prog="ingest.py ab --harness rmlx", description=ab_rmlx.__doc__)
-    p.add_argument("result", help="JSON emitted by perf_ab.sh")
+    p.add_argument("result", help="JSON emitted by bench/ab.sh")
     p.add_argument("--model", required=True, help="§5.1 model label")
     p.add_argument("--model-namespace", default="mlx-community")
     p.add_argument("--weight-quant", required=True, help="§5.2 whitelist value")
@@ -237,7 +237,7 @@ def ab_rmlx(argv: list[str]) -> int:
         raise SystemExit(
             f"{args.result} compares {len(cells)} models in one run. The model "
             "label, namespace and weight quant are per model and this script "
-            "takes one of each — re-run perf_ab.sh with a single --model, or "
+            "takes one of each — re-run bench/ab.sh with a single --model, or "
             "ingest each cell from its own result file."
         )
     cell = cells[0]
@@ -317,7 +317,7 @@ def ab_rmlx(argv: list[str]) -> int:
     for arm, declared in (("A", args.arm_a_kv_quant), ("B", args.arm_b_kv_quant)):
         _kv_quant_of(result["arm_a" if arm == "A" else "arm_b"].get("args", ""), declared, arm)
     records = [
-        _perf_ab_record(result, cell, args.keep_arm, args, prompt_body, prompt_tokens, prompt_name)
+        _ab_record(result, cell, args.keep_arm, args, prompt_body, prompt_tokens, prompt_name)
     ]
 
     staged = stage_records(
@@ -426,7 +426,7 @@ def _identity(binary: str) -> dict[str, Any]:
 
 
 def _iso(stamp: str) -> str:
-    """`perf_ab.sh` stamps `YYYYMMDDTHHMMSSZ`; §8.5 wants ISO-8601."""
+    """`bench/ab.sh` stamps `YYYYMMDDTHHMMSSZ`; §8.5 wants ISO-8601."""
     if re.fullmatch(r"\d{8}T\d{6}Z", stamp):
         return (
             f"{stamp[0:4]}-{stamp[4:6]}-{stamp[6:8]}T"
@@ -435,7 +435,7 @@ def _iso(stamp: str) -> str:
     return stamp
 
 
-def _perf_ab_record(
+def _ab_record(
     result: dict[str, Any],
     cell: dict[str, Any],
     arm: str,
@@ -444,7 +444,7 @@ def _perf_ab_record(
     prompt_tokens: int,
     prompt_name: str,
 ) -> dict[str, Any]:
-    """Build one §8.5 RunRecord from one arm of a perf_ab result."""
+    """Build one §8.5 RunRecord from one arm of a bench/ab.sh result."""
     key = "arm_a" if arm == "A" else "arm_b"
     stats = cell[key]
     top = result[key]
@@ -458,7 +458,7 @@ def _perf_ab_record(
     # BAAB, and a result written before the field existed says so.
     pattern = result.get("pattern") or "pattern-unrecorded"
     notes = (
-        f"perf_ab.sh {pattern} n={stats['n']}/arm; decode_tps median over slots, "
+        f"bench/ab.sh {pattern} n={stats['n']}/arm; decode_tps median over slots, "
         f"min={stats['min_tps']:.3f} max={stats['max_tps']:.3f}; "
         f"verdict={cell['verdict']}; "
         f"paired arm {top['label']!r} vs "
@@ -739,7 +739,7 @@ def run_codec_inertness(argv: list[str]) -> int:
     **Only `kv_cache_bytes` is recorded.** The sweep's throughput columns are single unpaired
     runs on a shared host, where the same binary and flags have read 11% apart thirty minutes
     apart; promoting one into an append-only table would make an unusable number permanent.
-    Throughput belongs to `perf_ab.sh` and `ab`. The greedy token-id digest travels in `notes`: it
+    Throughput belongs to `bench/ab.sh` and `ab`. The greedy token-id digest travels in `notes`: it
     is an identity, not a measurement, and `observations` stores reals.
 
     A sweep at non-default `--kv-boundary-layers` lands in a cell of its own: the sweep's

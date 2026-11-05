@@ -989,16 +989,16 @@ canary: build-perf  ## run 3-model TPS canary (records into runs.db + legacy CSV
 # Pass arms through ARGS, e.g.
 #   make canary-ab ARGS='--binary-a target/release-perf/rmlx.main --binary-b target/release-perf/rmlx'
 canary-ab: build-perf  ## interleaved A/B of two arms (ARGS='--binary-a … --binary-b …'); see docs/PERF_BASELINE.md
-	bash scripts/perf_ab.sh $(ARGS)
+	bash scripts/bench/ab.sh $(ARGS)
 
 canary-ab-selftest: ## mutation-check the A/B harness against stub binaries (no GPU, no model)
-	bash scripts/perf_ab_selftest.sh
+	bash scripts/bench/ab_selftest.sh logic
 
 codec-smoke-runner-selftest: ## recall-check the codec-matrix runner verdict (ran, skipped, INCOMPLETE, exit codes) over --dry-run and throwaway roots (no GPU, no model)
 	bash scripts/codec_smoke_runner_selftest.sh
 
 canary-ab-host-gate-fixtures: ## recall-check the A/B harness's host gates against shimmed hosts (no GPU, no model)
-	bash scripts/perf_ab_host_gate_fixtures.sh
+	bash scripts/bench/ab_selftest.sh host-gate
 
 canary-ab-ingest-selftest: ## mutation-check the A/B -> runs.db promoter (no GPU, no model, no DB write)
 	bash scripts/ingest/ab_selftest.sh

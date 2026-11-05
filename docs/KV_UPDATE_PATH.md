@@ -111,7 +111,7 @@ the update of step t+1. The cache evaluates the K buffer and the V buffer with
 one `async_eval` each. On Ternary-Bonsai-8B (36 layers) that distance is then
 one step, and each update stays in place. With one `async_eval` for both
 buffers, MLX copies them on that model: decode is 22 % slower and the Metal
-allocation is 497 MB larger (`scripts/perf_ab.sh`, 8 slots).
+allocation is 497 MB larger (`scripts/bench/ab.sh`, 8 slots).
 
 On gemma-4-e2b, layers 15 to 34 read the K/V of layers 13 and 14. For those
 two layers the distance is shorter, and they copy. A per-layer tally of one

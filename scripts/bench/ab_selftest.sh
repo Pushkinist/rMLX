@@ -1,34 +1,54 @@
 #!/usr/bin/env bash
-# perf_ab_selftest.sh — mutation check for `scripts/perf_ab.sh`.
+# Recall test for the A/B harness: its logic over stub arms, its host gates over shimmed hosts
 #
-# An A/B harness that cannot detect a planted difference is not an instrument,
+# Recall test for: bench/ab.sh --synthetic-arms
+#
+# Mode `logic`: an A/B harness that cannot detect a planted difference is not an instrument,
 # and one that reports a difference between two identical arms is worse than
-# none. Both directions are checked here against stub binaries that emit a
-# known decode_tps sequence, so every expectation below is an exact number
-# rather than a tolerance.
+# none. Both directions are checked against stub binaries that emit a known
+# decode_tps sequence, so every expectation is an exact number rather than a
+# tolerance. The stubs are shell scripts standing in for `rmlx baseline`: the
+# harness's job is to schedule, gate and summarise, and this mode tests exactly
+# that, with no GPU, no model, and no metrics database.
 #
-# The stubs are shell scripts standing in for `rmlx baseline`. That is the
-# point: the harness's job is to schedule, gate and summarise, and this file
-# tests exactly that, with no GPU, no model, and no metrics database.
+# Mode `host-gate`: the boundary between a measurement and a logic exercise.
+# `--synthetic-arms` gives the same verdict on any host, and the host gates
+# still fire on a hostile host without it. The host is supplied entirely by
+# `ps` and `claim-holder` shims, so no case reads this machine.
 #
-# Exit 0 = every case produced its expected exit code and output.
+# Usage:  bash scripts/bench/ab_selftest.sh logic|host-gate
+# Exit:   0 every case held; 1 a case did not; 2 usage error, or a fixture could not be built
+# Set:    -uo — a non-zero status inside a case ends the run under -e, before the cases after it
+# LOC-exempt: two modes of one recall test of one harness, each a flat list of cases over shared stubs
 
 set -uo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-AB="$ROOT/scripts/perf_ab.sh"
-
-# Sourced up front, before any case calls it. A missing definition exits
-# non-zero exactly like a failing `ps`, so the cases below would pass for the
-# wrong reason if this arrived later in the file.
-# shellcheck source=scripts/lib/cpu_snapshot.sh
-. "$ROOT/scripts/lib/cpu_snapshot.sh"
-if ! type cpu_snapshot >/dev/null 2>&1; then
-	echo "selftest bug: cpu_snapshot is not defined" >&2
-	exit 1
+MODE="${1:-}"
+if [[ $# -ne 1 || ("$MODE" != logic && "$MODE" != host-gate) ]]; then
+	echo "usage: bash scripts/bench/ab_selftest.sh logic|host-gate" >&2
+	exit 2
 fi
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/rmlx_ab_selftest.XXXXXX")"
+# Each mode sets this to its own name when it starts; a run that reached no
+# cases, or another mode's, is not green.
+RAN_MODE=""
+require_mode_ran() {
+	[[ "$RAN_MODE" == "$MODE" ]] && return
+	echo "ab selftest: mode $MODE ran ${RAN_MODE:-no} cases" >&2
+	exit 1
+}
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+AB="$REPO_ROOT/scripts/bench/ab.sh"
+[[ -r "$AB" ]] || {
+	echo "ERROR: missing $AB" >&2
+	exit 2
+}
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/rmlx_ab_selftest.XXXXXX")" || {
+	echo "ERROR: could not create a scratch directory" >&2
+	exit 2
+}
 trap 'rm -rf "$WORK"' EXIT
 
 STATE="$WORK/state"
@@ -141,6 +161,227 @@ STUB
 
 reset_state() { rm -f "$STATE"/*.cnt "$STATE/slots.log"; }
 
+# 40 rows of nothing: `cpu_snapshot` refuses a process table under 20 rows, so
+# every shim has to look like a real one before it can look like anything else.
+idle_rows='for i in $(seq 1 40); do printf "%6d %12s %s\\n" $((5000 + i)) "0:00.10" "/usr/sbin/idle$i"; done'
+
+# The three machines a case can run on, each a directory of `ps` and
+# `claim-holder` shims to put at the front of PATH.
+make_hosts() {
+	# A machine with a hog on it: one process whose cumulative CPU time advances
+	# by 100 s on every call.
+	mkdir -p "$WORK/busybin"
+	cat >"$WORK/busybin/ps" <<PSHOG
+#!/usr/bin/env bash
+n=\$(cat "$STATE/pshog.cnt" 2>/dev/null || echo 0)
+echo \$((n + 1)) >"$STATE/pshog.cnt"
+printf '%6d %12s %s\n' 4242 "0:\$((n * 100)).00" /usr/local/bin/hog
+$idle_rows
+PSHOG
+	printf '#!/bin/sh\nexit 1\n' >"$WORK/busybin/claim-holder"
+
+	# A quiet machine on which something else holds the Metal context.
+	mkdir -p "$WORK/servebin"
+	printf '#!/usr/bin/env bash\n%s\n' "$idle_rows" >"$WORK/servebin/ps"
+	printf '#!/bin/sh\necho 4243\nexit 0\n' >"$WORK/servebin/claim-holder"
+
+	# A quiet machine with the Metal context free.
+	mkdir -p "$WORK/quietbin"
+	printf '#!/usr/bin/env bash\n%s\n' "$idle_rows" >"$WORK/quietbin/ps"
+	printf '#!/bin/sh\nexit 1\n' >"$WORK/quietbin/claim-holder"
+
+	chmod +x "$WORK"/busybin/* "$WORK"/servebin/* "$WORK"/quietbin/*
+}
+
+# run_ab OUT HOST_DIR RMLX_HOME ARGS... -> the harness's exit code, its output in OUT.
+# HOST_DIR is put at the front of PATH; empty leaves this machine's PATH alone.
+run_ab() {
+	local out="$1" host="$2" home="$3"
+	shift 3
+	RMLX_HOME="$home" PATH="${host:+$host:}$PATH" bash "$AB" "$@" >"$out" 2>&1
+}
+
+make_hosts
+
+# ---- host-gate ---------------------------------------------------------------
+#
+# A logic check whose result depends on what else the machine is doing teaches
+# everyone to re-run until green, which is how a real failure gets waved
+# through. `--synthetic-arms` declares the arms stubs, so the machine is not
+# consulted. This mode pins both directions of that boundary, because either
+# one alone is satisfiable by a broken script:
+#
+#   * the host gates still FIRE on a hostile host without the flag (cases 1-2).
+#     Without these, a `--synthetic-arms` that had accidentally become
+#     unconditional would pass everything below.
+#   * with the flag, a hostile host and a quiet host produce the SAME verdict
+#     (cases 3-5) — host independence proven by equality, not by "it passed
+#     once".
+#   * the flag waives host state and nothing else (case 6). A mode that skips
+#     every guard would also make the logic mode green.
+#   * a run that took the flag is marked as one in its own result file (case 7),
+#     so nothing downstream can promote a stub run as a measurement.
+
+failures=0
+LAST_LOG=""
+RESULT_PATHS=()
+
+# Each case gets its own RMLX_HOME. The result file is named from a
+# whole-second UTC stamp, so under one shared home two cases that finish inside
+# the same second write the same path and the later silently replaces the
+# earlier -- an assertion on "the result file" would then be reading a file some
+# other case produced.
+RUN_SEQ=0
+host_run() { # host_run HOST_DIR [args...] -> exit code, output in $LAST_LOG
+	local host="$1"
+	shift
+	RUN_SEQ=$((RUN_SEQ + 1))
+	LAST_LOG="${WORK}/last.log"
+	reset_state
+	run_ab "${LAST_LOG}" "${host}" "${WORK}/home/run${RUN_SEQ}" --model "${MODEL}" --slots 8 --max-tokens 5 "$@"
+}
+
+host_check() { # host_check LABEL HOST_DIR WANT_EXIT WANT_PATTERN [-- args...]
+	local label="$1" host="$2" want_exit="$3" want_pat="$4"
+	shift 4
+	[ "${1:-}" = "--" ] && shift
+	host_run "${host}" "$@"
+	local rc=$?
+	local produced
+	produced="$(sed -n 's/^result: //p' "${LAST_LOG}" | tail -1)"
+	[ -n "${produced}" ] && RESULT_PATHS+=("${produced}")
+	if [ "${rc}" -ne "${want_exit}" ]; then
+		echo "FAIL  ${label}: exit ${rc}, expected ${want_exit}" >&2
+		sed 's/^/      | /' "${LAST_LOG}" | tail -12 >&2
+		failures=$((failures + 1))
+		return
+	fi
+	if ! grep -qE -- "${want_pat}" "${LAST_LOG}"; then
+		echo "FAIL  ${label}: exit ${rc} as expected but no line matching /${want_pat}/" >&2
+		sed 's/^/      | /' "${LAST_LOG}" | tail -12 >&2
+		failures=$((failures + 1))
+		return
+	fi
+	echo "ok    ${label}  (exit ${rc}, reason matched)"
+}
+
+host_gate() {
+	RAN_MODE=host-gate
+	# Constant decode_tps per arm, so the per-slot ranges are disjoint by
+	# construction and the verdict is SEPARATED in every case that reaches one.
+	local SLOW FAST
+	SLOW="$(make_stub slow 100.0 40.0 "$TOKENS_MAIN")"
+	FAST="$(make_stub fast 110.0 40.0 "$TOKENS_MAIN")"
+
+	# 1 — the CPU gate still fires. A `--synthetic-arms` that had become
+	# unconditional would turn every case below green and this one red.
+	host_check "busy host is refused" "${WORK}/busybin" 125 "host is not quiescent" \
+		-- --binary-a "${SLOW}" --binary-b "${FAST}"
+
+	# 2 — the exclusivity gate still fires. This is the one that made `make ci`
+	# depend on whether a server happened to be up.
+	host_check "a held Metal context is refused" "${WORK}/servebin" 125 "holds the Metal context" \
+		-- --binary-a "${SLOW}" --binary-b "${FAST}"
+
+	# 3 — same hostile host, arms declared synthetic: the machine is not consulted,
+	# so the run reaches its verdict and is not tainted.
+	host_check "synthetic arms ignore a busy host" "${WORK}/busybin" 0 "VERDICT: SEPARATED" \
+		-- --synthetic-arms --binary-a "${SLOW}" --binary-b "${FAST}"
+	grep -q '^  TAINTED:' "${LAST_LOG}" && {
+		echo "FAIL  synthetic arms ignore a busy host: the run reported TAINTED" >&2
+		failures=$((failures + 1))
+	}
+	HOSTILE_VERDICT="$(grep -E '^  (ratio B/A|VERDICT:)' "${LAST_LOG}")"
+	HOSTILE_JSON="$(sed -n 's/^result: //p' "${LAST_LOG}" | tail -1)"
+
+	# 4 — and the same for a held Metal context: a stub arm dispatches no Metal, so
+	# whoever owns the context is irrelevant to it.
+	host_check "synthetic arms ignore a held Metal context" "${WORK}/servebin" 0 "VERDICT: SEPARATED" \
+		-- --synthetic-arms --binary-a "${SLOW}" --binary-b "${FAST}"
+
+	# 5 — the point of the whole mode: the verdict is a function of the arms, not of
+	# the machine. Compared as text against case 3's, not merely asserted green.
+	host_check "synthetic arms are host-independent" "${WORK}/quietbin" 0 "VERDICT: SEPARATED" \
+		-- --synthetic-arms --binary-a "${SLOW}" --binary-b "${FAST}"
+	QUIET_VERDICT="$(grep -E '^  (ratio B/A|VERDICT:)' "${LAST_LOG}")"
+	if [ "${HOSTILE_VERDICT}" = "${QUIET_VERDICT}" ] && [ -n "${QUIET_VERDICT}" ]; then
+		echo "ok    a hostile and a quiet host give the same answer  (${QUIET_VERDICT//$'\n'/ | })"
+	else
+		echo "FAIL  a hostile and a quiet host give the same answer:" >&2
+		echo "      | hostile: ${HOSTILE_VERDICT:-<none>}" >&2
+		echo "      | quiet:   ${QUIET_VERDICT:-<none>}" >&2
+		failures=$((failures + 1))
+	fi
+
+	# 6 — the flag waives host state and nothing else. A guard that reads only the
+	# arms must still refuse, or `--synthetic-arms` is a blanket skip and the
+	# logic mode it exists to serve would be green for the wrong reason.
+	host_check "synthetic arms do not waive an arm guard" "${WORK}/quietbin" 125 "indistinguishable" \
+		-- --synthetic-arms --binary-a "${SLOW}" --binary-b "${SLOW}"
+
+	# 7 — the result file says so. `ingest/ingest.py ab` refuses to promote a
+	# run carrying this flag; that refusal is only enforceable if the flag is
+	# recorded.
+	if [ -n "${HOSTILE_JSON}" ] && [ -r "${HOSTILE_JSON}" ] &&
+		grep -q '"synthetic_arms": true' "${HOSTILE_JSON}"; then
+		echo "ok    the result file records the synthetic-arms waiver"
+	else
+		echo "FAIL  the result file does not record the synthetic-arms waiver: ${HOSTILE_JSON:-<no result line>}" >&2
+		failures=$((failures + 1))
+	fi
+
+	# 8 — the run carries no reading of this machine, not even a contextual one. A
+	# load average recorded beside a "not sampled" host line is still a number taken
+	# off this host, and it is the field a reader reaches for when the other one
+	# says nothing.
+	if [ -n "${HOSTILE_JSON}" ] && [ -r "${HOSTILE_JSON}" ] &&
+		! grep -qE '"load_at_start": "[0-9]' "${HOSTILE_JSON}"; then
+		echo "ok    the result file records no host load reading"
+	else
+		echo "FAIL  the result file carries a load average taken from this machine:" >&2
+		grep -o '"load_at_start": "[^"]*"' "${HOSTILE_JSON}" 2>/dev/null | sed 's/^/      | /' >&2
+		failures=$((failures + 1))
+	fi
+
+	# 9 — every case above must have written its own result file. The name is a
+	# whole-second UTC stamp, so two runs that finish inside one second land on the
+	# same path and the later one silently replaces the earlier: case 7 would then
+	# be asserting on a file some other case produced.
+	distinct=$(printf '%s\n' ${RESULT_PATHS[@]+"${RESULT_PATHS[@]}"} | sort -u | grep -c .)
+	if [ "${distinct}" -eq "${#RESULT_PATHS[@]}" ] && [ "${distinct}" -gt 1 ]; then
+		echo "ok    each case wrote its own result file (${distinct} of ${#RESULT_PATHS[@]})"
+	else
+		echo "FAIL  result files collided: ${distinct} distinct path(s) for ${#RESULT_PATHS[@]} runs -- a case asserted on another case's file" >&2
+		printf '      | %s\n' ${RESULT_PATHS[@]+"${RESULT_PATHS[@]}"} >&2
+		failures=$((failures + 1))
+	fi
+
+	if [ "${failures}" -gt 0 ]; then
+		echo >&2
+		echo "ERROR: ${failures} fixture(s) did not reproduce the expected behaviour." >&2
+		return 1
+	fi
+	echo "OK: host gating fires on a hostile host, and --synthetic-arms removes the host from the answer."
+}
+
+if [[ "$MODE" == host-gate ]]; then
+	host_gate
+	status=$?
+	require_mode_ran
+	exit "$status"
+fi
+RAN_MODE=logic
+
+# Sourced up front, before any case calls it. A missing definition exits
+# non-zero exactly like a failing `ps`, so the cases below would pass for the
+# wrong reason if this arrived later in the file.
+# shellcheck source=scripts/lib/cpu_snapshot.sh
+. "$REPO_ROOT/scripts/lib/cpu_snapshot.sh"
+if ! type cpu_snapshot >/dev/null 2>&1; then
+	echo "selftest bug: cpu_snapshot is not defined" >&2
+	exit 1
+fi
+
 PASSED=0
 FAILED=0
 SYNTHETIC_CASES=0
@@ -149,7 +390,7 @@ SYNTHETIC_SLOTS_CHECKED=0
 REAL_SLOTS_CHECKED=0
 HOST_READING_CASES=0
 
-# check <name> <expected-exit> <what-it-proves> -- <perf_ab.sh args...>
+# check <name> <expected-exit> <what-it-proves> -- <ab.sh args...>
 #
 # Optional trailing entries: `GREP:<pattern>` and `NOGREP:<pattern>` assert on
 # the captured output, `PATHPRE:<dir>` puts a directory of shims at the front of
@@ -158,7 +399,7 @@ HOST_READING_CASES=0
 #
 # WHY --synthetic-arms IS THE DEFAULT HERE
 #
-# perf_ab.sh refuses to run on a host it does not have to itself: a foreign
+# ab.sh refuses to run on a host it does not have to itself: a foreign
 # process over the CPU threshold, or an `rmlx serve` holding the Metal context.
 # That is right for a measurement and wrong for this file, whose arms are shell
 # stubs emitting canned numbers and whose every expectation is a fact about the
@@ -210,8 +451,7 @@ check() {
 	# bash 3.2 (the system bash here) treats "${arr[@]}" on an empty array as an
 	# unbound variable under `set -u` and dies. Every current call site supplies
 	# both, but the guard keeps a future one from failing as a harness crash.
-	RMLX_HOME="$WORK/home" PATH="${path_prefix:+$path_prefix:}$PATH" \
-		bash "$AB" ${args[@]+"${args[@]}"} >"$out" 2>&1
+	run_ab "$out" "$path_prefix" "$WORK/home" ${args[@]+"${args[@]}"}
 	local got=$?
 
 	local ok=1
@@ -288,7 +528,7 @@ SLOW_OLD="$(make_stub slow_old "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN" "" "" "" 
 # slot whose generation is shorter than asked for.
 COMMON=(--model "$MODEL" --slots 12 --max-tokens 5)
 
-echo "perf_ab selftest: mutation checks"
+echo "ab selftest (logic): mutation checks"
 
 # ---- can it see a difference that is there? ----------------------------------
 
@@ -438,33 +678,7 @@ check missing_model 125 \
 # runner the refusal would never fire and the case would pass having tested
 # nothing.
 
-# 40 rows of nothing: `cpu_snapshot` refuses a process table under 20 rows, so
-# every shim has to look like a real one before it can look like anything else.
-idle_rows='for i in $(seq 1 40); do printf "%6d %12s %s\\n" $((5000 + i)) "0:00.10" "/usr/sbin/idle$i"; done'
 
-# A machine with a hog on it: one process whose cumulative CPU time advances by
-# 100 s on every call.
-mkdir -p "$WORK/busybin"
-cat >"$WORK/busybin/ps" <<PSHOG
-#!/usr/bin/env bash
-n=\$(cat "$STATE/pshog.cnt" 2>/dev/null || echo 0)
-echo \$((n + 1)) >"$STATE/pshog.cnt"
-printf '%6d %12s %s\n' 4242 "0:\$((n * 100)).00" /usr/local/bin/hog
-$idle_rows
-PSHOG
-printf '#!/bin/sh\nexit 1\n' >"$WORK/busybin/claim-holder"
-
-# A quiet machine on which something else holds the Metal context.
-mkdir -p "$WORK/servebin"
-printf '#!/usr/bin/env bash\n%s\n' "$idle_rows" >"$WORK/servebin/ps"
-printf '#!/bin/sh\necho 4243\nexit 0\n' >"$WORK/servebin/claim-holder"
-
-# A quiet machine with the Metal context free.
-mkdir -p "$WORK/quietbin"
-printf '#!/usr/bin/env bash\n%s\n' "$idle_rows" >"$WORK/quietbin/ps"
-printf '#!/bin/sh\nexit 1\n' >"$WORK/quietbin/claim-holder"
-
-chmod +x "$WORK"/busybin/* "$WORK"/servebin/* "$WORK"/quietbin/*
 
 check real_slots_record_as_ab_arm 0 \
 	"on a quiet host every slot, warmups included, is recorded as an ab_arm row" \
@@ -620,7 +834,7 @@ unset RMLX_O_MODELS_ROOT
 # hand-written CPU snapshots, so "it detects a busy process" is a fact rather
 # than a hope about the test host.
 
-BUSIEST="$ROOT/scripts/lib/busiest_between.awk"
+BUSIEST="$REPO_ROOT/scripts/lib/busiest_between.awk"
 
 mkdir -p "$WORK/fakebin"
 cat >"$WORK/fakebin/ps" <<'FAKEPS'
@@ -825,15 +1039,16 @@ LOCAL_CASES=$((PASSED + FAILED - SYNTHETIC_CASES - REAL_HOST_CASES - HOST_READIN
 printf 'host inputs: %d synthetic-arm cases (the machine is not consulted); %d against a shimmed ps and claim-holder; %d ran no comparison; %d read this machine.\n' \
 	"$SYNTHETIC_CASES" "$REAL_HOST_CASES" "$LOCAL_CASES" "$HOST_READING_CASES"
 if [[ "$HOST_READING_CASES" -ne 0 ]]; then
-	echo "perf_ab selftest: FAIL — $HOST_READING_CASES case(s) can read this machine, so this suite's answer is not a property of the code" >&2
+	echo "ab selftest (logic): FAIL — $HOST_READING_CASES case(s) can read this machine, so this suite's answer is not a property of the code" >&2
 	exit 1
 fi
 if [[ "$LOCAL_CASES" -lt 0 ]]; then
-	echo "perf_ab selftest: FAIL — the case buckets do not add up ($LOCAL_CASES); the disposition line is not describing this run" >&2
+	echo "ab selftest (logic): FAIL — the case buckets do not add up ($LOCAL_CASES); the disposition line is not describing this run" >&2
 	exit 1
 fi
 if [[ "$FAILED" -ne 0 ]]; then
-	echo "perf_ab selftest: FAIL ($FAILED of $((PASSED + FAILED)))" >&2
+	echo "ab selftest (logic): FAIL ($FAILED of $((PASSED + FAILED)))" >&2
 	exit 1
 fi
-echo "perf_ab selftest: ok ($PASSED cases)"
+require_mode_ran
+echo "ab selftest (logic): ok ($PASSED cases)"

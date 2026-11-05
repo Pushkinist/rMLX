@@ -51,7 +51,7 @@ baseline: model=<name>  load=<ms>  ttft_ms=<ms>  decode_tps=<n>  overall_tps=<n>
   (`KvCache::resident_bytes`, [`METRICS_SCHEMA.md`](METRICS_SCHEMA.md) §4), not an
   allocator peak. When the reported count is zero it reads `n/a`, and the
   record omits the column; the timing row stands.
-  `scripts/perf_ab.sh` parses it.
+  `scripts/bench/ab.sh` parses it.
 
 **Refusals.** If the model's KV byte counter did not advance, the generation
 ended early without an error. `baseline` then prints no summary, writes no

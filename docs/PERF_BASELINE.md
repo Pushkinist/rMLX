@@ -78,7 +78,7 @@ model's measured runs happen together. When it is pointed at two builds in
 turn, whichever ran second wears any drift. For any two-arm question, use
 `make canary-ab`.
 
-## A/B comparison: `scripts/perf_ab.sh`
+## A/B comparison: `scripts/bench/ab.sh`
 
 Interleaved comparison of two arms. An arm is a binary plus extra
 `rmlx baseline` arguments. `make canary-ab ARGS='…'` builds `release-perf`
@@ -86,13 +86,13 @@ and runs the same harness.
 
 ```bash
 # two builds, same flags
-bash scripts/perf_ab.sh \
+bash scripts/bench/ab.sh \
   --binary-a target/release-perf/rmlx.main \
   --binary-b target/release-perf/rmlx \
   --label-a main --label-b patch
 
 # one build, two flag settings, on one model
-bash scripts/perf_ab.sh \
+bash scripts/bench/ab.sh \
   --model "$RMLX_O_MODELS_ROOT/mlx-community__gemma-4-e2b-it-mxfp8" \
   --arm-a "--kv-quant k8v8" --arm-b "--kv-quant k8v4" \
   --allow-token-divergence
@@ -218,7 +218,7 @@ scratch directory when that matters.
 comparison. Kernel selections are latched in `OnceLock` at first read, so one
 process exercises one dispatch path.
 
-**Selftests.** `make canary-ab-selftest` (`scripts/perf_ab_selftest.sh`, also
+**Selftests.** `make canary-ab-selftest` (`scripts/bench/ab_selftest.sh logic`, also
 in `make ci`) mutation-checks the harness against stub binaries with planted
 differences. It must report a planted ratio exactly, and nothing for two equal
 arms. Every case passes `--synthetic-arms`. The cases that test host gating
@@ -227,7 +227,7 @@ cases that took each route; a case that could reach this machine fails the
 suite. `scripts/bench_llama_ab_selftest.sh` carries the same boundary, with
 `ps` as its whole host surface.
 
-`make canary-ab-host-gate-fixtures` (`scripts/perf_ab_host_gate_fixtures.sh`,
+`make canary-ab-host-gate-fixtures` (`scripts/bench/ab_selftest.sh host-gate`,
 also in `make ci`) pins that boundary from both sides. The quiescence and
 Metal-exclusivity gates still refuse a shimmed hostile host. A hostile and a
 quiet host give the same verdict text under `--synthetic-arms`. The flag
