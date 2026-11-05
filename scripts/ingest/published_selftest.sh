@@ -889,7 +889,7 @@ CASE_BAD=""
 CASE_OUT="${WORK}/requery_unrecorded.log"
 mkdir -p "${WORK}/requery_home"
 env RMLX_HOME="${WORK}/requery_home" STUB_RECORDED="${WORK}/recorded.txt" \
-    python3 "${REPO_ROOT}/scripts/published/requery.py" "${BASE}" \
+    python3 "${REPO_ROOT}/scripts/ingest/requery.py" "${BASE}" \
     --rmlx-bin "${STUB_RMLX}" --out "${WORK}/requery_unrecorded.json" >"${CASE_OUT}" 2>&1
 got=$?
 [ "${got}" -ne 1 ] && note_bad "exit=${got} (want 1)"

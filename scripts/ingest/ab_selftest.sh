@@ -133,7 +133,7 @@ check() {
 	fi
 }
 
-echo "perf_ab_ingest selftest: refusal checks"
+echo "ab_selftest: refusal checks"
 
 CLEAN="$(make_result clean)"
 check accepts_a_clean_result 0 \

@@ -92,6 +92,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `ingest/llama_bench.py` | ingest/ingest.py | Ingest llama-bench JSON output into the rMLX metrics DB. |
 | `ingest/published.py` | ingest/ingest.py | Promote a `scripts/published/bench.sh` result into `runs.db`. |
 | `ingest/published_selftest.sh` | make published-ingest-selftest | Recall test for the ingest entry's published mode: refusals over a synthetic bench result. |
+| `ingest/requery.py` | ingest/published.py, ingest/published_selftest.sh | Re-query a recorded published-protocol run from `runs.db` and compare. |
 
 ## scripts/lib/
 
@@ -147,7 +148,6 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `published/greedy.py` | published/bench.sh | Seal a greedy pass, and judge a speculative one against a plain one. |
 | `published/longctx.py` | published/bench.sh | The long-context row: one canonical prompt, plain decode, a cold cache. |
 | `published/payloads.py` | published/bench.sh, published/bench_selftest.sh, published/longctx.py | Render one request payload per checked-in sample, and index them. |
-| `published/requery.py` | ingest/published.py, ingest/published_selftest.sh | Re-query a recorded published-protocol run from `runs.db` and compare. |
 | `published/samples.py` | make check-published-samples, ingest/published.py, published/bench.sh, published/fixed_prompt.py, +2 more scripts | Build and verify the checked-in published-protocol sample sets. |
 | `published/samples_selftest.sh` | make check-published-samples-fixtures | Recall test for published/samples.py verify: synthetic sample-set roots, one edit per case. |
 | `published/snapshot_sampling.py` | published/bench.sh | Read the sampling defaults a snapshot states, for a run that sends none. |

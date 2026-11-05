@@ -43,7 +43,7 @@ WHAT IS CHECKED AFTER RECORDING
 
 `--record` ends by re-querying the rows it just wrote, by the run's label and
 start time, and rebuilding the per-cell and macro means from them
-(`published/requery.py`). A result they do not reproduce is exit 1: the rows
+(`ingest/requery.py`). A result they do not reproduce is exit 1: the rows
 are not the measurement. The label is the run's own (`published/bench.sh
 --label`); it is written as `label=<label>;` at the start of every row's `notes`.
 

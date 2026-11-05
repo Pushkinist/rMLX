@@ -96,7 +96,7 @@
 #
 # The label reaches runs.db as `label=<label>;` at the start of `notes` on every
 # row, so `rmlx metrics query` finds a campaign's rows and
-# `published/requery.py` checks they reproduce the result. The label names a
+# `ingest/requery.py` checks they reproduce the result. The label names a
 # directory and enters a LIKE pattern, so it is lower-case letters, digits, `.`
 # and `-` only. A run never overwrites another: a directory that exists is an error.
 # `published/table.py` takes one result per engine mode, so a label that holds
