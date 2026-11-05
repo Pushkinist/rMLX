@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # perf_ab.sh — ABBA-interleaved A/B comparison of two `rmlx baseline` arms.
 #
-# Reached as `bash scripts/perf_canary.sh --ab ...`; runnable directly.
+# Reached as `make canary-ab`; runnable directly.
 #
 # WHY THIS EXISTS
 #

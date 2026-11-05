@@ -14,7 +14,6 @@
 class aggregate_decode_profile.py
 class bench_cache_types.sh
 class bench_cell.sh
-class bench_codec_cell.sh
 class bench_identity_selftest.sh
 class bench_llama_ab.sh
 class bench_llama_ab_selftest.sh
@@ -29,7 +28,6 @@ class perf-iter/bench_decode_tps.sh
 class perf_ab.sh
 class perf_ab_host_gate_fixtures.sh
 class perf_ab_selftest.sh
-class perf_canary.sh
 class perf_ceiling.py
 class prefill_chunk_sweep.sh
 class release_e2e/stage6_perf/codec_smoke_runner.sh
@@ -87,7 +85,6 @@ exit-undeclared aggregate_decode_profile.py 2
 exit-undeclared bench/codec_inertness_probe.sh 0,2
 exit-undeclared bench_cache_types.sh 0,2
 exit-undeclared bench_cell.sh 0,1,2,3,4,5,6,7,8,9,10
-exit-undeclared bench_codec_cell.sh 1
 exit-undeclared bench_identity_selftest.sh 1
 exit-undeclared bench_llama_ab.sh 0,4,125
 exit-undeclared bench_llama_ab_selftest.sh 1
@@ -103,7 +100,6 @@ exit-undeclared perf-iter/bench_decode_tps.sh 1,2
 exit-undeclared perf_ab.sh 0,1,125
 exit-undeclared perf_ab_host_gate_fixtures.sh 1,2
 exit-undeclared perf_ab_selftest.sh 1
-exit-undeclared perf_canary.sh 1,125
 exit-undeclared prefill_chunk_sweep.sh 0,125
 exit-undeclared release_e2e/stage6_perf/codec_smoke_runner.sh 0,1,2,3
 exit-undeclared release_e2e/stage6_perf/niah_long_context.sh 1,2
@@ -136,16 +132,15 @@ lib-run lib/prefill_ms.py mst_capture.sh
 lib-run lib/published_run_log.py published/bench.sh
 lib-run lib/run_log_for_pid.py lib/bench_server.sh
 lib-run lib/server_decode_tps.py perf-iter/bench_decode_tps.sh,spec_bench.sh
-lib-run lib/server_kv_quant.py lib/bench_server.sh,perf_canary.sh,ssd_canary.sh
+lib-run lib/server_kv_quant.py lib/bench_server.sh,ssd_canary.sh
 lib-run lib/server_sampling.py spec_bench.sh
-lib-run lib/snapshot_identity.py bench_cache_types.sh,perf-iter/bench_decode_tps.sh,perf_canary.sh,published/bench.sh,spec_bench.sh
+lib-run lib/snapshot_identity.py bench_cache_types.sh,perf-iter/bench_decode_tps.sh,published/bench.sh,spec_bench.sh
 lib-run lib/spec_round_log.py spec_bench.sh
 lib-run lib/sse_decode_window.py published/bench.sh,spec_bench.sh,spec_bench_selftest.sh
 shebang lib/snapshot_identity.py
 shebang lib/record_pending.sh
 exec-bit bench_identity_selftest.sh
 exec-bit perf_ceiling.py
-dead-path perf_canary.sh regression_gate.sh
 set-mode bench/codec_inertness_probe.sh
 set-mode bench_cache_types.sh
 set-mode bench_cell.sh
@@ -213,7 +208,6 @@ lib-shadow ssd_canary.sh wait_for_server
 binary-literal bench/codec_inertness_probe.sh 3
 binary-literal bench_cache_types.sh 1
 binary-literal bench_cell.sh 5
-binary-literal bench_codec_cell.sh 5
 binary-literal bench_identity_selftest.sh 2
 binary-literal bench_llama_ab.sh 2
 binary-literal codec_smoke_runner_selftest.sh 2
@@ -223,7 +217,6 @@ binary-literal gputrace_preflight.sh 1
 binary-literal mst_capture.sh 2
 binary-literal perf-iter/bench_decode_tps.sh 4
 binary-literal perf_ab.sh 2
-binary-literal perf_canary.sh 1
 binary-literal prefill_chunk_sweep.sh 2
 binary-literal release/release.sh 1
 binary-literal release_e2e/stage6_perf/codec_smoke_runner.sh 1
@@ -235,7 +228,6 @@ binary-literal ssd_canary.sh 1
 binary-literal run_class_selftest.sh 5
 env-knob bench/codec_inertness_probe.sh RMLX_BINARY,RMLX_HOME
 env-knob bench_cell.sh CROSS_BENCH_ROOT,CTK,CTV,CTX_MAX,KV_CANON_OVERRIDE,LABEL_PREFIX,LLAMA_CPP_ROOT,LLAMA_CPP_TURBOQUANT_ROOT,MAX_TOKENS,MEASURED_RUNS,MLX_LM_ROOT,MLX_LM_TURBOQUANT_ROOT,OMLX_ROOT,PAROQUANT_ROOT,PROMPT_ID,RMLX_HARDWARE_TAG,RMLX_HOME,RMLX_ROOT,WARMUP_RUNS
-env-knob bench_codec_cell.sh RMLX_BINARY,RMLX_HOME
 env-knob bench_llama_ab.sh RMLX_HOME
 env-knob bench_llama_ab_selftest.sh FORCE_UNMEASURED_ROWS,NO_RECORD_ARGS
 env-knob codec_smoke_runner_selftest.sh GATE_BIN
@@ -250,7 +242,6 @@ env-knob host/mlx_restore_pin.sh HOMEBREW_PREFIX
 env-knob mst_capture.sh RMLX_HOME
 env-knob perf-iter/bench_decode_tps.sh KV_QUANT,MAX_CTX,MEASURE_RUNS,METRICS_DB,METRICS_OUT,MODEL_PATH,PORT,RMLX_BIN,RMLX_HOME,WARMUP_RUNS
 env-knob perf_ab.sh RMLX_HOME,RMLX_O_MODELS_ROOT
-env-knob perf_canary.sh RMLX_HOME,RMLX_O_MODELS_ROOT
 env-knob prefill_chunk_sweep.sh RMLX_HOME
 env-knob published/table_selftest.sh MAKE_ENV
 env-knob release_e2e/stage6_perf/codec_smoke_runner.sh RMLX_O_MODELS_ROOT
@@ -272,5 +263,3 @@ unguarded-array spec_bench.sh MTP_ANSWER_DIGESTS,MTP_CLIENT_TPS_VALUES,MTP_ENGIN
 unguarded-array published/bench.sh CELLS,CELL_ARGS,FIXED_FILES,GREEDY_CELL_ARGS,HOST_WINDOWS,LC_RUNS,PASS_FILES,THERMAL_READINGS,args
 unguarded-array published/bench_selftest.sh cell_args
 unguarded-array ssd_canary.sh ALL_PROMPTS
-unguarded-array bench_codec_cell.sh decode_values,prefill_values
-unguarded-array perf_canary.sh MODELS,tps_values,turbo3_values

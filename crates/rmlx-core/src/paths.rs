@@ -113,7 +113,7 @@ pub fn kv_cache_root() -> PathBuf {
 ///
 /// review LOW-4: canonical location for criterion / shell-script
 /// bench outputs (`perf_canary.csv`, `prefix_index.csv`, …) so benches and
-/// `scripts/perf_canary.sh` agree on the same root and respect `$RMLX_HOME`.
+/// `scripts/bench/baseline_cells.sh` agree on the same root and respect `$RMLX_HOME`.
 pub fn bench_dir() -> PathBuf {
     let p = home().join("bench");
     let _ = std::fs::create_dir_all(&p);

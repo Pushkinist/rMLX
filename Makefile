@@ -95,7 +95,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         build-perf build-debug test-perf ci-perf gpu-test claim-rmlx model-check model-check-full \
         profile-samply profile-samply-debug profile-instruments bench asm perf-iter \
         canary canary-gate canary-ab canary-ab-selftest canary-ab-ingest-selftest ingest-selftest \
-        canary-ab-host-gate-fixtures codec-smoke-runner-selftest llama-ab-selftest spec-bench-selftest bench-identity-selftest run-class-selftest \
+        canary-ab-host-gate-fixtures codec-smoke-runner-selftest llama-ab-selftest spec-bench-selftest bench-identity-selftest baseline-cells-selftest run-class-selftest \
         spec-bench-published-selftest published-ingest-selftest \
         published-table check-published-table published-table-selftest \
         check-spec-metric-parity check-spec-metric-parity-fixtures \
@@ -799,6 +799,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@$(MAKE) --no-print-directory llama-ab-selftest
 	@$(MAKE) --no-print-directory spec-bench-selftest
 	@$(MAKE) --no-print-directory bench-identity-selftest
+	@$(MAKE) --no-print-directory baseline-cells-selftest
 	@$(MAKE) --no-print-directory run-class-selftest
 	@$(MAKE) --no-print-directory spec-bench-published-selftest
 	@$(MAKE) --no-print-directory published-ingest-selftest
@@ -953,8 +954,9 @@ perf-iter:       ## run 3-model regression bench in series (appends to metrics/p
 
 # ---- canary TPS gate (DB-backed, release-perf binary) -----------------
 #
-# `make canary`      — runs perf_canary.sh (1 warmup + 3 measured per model),
-#                      appends rows to <RMLX_HOME>/bench/perf_canary.csv and
+# `make canary`      — runs bench/baseline_cells.sh --preset canary (1 warmup + 3
+#                      measured per model), appends rows to
+#                      <RMLX_HOME>/bench/perf_canary.csv and
 #                      records one run per model into runs.db via
 #                      `rmlx baseline --record` (the source of truth).
 #                      Requires the release-perf binary; build with `make build-perf`.
@@ -982,7 +984,7 @@ CANARY_THRESHOLD_PCT ?= 3
 # Usage: make canary-gate SHA=3ba8aee
 
 canary: build-perf  ## run 3-model TPS canary (records into runs.db + legacy CSV); requires release-perf binary
-	bash scripts/perf_canary.sh
+	bash scripts/bench/baseline_cells.sh --preset canary --models-root "$(RMLX_O_MODELS_ROOT)"
 
 # The canary tracks ONE build over time. Comparing two builds (or two flag
 # settings) needs the interleaved harness, or ordering and thermal drift land
@@ -991,7 +993,7 @@ canary: build-perf  ## run 3-model TPS canary (records into runs.db + legacy CSV
 # Pass arms through ARGS, e.g.
 #   make canary-ab ARGS='--binary-a target/release-perf/rmlx.main --binary-b target/release-perf/rmlx'
 canary-ab: build-perf  ## interleaved A/B of two arms (ARGS='--binary-a … --binary-b …'); see docs/PERF_BASELINE.md
-	bash scripts/perf_canary.sh --ab $(ARGS)
+	bash scripts/perf_ab.sh $(ARGS)
 
 canary-ab-selftest: ## mutation-check the A/B harness against stub binaries (no GPU, no model)
 	bash scripts/perf_ab_selftest.sh
@@ -1014,8 +1016,11 @@ llama-ab-selftest: ## mutation-check the llama-server A/B harness against a stub
 spec-bench-selftest: ## mutation-check the spec-decode bench against a stub server (no GPU, no model, no DB write; builds the dev rmlx, which judges a near-tie flip)
 	bash scripts/spec_bench_selftest.sh
 
-bench-identity-selftest: ## mutation-check the commit and run-log sources of perf_canary.sh, bench_decode_tps.sh and lib/identity.sh against stub binaries (no GPU, no model, no DB write)
+bench-identity-selftest: ## mutation-check the commit and run-log sources of the canary, bench_decode_tps.sh and lib/identity.sh against stub binaries (no GPU, no model, no DB write)
 	bash scripts/bench_identity_selftest.sh
+
+baseline-cells-selftest: ## recall-check the canary preset and the single codec cell: argv, CSV rows, median and stddev, records, exit codes (stub binary; no GPU, no model, no DB write)
+	bash scripts/bench/baseline_cells_selftest.sh
 
 run-class-selftest: ## check that the capture scripts, the codec probe and its ingest record under a stated run class, and record a run once (stub binaries; no GPU, no model, no DB write)
 	bash scripts/run_class_selftest.sh
@@ -1165,8 +1170,8 @@ ssd-canary-gate:   ## gate SSD-tier regressions; SHA= required, THRESHOLD_PCT=3 
 
 # ---- Per-codec × per-model cell bench ------------------------------------
 #
-# Run a single-codec, single-model bench and append 3 rows to
-# .rmlx/bench/codec_cells.csv.
+# Run a single-codec, single-model bench: 1 warmup and 3 measured runs, each
+# recorded in runs.db as `diagnostic`.
 #
 # Usage:
 #   make bench-codec-cell CODEC=<codec> MODEL=<snapshot-abs-path>
@@ -1175,15 +1180,15 @@ ssd-canary-gate:   ## gate SSD-tier regressions; SHA= required, THRESHOLD_PCT=3 
 #   make bench-codec-cell CODEC=k8v4 MODEL=/path/to/mlx-community__gemma-4-e4b-it-mxfp8
 #   make bench-codec-cell CODEC=iso3_sym MODEL=/path/to/mlx-community__Qwen3.8-27B-4bit
 #
-# See scripts/bench_codec_cell.sh for full options (--max-tokens, --prompt-len).
-# CSV schema documented in docs/PERF_BASELINE.md § "Per-codec × per-model cells".
+# See scripts/bench/baseline_cells.sh for full options (--max-tokens,
+# --prompt-tokens, --warmup, --runs, --label, --binary).
 
-bench-codec-cell: ## bench one codec × one model cell (CODEC= MODEL= required); appends to .rmlx/bench/codec_cells.csv
+bench-codec-cell: ## bench one codec × one model cell (CODEC= MODEL= required); records each run as diagnostic
 	@if [ -z "$(CODEC)" ] || [ -z "$(MODEL)" ]; then \
 		echo "Usage: make bench-codec-cell CODEC=<codec> MODEL=<snapshot-abs-path>"; \
 		exit 2; \
 	fi
-	bash scripts/bench_codec_cell.sh --kv-quant $(CODEC) --model $(MODEL)
+	bash scripts/bench/baseline_cells.sh --model $(MODEL) --kv-quant $(CODEC) --record diagnostic
 
 # ---- Codec smoke + NIAH gate matrix -------------------------------------
 # Drive scripts/release_e2e/stage6_perf/codec_smoke_runner.sh over

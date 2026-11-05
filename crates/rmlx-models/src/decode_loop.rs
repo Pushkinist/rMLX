@@ -866,7 +866,7 @@ pub(crate) fn pipelined_decode(
 
 /// Emit the `sampler_profile` event for the host-selection steps of one decode
 /// call. Silent when no step took that path, so a greedy run — the shape
-/// `scripts/perf_canary.sh` measures — produces no event at all.
+/// `scripts/bench/baseline_cells.sh --preset canary` measures — produces no event at all.
 ///
 /// The event exists because the host-selection cost is otherwise unobservable:
 /// it is charged to whichever step it ran in and never separated from the

@@ -25,10 +25,12 @@ host. Absolute decode TPS drifts between runs on a busy host. Only an
 interleaved A/B run supports a direction between two builds.
 
 **Canary protocol.** `make canary` builds the `release-perf` binary and runs
-`scripts/perf_canary.sh`:
+`scripts/bench/baseline_cells.sh --preset canary`:
 
-- Models: the three above. `bash scripts/perf_canary.sh --include-26b` adds
-  `mlx-community__gemma-4-26b-a4b-it-mxfp8`.
+- Models: the three above. `--include-26b` adds
+  `mlx-community__gemma-4-26b-a4b-it-mxfp8`. `--models-root` names the
+  directory that holds the snapshots; `make canary` passes
+  `$RMLX_O_MODELS_ROOT`.
 - Shape: `rmlx baseline --prompt-tokens 4096 --max-tokens 100
   --max-ctx 8192`, with no `--kv-quant`.
 - Runs: 1 warmup discarded, 3 measured; median and sample stddev.
@@ -74,9 +76,9 @@ on a cell that runs long.
 **The canary tracks one build over time. It cannot compare two.** All of a
 model's measured runs happen together. When it is pointed at two builds in
 turn, whichever ran second wears any drift. For any two-arm question, use
-`--ab`.
+`make canary-ab`.
 
-## A/B comparison: `perf_canary.sh --ab` (`scripts/perf_ab.sh`)
+## A/B comparison: `scripts/perf_ab.sh`
 
 Interleaved comparison of two arms. An arm is a binary plus extra
 `rmlx baseline` arguments. `make canary-ab ARGS='…'` builds `release-perf`
@@ -84,13 +86,13 @@ and runs the same harness.
 
 ```bash
 # two builds, same flags
-bash scripts/perf_canary.sh --ab \
+bash scripts/perf_ab.sh \
   --binary-a target/release-perf/rmlx.main \
   --binary-b target/release-perf/rmlx \
   --label-a main --label-b patch
 
 # one build, two flag settings, on one model
-bash scripts/perf_canary.sh --ab \
+bash scripts/perf_ab.sh \
   --model "$RMLX_O_MODELS_ROOT/mlx-community__gemma-4-e2b-it-mxfp8" \
   --arm-a "--kv-quant k8v8" --arm-b "--kv-quant k8v4" \
   --allow-token-divergence
@@ -234,23 +236,15 @@ waives no arm-reading guard.
 ## Per-codec × per-model cells
 
 `make bench-codec-cell CODEC=<codec> MODEL=<snapshot>` runs
-`scripts/bench_codec_cell.sh`. It runs `rmlx baseline --kv-quant <codec>`, 1
-warmup and 3 measured runs, at `--prompt-len 4096` and `--max-tokens 100` by
-default. The binary is `$RMLX_BINARY`, else `target/release-perf/rmlx`, else
-`target/release/rmlx`. It appends three rows to
-`$RMLX_HOME/bench/codec_cells.csv` and gates nothing.
-
-| Column | Type | Meaning |
-|---|---|---|
-| timestamp | ISO-8601 | When the row was recorded |
-| codec | string | The `--kv-quant` value |
-| model | string | Snapshot directory basename |
-| prompt_len | int | `--prompt-tokens` value |
-| max_tokens | int | `--max-tokens` value |
-| run_idx | int | 1, 2 or 3 |
-| decode_tps | float | Decode tokens per second |
-| prefill_tps | float | Prefill tokens per second |
-| git_sha | string | `HEAD` at bench time, first 12 characters |
+`scripts/bench/baseline_cells.sh --model <snapshot> --kv-quant <codec>
+--record diagnostic`. It runs `rmlx baseline --kv-quant <codec>`, 1 warmup and
+3 measured runs, at `--prompt-tokens 4096` and `--max-tokens 100` by default
+(`--warmup`, `--runs`, `--prompt-tokens` and `--max-tokens` change them), and
+prints the mean decode and prefill rate and the sample stddev of the measured
+runs. Every run, the warmup included, is recorded in `runs.db` as `diagnostic`
+under one label (`codec_cell:<utc stamp>:<codec>`, or `--label`), so the cell
+reaches no champion and no gate. The binary is `--binary`, else
+`target/release-perf/rmlx`, else `target/release/rmlx`.
 
 ## Reading a decode rate against the bandwidth ceiling
 

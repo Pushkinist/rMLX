@@ -9,8 +9,8 @@
 #     diagnostic`, and keep their trace when its record did not land, ending 75.
 #   - bench/codec_inertness_probe.sh records each run as diagnostic, and keeps
 #     a measured run's status apart from its record's (`landed` or `pending`).
-#   - bench_codec_cell.sh, the bench_cache_types.sh smoke probes and
-#     eval/wikitext2_ppl.py keep a reading whose record did not land (exit 75).
+#   - the bench_cache_types.sh smoke probes and eval/wikitext2_ppl.py keep a
+#     reading whose record did not land (exit 75).
 #   - ingest/ingest.py codec-inertness skips a row the probe already recorded,
 #     refuses a snapshot with no recordable label, and refuses a recorder built
 #     before the run class before writing anything.
@@ -389,35 +389,9 @@ used="$(sort -u "$WORK/llama_recorder.log" | tr '\n' ' ')"
 [ "$used" = "checkout " ] || bad="the recorder that ran: ${used:-none} (want the checkout's build only); $(tail -2 "$WORK/llama_record.out" | tr '\n' ' ')"
 verdict llama_bench_records_through_the_checkout "an rmlx on PATH is not chosen over the checkout's build" "$bad"
 
-# ── bench_codec_cell.sh, bench_cache_types.sh, codec_smoke_runner.sh ─────────
+# ── bench_cache_types.sh, codec_smoke_runner.sh ──────────────────────────────
 #
 # Each records its runs as diagnostic; the stub logs the argv it is handed.
-ARGV_LOG="$WORK/codec_cell.argv"
-: >"$ARGV_LOG"
-set +e
-ARGV_LOG="$ARGV_LOG" RMLX_BINARY="$PROBE_BIN" RMLX_HOME="$WORK/home" \
-	bash "$REPO_ROOT/scripts/bench_codec_cell.sh" --kv-quant k8v8 --model "$MODEL" \
-	>"$WORK/codec_cell.out" 2>&1
-set -e
-bad=""
-runs="$(grep -cE -- '--record --run-class diagnostic --label codec_cell:[0-9]{8}T[0-9]{6}Z:k8v8' "$ARGV_LOG" || true)"
-[ "$runs" = 4 ] || bad="$runs of 4 runs asked to record as diagnostic: $(head -1 "$ARGV_LOG")"
-verdict codec_cell_records_diagnostic "the warmup and the three measured runs record as diagnostic" "$bad"
-
-set +e
-STUB_NO_INGEST=k8v8 ARGV_LOG="$WORK/codec_cell_fail.argv" RMLX_BINARY="$PROBE_BIN" RMLX_HOME="$WORK/home_cell" \
-	bash "$REPO_ROOT/scripts/bench_codec_cell.sh" --kv-quant k8v8 --model "$MODEL" \
-	>"$WORK/codec_cell_fail.out" 2>&1
-status=$?
-set -e
-bad=""
-[ "$status" -eq 75 ] || bad="exit=$status (want 75)"
-grep -q 'record pending: /x/pending/stub.json' "$WORK/codec_cell_fail.out" || bad="${bad:+$bad; }the buffer file is not named"
-[ "$(grep -c ',k8v8,host__m,' "$WORK/home_cell/bench/codec_cells.csv" 2>/dev/null || true)" = 3 ] ||
-	bad="${bad:+$bad; }the three readings were not kept"
-grep -q 'mean decode_tps=10.0' "$WORK/codec_cell_fail.out" || bad="${bad:+$bad; }no summary"
-verdict codec_cell_keeps_readings_whose_record_is_pending "runs whose record did not land keep their readings; the cell names the files and ends 75" "$bad"
-
 # The cache-type driver runs `target/release/rmlx` under its own root, so it
 # uses the fake root above; a smoke probe that exits 78 (an unsupported combo)
 # skips its cell, so no cell driver runs.

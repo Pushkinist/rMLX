@@ -11,7 +11,6 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `aggregate_decode_profile.py` | none | Aggregate per-model decode_profile lines from profile_<MODEL>.txt into one CSV row per model. |
 | `bench_cache_types.sh` | run_class_selftest.sh | bench_cache_types.sh — drive the cache-type combo matrix for a single model. |
 | `bench_cell.sh` | bench_cache_types.sh | Per-cell driver for cross-backend bench. |
-| `bench_codec_cell.sh` | make bench-codec-cell, run_class_selftest.sh | bench_codec_cell.sh — single-codec × single-model bench runner. |
 | `bench_identity_selftest.sh` | make bench-identity-selftest | bench_identity_selftest.sh — mutation check for the commit and run-log sources |
 | `bench_llama_ab.sh` | bench_llama_ab_selftest.sh | bench_llama_ab.sh — ABBA-interleaved A/B comparison of two `llama-server` arms. |
 | `bench_llama_ab_selftest.sh` | make llama-ab-selftest | bench_llama_ab_selftest.sh — mutation check for `scripts/bench_llama_ab.sh`. |
@@ -21,10 +20,9 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `gpu_capture.sh` | make profile-gputrace, run_class_selftest.sh | Capture a Metal GPU trace of a bounded window of steady-state decode, for |
 | `gputrace_preflight.sh` | make build-capture, make gputrace-preflight, gpu_capture.sh | Check the host prerequisites for Apple's GPU tools to work with a Metal capture of this binary. |
 | `mst_capture.sh` | make profile-mst, run_class_selftest.sh | Record a Metal System Trace of a live rmlx run, export the GPU-interval table |
-| `perf_ab.sh` | perf_ab_host_gate_fixtures.sh, perf_ab_selftest.sh, perf_canary.sh | perf_ab.sh — ABBA-interleaved A/B comparison of two `rmlx baseline` arms. |
+| `perf_ab.sh` | make canary-ab, perf_ab_host_gate_fixtures.sh, perf_ab_selftest.sh | perf_ab.sh — ABBA-interleaved A/B comparison of two `rmlx baseline` arms. |
 | `perf_ab_host_gate_fixtures.sh` | make canary-ab-host-gate-fixtures | Recall test for the perf_ab.sh boundary: --synthetic-arms gives the same verdict on any host. |
 | `perf_ab_selftest.sh` | make canary-ab-selftest | perf_ab_selftest.sh — mutation check for `scripts/perf_ab.sh`. |
-| `perf_canary.sh` | make canary, make canary-ab | perf_canary.sh — fast decode-TPS canary for the three standard test-target models. |
 | `perf_ceiling.py` | check/engine_parity_selftest.sh, published/table.py | Theoretical decode/prefill ceiling calculator for rMLX on Apple Silicon. |
 | `prefill_chunk_sweep.sh` | none | prefill_chunk_sweep.sh — Latin-square sweep of one architecture's prefill |
 | `rmlx-capture.entitlements` | make build-capture | Debug-only entitlement for the GPU-capture binary (`make build-capture`). |
@@ -40,6 +38,8 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
+| `bench/baseline_cells.sh` | make bench-codec-cell, make canary, bench/baseline_cells_selftest.sh | baseline_cells.sh — decode-rate cells through `rmlx baseline`: the canary, or one model and codec |
+| `bench/baseline_cells_selftest.sh` | make baseline-cells-selftest | Recall test for the baseline cells tool: canary rows, argv, records and exit codes under a stub rmlx |
 | `bench/codec_inertness_probe.sh` | run_class_selftest.sh | codec_inertness_probe.sh — does a KV codec change anything a caller can see? |
 
 ## scripts/check/
@@ -99,25 +99,25 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
 | `lib/awk_text.sh` | crates/rmlx-models/tests/common/stop_scan.rs, check/gpu_device_census.sh, check/gpu_tests.sh, check/kernel_dispatch.sh, +2 more scripts | Line readers for Rust-scanning gates: code without comments, without string bodies, bodiless fns. |
-| `lib/bench_server.sh` | perf_canary.sh, published/bench.sh, spec_bench.sh | Start, wait for and identify one rmlx server, for bench harnesses; source it. |
+| `lib/bench_server.sh` | bench/baseline_cells.sh, published/bench.sh, spec_bench.sh | Start, wait for and identify one rmlx server, for bench harnesses; source it. |
 | `lib/busiest_between.awk` | bench_llama_ab.sh, perf_ab.sh, perf_ab_selftest.sh, +2 more scripts | Which process burned the most CPU between two cpu_snapshot files. |
 | `lib/cpu_snapshot.sh` | bench_llama_ab.sh, perf_ab.sh, perf_ab_selftest.sh, +2 more scripts | Per-process cumulative CPU seconds, for interference gates; source it. |
-| `lib/identity.sh` | bench_cell.sh, perf-iter/bench_decode_tps.sh, perf_canary.sh, +4 more scripts | Shared §8.5 run-identity for rMLX bench scripts. |
+| `lib/identity.sh` | bench/baseline_cells.sh, bench_cell.sh, perf-iter/bench_decode_tps.sh, +4 more scripts | Shared §8.5 run-identity for rMLX bench scripts. |
 | `lib/kv_boundary_default.py` | ingest/ingest.py | The engine's default KV boundary-layer counts, read from the engine. |
 | `lib/metal_dirs.sh` | check/kernel_dispatch.sh, check/metal_kernels.sh, check/metal_kernels_selftest.sh, +1 more scripts | The directories holding gated .metal kernels; sourced by the metal gates. |
 | `lib/mlx_pin.sh` | crates/rmlx-mlx/src/pin_tests.rs, host/mlx_restore_pin.sh | Read the validated MLX / mlx-c pair from its one declaration. |
 | `lib/prefill_ms.py` | mst_capture.sh | Read the prefill time of an rmlx run out of its log: `generate: prefill{prefill_ms}`. |
 | `lib/published_run_log.py` | lib/prefill_ms.py, published/bench.sh, published/binary_identity.py, +1 more scripts | Read one rmlx run log back as a per-request table. |
-| `lib/record_pending.sh` | crates/rmlx-cli/src/exit_tests.rs, bench/codec_inertness_probe.sh, bench_cache_types.sh, bench_codec_cell.sh, +4 more scripts | The exit code `rmlx baseline --record` and `rmlx eval ppl --corpus` give a |
+| `lib/record_pending.sh` | crates/rmlx-cli/src/exit_tests.rs, bench/baseline_cells.sh, bench/codec_inertness_probe.sh, bench_cache_types.sh, +3 more scripts | The exit code `rmlx baseline --record` and `rmlx eval ppl --corpus` give a |
 | `lib/recorder_check.py` | ingest/ingest.py, ingest/llama_bench.py | Refuse a recorder that cannot state a run class. |
 | `lib/rmlx_home.py` | ingest/ingest.py, ingest/llama_bench.py | Resolve the runtime home the way the binary does. |
 | `lib/run_log_for_pid.py` | lib/bench_server.sh | Pick the run log a given process wrote, out of the candidates on stdin. |
-| `lib/selftest_support.sh` | bench_llama_ab_selftest.sh, check/engine_parity_selftest.sh, check/gpu_device_census_selftest.sh, +18 more scripts | The case runner and shims the self-tests share; source it. |
+| `lib/selftest_support.sh` | bench/baseline_cells_selftest.sh, bench_llama_ab_selftest.sh, check/engine_parity_selftest.sh, +19 more scripts | The case runner and shims the self-tests share; source it. |
 | `lib/server_decode_tps.py` | perf-iter/bench_decode_tps.sh, spec_bench.sh | Read one request's decode rate off a running rmlx server. |
-| `lib/server_kv_quant.py` | lib/bench_server.sh, perf_canary.sh, published/binary_identity.py, +1 more scripts | Read the KV codec a run resolved out of its rmlx run log. |
+| `lib/server_kv_quant.py` | lib/bench_server.sh, published/binary_identity.py, ssd_canary.sh | Read the KV codec a run resolved out of its rmlx run log. |
 | `lib/server_sampling.py` | crates/rmlx-server/src/engine/sampler_event_tests.rs, lib/published_run_log.py, spec_bench.sh | Read whether a run's requests were sampled, out of its rmlx run log. |
 | `lib/skip_notice_patterns.sh` | check/gpu_tests.sh, suite/run_gpu_tests.sh | The SKIP and WAIVED stand-down notice patterns, defined once for the runner and the gate. |
-| `lib/snapshot_identity.py` | bench_cache_types.sh, ingest/ingest.py, ingest/llama_bench.py, +5 more scripts | Read a model snapshot's identity columns out of the snapshot itself. |
+| `lib/snapshot_identity.py` | bench_cache_types.sh, ingest/ingest.py, ingest/llama_bench.py, +4 more scripts | Read a model snapshot's identity columns out of the snapshot itself. |
 | `lib/spec_round_log.py` | lib/published_run_log.py, published/binary_identity.py, spec_bench.sh | Read a speculative round loop's own numbers back out of an rmlx run log. |
 | `lib/sse_decode_window.py` | published/bench.sh, spec_bench.sh, spec_bench_selftest.sh | Time a streamed chat-completions response over its decode window. |
 | `lib/workspace_members.sh` | check/gpu_tests.sh, suite/gpu_test_classes.sh | The workspace members of a Cargo.toml, parsed and normalised once for the tools that read them. |

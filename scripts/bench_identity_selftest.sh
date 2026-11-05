@@ -9,8 +9,9 @@
 #
 #   - lib/identity.sh: the identity's git_sha, its refusals, its normalisation.
 #   - perf-iter/bench_decode_tps.sh: a git_sha is data, never source.
-#   - perf_canary.sh: the filed sha is the identity's, the codec is read from the
-#     run log the probe wrote, also when that log is shared with another process.
+#   - bench/baseline_cells.sh --preset canary: the filed sha is the identity's, the
+#     codec is read from the run log the probe wrote, also when that log is shared
+#     with another process.
 #
 # No GPU, no model, no DB.
 #
@@ -222,7 +223,7 @@ tail -3 "$CASE/out.log" | sed 's/^/        | /' >"$CASE/tail.txt"
 verdict decode_sha_is_data "a git_sha is data: never run, filed as given, not in file names" "${bad#; }"
 [ -z "$bad" ] || cat "$CASE/tail.txt"
 
-# ── perf_canary.sh ────────────────────────────────────────────────────────────
+# ── bench/baseline_cells.sh --preset canary ───────────────────────────────────
 
 CANARY_STUB="$FAKE_ROOT/target/release-perf/rmlx"
 cat >"$CANARY_STUB" <<STUBEOF
@@ -230,7 +231,12 @@ cat >"$CANARY_STUB" <<STUBEOF
 set -eu
 case "\$1" in
 claim) exit 0 ;;
-metrics) echo '{$BASE_IDENTITY}' ;;
+metrics)
+	case "\$2" in
+	path) echo "\$RMLX_HOME" ;;
+	*) echo '{$BASE_IDENTITY}' ;;
+	esac
+	;;
 baseline)
 	printf '%s\n' "\$*" >>"\$RMLX_HOME/baseline_argv"
 	if [ -n "\${STUB_SHARED_LOG:-}" ]; then
@@ -281,9 +287,9 @@ canary_case() {
 		PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
 		HOME="$WORK" \
 		RMLX_HOME="$home" \
-		RMLX_O_MODELS_ROOT="$WORK/models" \
 		${env_extra[@]+"${env_extra[@]}"} \
-		bash "$FAKE_ROOT/scripts/perf_canary.sh" >"$home/out.log" 2>&1
+		bash "$FAKE_ROOT/scripts/bench/baseline_cells.sh" --preset canary --models-root "$WORK/models" \
+		>"$home/out.log" 2>&1
 	CANARY_STATUS=$?
 	set -e
 	CANARY_HOME="$home"

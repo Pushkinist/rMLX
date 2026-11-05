@@ -500,7 +500,7 @@ supplies:
   (`rmlx_git_sha` in `scripts/lib/identity.sh`). A hex sha that resolves in
   that repo is filed in the short form HEAD is filed in; any other value is
   filed as given, and an `unknown...` value counts as none. This covers
-  `spec_bench.sh`, `ssd_canary.sh`, `perf_canary.sh`, `bench_cell.sh`,
+  `spec_bench.sh`, `ssd_canary.sh`, `bench/baseline_cells.sh`, `bench_cell.sh`,
   `bench_cache_types.sh` and `perf-iter/bench_decode_tps.sh`.
 - `rmlx baseline --git-sha <sha>` and `rmlx eval ppl --git-sha <sha>` stamp
   it. Without the flag it is `NULL`.

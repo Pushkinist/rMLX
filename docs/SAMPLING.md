@@ -280,7 +280,7 @@ over the steps that took the host path. A greedy run emits nothing.
 | `sample_share_pct` | `sample / step`. |
 
 `rmlx bench --temperature`, `--top-p`, `--top-k` and `--repetition-penalty`
-drive the path. `scripts/perf_canary.sh` is greedy-only and cannot see it.
+drive the path. `scripts/bench/baseline_cells.sh --preset canary` is greedy-only and cannot see it.
 
 `sample_share_pct` is not a bound in either direction:
 

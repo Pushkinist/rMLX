@@ -127,7 +127,7 @@ fn phase_timing_single_token_falls_back_to_overall() {
 //
 // Mirrors `eval_tests::build_record_stamps_identity_from_the_single_source` /
 // `build_record_git_sha_absent_is_null` — `build_run_record` is the OTHER
-// (and, via `perf_canary.sh`, the more heavily exercised) record builder that
+// (and, via `bench/baseline_cells.sh`, the more heavily exercised) record builder that
 // threads `--git-sha` through, and it is pure — no model, no GPU claim.
 
 #[test]

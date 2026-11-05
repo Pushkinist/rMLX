@@ -527,8 +527,8 @@ the change touches**, each at its best-known KV quant.
 - Models out of scope (do not bench, do not optimize): Laguna, DR-Venus.
 
 **Perf tooling.** The fast pre-commit smoke is `make canary`, which builds
-`release-perf` and runs the canary script: 1 warmup + 3 measured
-baseline calls per model (Bonsai, Gemma4-e4b, Qwen3.6). It prints decode-only
+`release-perf` and runs `scripts/bench/baseline_cells.sh --preset canary`: 1
+warmup + 3 measured baseline calls per model (Bonsai, Gemma4-e4b, Qwen3.6). It prints decode-only
 TPS, appends one CSV row per model to `<RMLX_HOME>/bench/perf_canary.csv` and
 records one further run in `runs.db`. The anchors in `docs/PERF_BASELINE.md`
 are at the bf16 `auto` default (Bonsai ~142, Gemma4-e4b ~80, Qwen3.6 ~101
