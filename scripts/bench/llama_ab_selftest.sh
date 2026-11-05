@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bench_llama_ab_selftest.sh — mutation check for `scripts/bench_llama_ab.sh`.
+# bench/llama_ab_selftest.sh — mutation check for `scripts/bench/llama_ab.sh`.
 #
 # Every guard in that harness exists because a specific wrong answer is
 # reachable without it. A guard nobody has watched fail is a comment. This file
@@ -13,8 +13,8 @@
 
 set -uo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-AB="$ROOT/scripts/bench_llama_ab.sh"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+AB="$ROOT/scripts/bench/llama_ab.sh"
 
 # shellcheck source=scripts/lib/selftest_support.sh
 . "$ROOT/scripts/lib/selftest_support.sh"
@@ -148,7 +148,7 @@ chmod +x "$CLAIM_STUB"
 
 # WHY EVERY CASE DECLARES ITS ARMS SYNTHETIC
 #
-# `bench_llama_ab.sh` refuses to measure on a host it does not have to itself,
+# `bench/llama_ab.sh` refuses to measure on a host it does not have to itself,
 # and taints a comparison that ran alongside a foreign process. That is right
 # for a measurement and wrong for this file, whose arms are stub HTTP servers
 # emitting canned timings and whose every expectation is a fact about the
@@ -271,7 +271,7 @@ check() {
 	fi
 }
 
-echo "bench_llama_ab selftest"
+echo "llama_ab selftest"
 
 # --- guard: indistinguishable arms -------------------------------------------
 STUB_A="$(make_stub a "50,52" "$KV_OK" "hello world")"
@@ -553,7 +553,7 @@ fi
 LOCAL=$((PASS + FAIL - SYNTHETIC_CASES - REAL_HOST_CASES - HOST_READING_CASES))
 printf 'host inputs: %d synthetic-arm cases (the machine is not consulted); %d against a shimmed ps; %d ran no comparison; %d read this machine.\n' \
 	"$SYNTHETIC_CASES" "$REAL_HOST_CASES" "$LOCAL" "$HOST_READING_CASES"
-echo "bench_llama_ab selftest: $PASS passed, $FAIL failed"
+echo "llama_ab selftest: $PASS passed, $FAIL failed"
 [ "$HOST_READING_CASES" -eq 0 ] || {
 	echo "  FAIL  $HOST_READING_CASES case(s) can read this machine, so this suite's answer is not a property of the code" >&2
 	exit 1

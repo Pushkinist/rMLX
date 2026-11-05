@@ -739,7 +739,7 @@ change to what `bests` publishes, such as a `METRICS_SCHEMA.md` §4.1 bounds cha
 21. **Record every measurement run, under its class** (§8.5). `gate`: a
     canary, a release gate, the surviving arm of an A/B recorded once.
     `ab_arm`: every A/B slot; `scripts/bench/ab.sh` records each slot, and
-    `scripts/bench_llama_ab.sh` each arm's medians. `diagnostic`: profiling,
+    `scripts/bench/llama_ab.sh` each arm's medians. `diagnostic`: profiling,
     traced and investigation runs, among them the canary's warmup and
     measured calls, a GPU capture, an inertness sweep and the server's live
     requests. Only `gate` rows reach `bests`, the gates and the exports.

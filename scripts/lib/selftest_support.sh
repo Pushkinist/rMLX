@@ -13,7 +13,7 @@
 #
 # The two spec-bench tests drive a harness against a stub server and need a
 # stand-in for `python3` that stands between the harness and the client reader.
-# They and bench_llama_ab_selftest.sh need a wait that cannot hang.
+# They and bench/llama_ab_selftest.sh need a wait that cannot hang.
 
 # st_stub_http <dir> — write stub_http.py into <dir>, beside the stub server file
 # that imports it. It is what the two spec-bench tests' stub servers share; each

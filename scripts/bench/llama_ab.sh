@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bench_llama_ab.sh — ABBA-interleaved A/B comparison of two `llama-server` arms.
+# bench/llama_ab.sh — ABBA-interleaved A/B comparison of two `llama-server` arms.
 #
 # WHY THIS EXISTS
 #
@@ -78,7 +78,7 @@
 
 set -eu
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
 AWK_BUSIEST="${REPO_ROOT}/scripts/lib/busiest_between.awk"
 # shellcheck source=scripts/lib/args.sh
@@ -98,7 +98,7 @@ RECORD_ARGS=""
 
 usage() {
 	cat <<'USAGE'
-bench_llama_ab.sh --bin-a P --bin-b P --model GGUF --prompt-file F [options]
+bench/llama_ab.sh --bin-a P --bin-b P --model GGUF --prompt-file F [options]
 
   --bin-a/--bin-b PATH     llama-server binary per arm (required)
   --args-a/--args-b STR    extra server flags per arm, e.g. "-ctk turbo3 -ctv turbo3"

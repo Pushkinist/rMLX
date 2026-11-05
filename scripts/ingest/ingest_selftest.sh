@@ -5,7 +5,7 @@
 #
 # Each case drives the tool in one mode over a synthetic result or CSV and a stub `rmlx` that only
 # files what it is handed, then asserts the literal exit code, the reason text and what is left in
-# staging and in the pending queue. `ab_selftest.sh`, `bench_llama_ab_selftest.sh` and
+# staging and in the pending queue. `ab_selftest.sh`, `bench/llama_ab_selftest.sh` and
 # `published_selftest.sh` hold the refusals of their own sources; this file holds the
 # record fields of codec-inertness and llama-bench, which nothing else watches, and the tail the
 # modes share: dry run, staged but not ingested, ingested, and a recorder that refuses.
@@ -327,7 +327,7 @@ why="$(st_check 1 --has 'ingest FAILED for' --has '(exit 3); record kept in stag
 }the refused record was left in pending"
 st_verdict ab_refused_record_stays_in_staging "$why" "a recorder that refuses ends 1 and the record goes back to staging"
 
-# ── ab --harness llama: a bench_llama_ab.sh result ────────────────────────────
+# ── ab --harness llama: a bench/llama_ab.sh result ────────────────────────────
 
 cat >"$ST_WORK/llama_ab.json" <<'JSON'
 {"ts_utc": "2026-10-01T00:00:00Z", "n_ctx": 8192, "n_predict": 64, "verdict": "SEPARATED",
@@ -354,7 +354,7 @@ why="$(st_check 0 --has '"backend": "llama_cpp"' --has '"backend": "llama_cpp_tq
     --has '"kv_quant": "turbo3"' --has '"model_namespace": "hf"' --has '"ctx_max": 8192' --has '"max_tokens": 64' \
     --has '"prompt_tokens": 1000' --has '"n_measure": 2' --has '"name": "prefill_tps"' --has '"value": 905.0' \
     --has '"value": 104857600' --has '"name": "peak_rss_mb"' --has '"value": 4005.0' --has '"value": 51.0' \
-    --has 'bench_llama_ab.sh ABBA n=2/arm' --has '<45 chars>')"
+    --has 'bench/llama_ab.sh ABBA n=2/arm' --has '<45 chars>')"
 [ "$(printf '%s\n' "$ST_OUT" | grep -c '"schema_version"')" = 2 ] || why="${why:+$why
 }not one record for each arm"
 st_verdict llama_ab_record_fields "$why" "both arms are written as ab_arm, one record each, with their own backend"

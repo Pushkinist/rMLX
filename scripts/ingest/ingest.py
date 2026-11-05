@@ -12,7 +12,7 @@ Exit:   0 records written, printed or filed; 1 the recorder refused a record, or
 Not a mode of: bench/baseline_cells.sh — that one runs a model and measures; this one
         promotes a finished result into records
 
-`ab` takes a `bench/ab.sh` result (`--harness rmlx`, the default) or a `bench_llama_ab.sh` result
+`ab` takes a `bench/ab.sh` result (`--harness rmlx`, the default) or a `bench/llama_ab.sh` result
 (`--harness llama`). Both harnesses write each slot as an `ab_arm` row, which reaches no champion
 and no gate; `--keep-arm A|B` promotes the surviving arm as one `gate` record. The llama harness
 runs this itself, without `--keep-arm`, after every real run: both arms are then `ab_arm`.
@@ -515,7 +515,7 @@ def _ab_record(
 
 
 def ab_llama(argv: list[str]) -> int:
-    """Write the arms of a `bench_llama_ab.sh` result as records.
+    """Write the arms of a `bench/llama_ab.sh` result as records.
 
     Without `--keep-arm` both arms are written as `ab_arm`, one record each, which is what the
     harness does after every real run. With `--keep-arm A|B` that arm alone is written, as
@@ -527,7 +527,7 @@ def ab_llama(argv: list[str]) -> int:
     is then carried into `notes`.
     """
     p = argparse.ArgumentParser(prog="ingest.py ab --harness llama", description=ab_llama.__doc__)
-    p.add_argument("result", nargs="?", help="JSON emitted by bench_llama_ab.sh")
+    p.add_argument("result", nargs="?", help="JSON emitted by bench/llama_ab.sh")
     p.add_argument("--prompt-file", required=True, help="the prompt body that was sent")
     p.add_argument("--prompt-name", required=True)
     p.add_argument("--prompt-notes", default=None)
@@ -564,7 +564,7 @@ def ab_llama(argv: list[str]) -> int:
         default=None,
         help="write only this arm, as gate: the surviving arm of an accepted "
         "comparison (docs/METRICS_DB.md §8.5). Without it both arms are written "
-        "as ab_arm, which is what bench_llama_ab.sh does after every real run.",
+        "as ab_arm, which is what bench/llama_ab.sh does after every real run.",
     )
     p.add_argument("--accept-tainted", action="store_true")
     p.add_argument("--dry-run", action="store_true")
@@ -574,7 +574,7 @@ def ab_llama(argv: list[str]) -> int:
         "--check-args",
         action="store_true",
         help="parse the arguments, and with --record check the recorder, then exit 0 "
-        "without reading a result: bench_llama_ab.sh runs this before its first slot",
+        "without reading a result: bench/llama_ab.sh runs this before its first slot",
     )
     args = p.parse_args(argv)
 
@@ -675,7 +675,7 @@ def _llama_ab_record(
         )
 
     notes = (
-        f"bench_llama_ab.sh ABBA n={len(slots)}/arm; "
+        f"bench/llama_ab.sh ABBA n={len(slots)}/arm; "
         f"decode_tps median over slots, min={min(tps):.3f} max={max(tps):.3f}; "
         f"verdict={result['verdict']}"
     )

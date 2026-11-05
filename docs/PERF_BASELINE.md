@@ -159,10 +159,10 @@ so in its header, on every slot line and in `waivers.synthetic_arms`.
 arm-reading guards still apply.
 
 The boundary lives in `scripts/lib/cpu_snapshot.sh`, as `snapshot_ok`,
-`window_not_sampled` and `classify_window`. `scripts/bench_llama_ab.sh` takes
+`window_not_sampled` and `classify_window`. `scripts/bench/llama_ab.sh` takes
 the same `--synthetic-arms` flag through it. Its result file carries `synthetic_arms`,
 and `scripts/ingest/ingest.py ab --harness llama` refuses that result with no waiver. A
-real `bench_llama_ab.sh` run ends by handing its result to that ingest, which
+real `bench/llama_ab.sh` run ends by handing its result to that ingest, which
 records both arms as `ab_arm` rows under the identity `--record-args` carries;
 `--keep-arm A|B` on a second run of the ingest records the surviving arm as
 `gate`.
@@ -224,7 +224,7 @@ differences. It must report a planted ratio exactly, and nothing for two equal
 arms. Every case passes `--synthetic-arms`. The cases that test host gating
 supply the machine as `ps` and `claim-holder` shims on `PATH`. Every run counts the
 cases that took each route; a case that could reach this machine fails the
-suite. `scripts/bench_llama_ab_selftest.sh` carries the same boundary, with
+suite. `scripts/bench/llama_ab_selftest.sh` carries the same boundary, with
 `ps` as its whole host surface.
 
 `make canary-ab-host-gate-fixtures` (`scripts/bench/ab_selftest.sh host-gate`,

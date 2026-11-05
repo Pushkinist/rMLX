@@ -10,8 +10,6 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 |---|---|---|
 | `aggregate_decode_profile.py` | none | Aggregate per-model decode_profile lines from profile_<MODEL>.txt into one CSV row per model. |
 | `bench_identity_selftest.sh` | make bench-identity-selftest | bench_identity_selftest.sh — mutation check for the commit and run-log sources |
-| `bench_llama_ab.sh` | bench_llama_ab_selftest.sh | bench_llama_ab.sh — ABBA-interleaved A/B comparison of two `llama-server` arms. |
-| `bench_llama_ab_selftest.sh` | make llama-ab-selftest | bench_llama_ab_selftest.sh — mutation check for `scripts/bench_llama_ab.sh`. |
 | `codec_smoke_runner_selftest.sh` | make codec-smoke-runner-selftest | scripts/codec_smoke_runner_selftest.sh — recall test for the verdict of |
 | `convert_silero_vad.py` | by hand | Convert Silero VAD v4 ONNX weights (16kHz branch only) to safetensors. |
 | `gen_lloyd_codebook.py` | none | Generate Lloyd-Max optimal N(0,1) centroids for TurboQuant codebook. |
@@ -37,6 +35,8 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `bench/cache_types.py` | bench/baseline_cells.sh | Python half of baseline_cells.sh --preset cache-types: a cell's run record and a smoke text check. |
 | `bench/cross_backend.sh` | bench/cross_backend_selftest.sh | Drive one cross-backend bench cell through the Cross-Backend-Bench harness |
 | `bench/cross_backend_selftest.sh` | make cross-backend-selftest | Recall test for the cross-backend cell tool: the codec name it files, where its files go, its exits |
+| `bench/llama_ab.sh` | bench/llama_ab_selftest.sh | bench/llama_ab.sh — ABBA-interleaved A/B comparison of two `llama-server` arms. |
+| `bench/llama_ab_selftest.sh` | make llama-ab-selftest | bench/llama_ab_selftest.sh — mutation check for `scripts/bench/llama_ab.sh`. |
 | `bench/prefill_chunk_sweep.sh` | bench/prefill_chunk_sweep_selftest.sh | prefill_chunk_sweep.sh — Latin-square sweep of one architecture's prefill |
 | `bench/prefill_chunk_sweep_selftest.sh` | make prefill-chunk-sweep-selftest | Recall test for the prefill-chunk sweep: slot order, env name, records, paired verdict, exits |
 | `bench/serve_bench.sh` | make perf-iter, make spec-canary, bench/serve_bench_selftest.sh | serve_bench.sh — bench one model through rmlx serve, alone or against a drafter |
@@ -88,7 +88,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
 | `ingest/ab_selftest.sh` | make canary-ab-ingest-selftest | Recall test for the ingest entry's ab mode: dry-run records and refusals under a stub rmlx. |
-| `ingest/ingest.py` | bench_llama_ab.sh, bench_llama_ab_selftest.sh, ingest/ab_selftest.sh, +3 more scripts | Promote a harness result into §8.5 records and file them with `rmlx metrics record`. |
+| `ingest/ingest.py` | bench/llama_ab.sh, bench/llama_ab_selftest.sh, ingest/ab_selftest.sh, +3 more scripts | Promote a harness result into §8.5 records and file them with `rmlx metrics record`. |
 | `ingest/ingest_selftest.sh` | make ingest-selftest | Recall test for the ingest entry: record fields, refusals and the stage-and-record tail. |
 | `ingest/llama_bench.py` | ingest/ingest.py | Ingest llama-bench JSON output into the rMLX metrics DB. |
 | `ingest/published.py` | ingest/ingest.py | Promote a `scripts/published/bench.sh` result into `runs.db`. |
@@ -99,11 +99,11 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
-| `lib/args.sh` | bench/ab.sh, bench/prefill_chunk_sweep.sh, bench_llama_ab.sh | Argument-parsing helpers shared by the bench harnesses; source it. |
+| `lib/args.sh` | bench/ab.sh, bench/llama_ab.sh, bench/prefill_chunk_sweep.sh | Argument-parsing helpers shared by the bench harnesses; source it. |
 | `lib/awk_text.sh` | crates/rmlx-models/tests/common/stop_scan.rs, check/gpu_device_census.sh, check/gpu_tests.sh, check/kernel_dispatch.sh, +2 more scripts | Line readers for Rust-scanning gates: code without comments, without string bodies, bodiless fns. |
 | `lib/bench_server.sh` | bench/baseline_cells.sh, bench/cross_backend.sh, bench/serve_bench.sh, +1 more scripts | Start, wait for and identify one rmlx server, for bench harnesses; source it. |
-| `lib/busiest_between.awk` | bench/ab.sh, bench/ab_selftest.sh, bench/prefill_chunk_sweep.sh, +2 more scripts | Which process burned the most CPU between two cpu_snapshot files. |
-| `lib/cpu_snapshot.sh` | bench/ab.sh, bench/ab_selftest.sh, bench/prefill_chunk_sweep.sh, +2 more scripts | Per-process cumulative CPU seconds, for interference gates; source it. |
+| `lib/busiest_between.awk` | bench/ab.sh, bench/ab_selftest.sh, bench/llama_ab.sh, +2 more scripts | Which process burned the most CPU between two cpu_snapshot files. |
+| `lib/cpu_snapshot.sh` | bench/ab.sh, bench/ab_selftest.sh, bench/llama_ab.sh, +2 more scripts | Per-process cumulative CPU seconds, for interference gates; source it. |
 | `lib/identity.sh` | bench/baseline_cells.sh, bench/cross_backend.sh, bench/prefill_chunk_sweep.sh, +3 more scripts | Shared §8.5 run-identity for rMLX bench scripts. |
 | `lib/kv_boundary_default.py` | ingest/ingest.py | The engine's default KV boundary-layer counts, read from the engine. |
 | `lib/metal_dirs.sh` | check/kernel_dispatch.sh, check/metal_kernels.sh, check/metal_kernels_selftest.sh, +1 more scripts | The directories holding gated .metal kernels; sourced by the metal gates. |
@@ -114,7 +114,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/recorder_check.py` | ingest/ingest.py, ingest/llama_bench.py | Refuse a recorder that cannot state a run class. |
 | `lib/rmlx_home.py` | ingest/ingest.py, ingest/llama_bench.py | Resolve the runtime home the way the binary does. |
 | `lib/run_log_for_pid.py` | lib/bench_server.sh | Pick the run log a given process wrote, out of the candidates on stdin. |
-| `lib/selftest_support.sh` | bench/baseline_cells_selftest.sh, bench/cross_backend_selftest.sh, bench/prefill_chunk_sweep_selftest.sh, +21 more scripts | The case runner and shims the self-tests share; source it. |
+| `lib/selftest_support.sh` | bench/baseline_cells_selftest.sh, bench/cross_backend_selftest.sh, bench/llama_ab_selftest.sh, +21 more scripts | The case runner and shims the self-tests share; source it. |
 | `lib/server_kv_quant.py` | lib/bench_server.sh, published/binary_identity.py, ssd_canary.sh | Read the KV codec a run resolved out of its rmlx run log. |
 | `lib/server_sampling.py` | crates/rmlx-server/src/engine/sampler_event_tests.rs, bench/serve_bench.sh, lib/published_run_log.py | Read whether a run's requests were sampled, out of its rmlx run log. |
 | `lib/skip_notice_patterns.sh` | check/gpu_tests.sh, suite/run_gpu_tests.sh | The SKIP and WAIVED stand-down notice patterns, defined once for the runner and the gate. |

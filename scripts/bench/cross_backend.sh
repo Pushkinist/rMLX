@@ -211,7 +211,7 @@ case "$BACKEND" in
     # NOTE: the CBB legacy path still derives `model_namespace` itself, from the
     # `--model-path` basename, so these cells land under `local` while the A/B
     # ingest path records them under `hf`. That split lives in the sibling
-    # harness, not here. `bench_llama_ab.sh` + `ingest/ingest.py` is the
+    # harness, not here. `bench/llama_ab.sh` + `ingest/ingest.py` is the
     # canonical recorder for GGUF cells; this arm is a smoke/coverage path.
     ;;
   *)
@@ -354,7 +354,7 @@ fi
 # prompt-cache HIT, so the quotient described a prefill that never ran. It
 # produced ~109 000 and ~88 000 tok/s on the llama.cpp arms. A backend's own
 # `timings.prompt_per_second` is the real figure and is what
-# `scripts/bench_llama_ab.sh` records; nothing downstream of this progress line
+# `scripts/bench/llama_ab.sh` records; nothing downstream of this progress line
 # needs a number here.
 PREFILL_TPS="n/a"
 

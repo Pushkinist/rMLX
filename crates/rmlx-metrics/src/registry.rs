@@ -885,7 +885,7 @@ pub const COVERAGE_MATRIX: &[(&str, &str, Coverage)] = &[
     // Two producers feed this backend and they cover different metrics:
     // `ingest.py llama-bench` reads `llama-bench -o json` (pp = prefill TPS,
     // tg = decode TPS, nothing else), and `ingest.py ab --harness llama` reads a
-    // `bench_llama_ab.sh` result, which carries the server's own `timings`
+    // `bench/llama_ab.sh` result, which carries the server's own `timings`
     // plus the KV-buffer total parsed from the server log and sampled peak RSS.
     // A cell is Yes when EITHER producer can supply it.
     // metal_peak_alloc_mb: no MLX Metal allocator; llama.cpp uses its own pool.

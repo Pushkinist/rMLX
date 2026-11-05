@@ -84,7 +84,7 @@ cpu_snapshot() {
 # workload, so no fact about this machine belongs in that run's answer -- and a
 # gate whose result depends on what else the machine is doing teaches everyone
 # to re-run it until it goes green. Both harnesses (`bench/ab.sh`,
-# `bench_llama_ab.sh`) set it from their own `--synthetic-arms` flag; it is read
+# `bench/llama_ab.sh`) set it from their own `--synthetic-arms` flag; it is read
 # here and in `classify_window`, via `window_not_sampled`.
 snapshot_ok() {
 	if ${SYNTHETIC_ARMS:-false}; then

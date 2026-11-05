@@ -1008,7 +1008,7 @@ ingest-selftest: ## recall-check the ingest entry: record fields, refusals and t
 	bash scripts/ingest/ingest_selftest.sh
 
 llama-ab-selftest: ## mutation-check the llama-server A/B harness against a stub server (no GPU, no GGUF)
-	bash scripts/bench_llama_ab_selftest.sh
+	bash scripts/bench/llama_ab_selftest.sh
 
 spec-bench-selftest: ## mutation-check the spec-decode bench against a stub server (no GPU, no model, no DB write; builds the dev rmlx, which judges a near-tie flip)
 	bash scripts/bench/serve_bench_selftest.sh
