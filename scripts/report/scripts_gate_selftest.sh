@@ -2315,6 +2315,43 @@ sg_reindex "$root"
 st_case pin_set_lib_run_new_site 1 --what "a second site outside the pin fails" \
     --has "lib-run: lib/y.py:1:" --has "run by make:libb" --lacks "run by make:liba" -- sg_gate "$root"
 
+lib_run_pinned_base() {
+    local r
+    r=$(sg_fresh "$1")
+    lib_py | sg_put "$r" lib/y.py
+    sg_valid_sh 'python3 "$(dirname "$0")/../lib/y.py"' | sg_put "$r" check/z.sh
+    sg_pins_file 'lib-run lib/y.py check/z.sh' 'lib-consumers lib/y.py' >"$r/$SG_PINS_REL"
+    sg_reindex "$r"
+    sg_commit_all "$r" "pin the site"
+    printf '%s' "$r"
+}
+
+root=$(lib_run_pinned_base pin_lib_run_moved)
+git -C "$root" mv scripts/check/z.sh scripts/check/w.sh
+python3 - "$root/$SG_PINS_REL" <<'EOF'
+import sys
+
+path = sys.argv[1]
+text = open(path).read().replace("check/z.sh", "check/w.sh")
+open(path, "w").write(text)
+EOF
+sg_reindex "$root"
+st_case pin_follows_a_moved_lib_run_site 0 --what "a lib-run site moved with its pin member renamed keeps the pin" \
+    --has "pinned: lib-consumers 1, lib-run 1" --lacks "pin-new" -- sg_gate "$root"
+
+root=$(lib_run_pinned_base pin_lib_run_new_site)
+sg_valid_sh 'python3 "$(dirname "$0")/../lib/y.py"' | sg_put "$root" check/v.sh
+python3 - "$root/$SG_PINS_REL" <<'EOF'
+import sys
+
+path = sys.argv[1]
+text = open(path).read().replace("check/z.sh", "check/v.sh,check/z.sh")
+open(path, "w").write(text)
+EOF
+sg_reindex "$root"
+st_case pin_lib_run_gains_a_site 1 --what "a lib-run pin that gains a new site, not a rename, is pin-new" \
+    --has "pin-new: report/scripts_gate_pins.txt:4: lib-run lib/y.py: site check/v.sh is not pinned at the base" -- sg_gate "$root"
+
 root=$(sg_fresh pinset_dead_path)
 printf '%s\n' '# see scripts/check/gone.sh' >>"$root/scripts/check/ok.sh"
 sg_pins_file 'dead-path check/ok.sh check/gone.sh' >"$root/$SG_PINS_REL"

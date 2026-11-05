@@ -307,6 +307,8 @@ def pin_growth(
             detail = f"{rule} {path}: figure {show(pin.figure)} is above the base's {show(old.figure)}"
             out.append(Violation("pin-new", PINS, pin.line, detail))
         for member in sorted(pin.codes - old.codes):
+            if rule == "lib-run" and renames.get(member, member) in old.codes:
+                continue
             detail = f"{rule} {path}: {SET_NOUNS.get(rule, 'member')} {member} is not pinned at the base"
             out.append(Violation("pin-new", PINS, pin.line, detail))
     return out, ""
