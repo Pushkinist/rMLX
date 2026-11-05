@@ -903,6 +903,34 @@ cpu_case cpu_both_empty_is_unmeasured "unmeasured - -" \
 	"two empty snapshots answer nothing rather than answering 'quiet'" \
 	5 '' ''
 
+# `classify_window` turns two snapshots into the verdict every harness reports. It reads
+# AWK_BUSIEST and BUSY_PCT from its caller.
+AWK_BUSIEST="$BUSIEST"
+BUSY_PCT=60
+
+window_case() { # <name> <want> <what> [before|after: the snapshot that carries the not-sampled marker]
+	local name="$1" want="$2" what="$3" marker="${4:-}" got
+	printf '%s\n' '100 10.00 npm' >"$WORK/win_before"
+	printf '%s\n' '100 13.00 npm' >"$WORK/win_after"
+	rm -f "$WORK/win_before.not-sampled" "$WORK/win_after.not-sampled"
+	if [[ -n "$marker" ]]; then : >"$WORK/win_$marker.not-sampled"; fi
+	got="$(classify_window "$WORK/win_before" "$WORK/win_after" 5)"
+	if [[ "$got" == "$want" ]]; then
+		PASSED=$((PASSED + 1))
+		printf '  ok   %-26s        — %s\n' "$name" "$what"
+	else
+		FAILED=$((FAILED + 1))
+		printf '  FAIL %-26s        — %s\n       | got  "%s"\n       | want "%s"\n' \
+			"$name" "$what" "$got" "$want"
+	fi
+}
+
+window_case window_at_threshold_is_busy "busy 60.0 npm" \
+	"a process burning exactly --busy-pct of one core over the window is busy, not quiet"
+
+window_case window_not_sampled_is_not_quiet "not-sampled - -" \
+	"a window whose snapshot carries the not-sampled marker is reported as not sampled, whatever the snapshots say" after
+
 # `cpu_snapshot` must report failure rather than leave an empty file behind: the
 # pipeline's status is awk's, which is always 0, so a failing `ps` is invisible
 # to `set -e` and to every caller that does not check.

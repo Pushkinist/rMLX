@@ -8,7 +8,8 @@
 # shows an idle or a busy host, and a stub `date` that moves one second per reading. No model and
 # no GPU runs. The cases assert the level that occupies each slot, the env var each slot gets, that
 # a slot records nothing, the records built from the stub's numbers, the paired verdict, the
-# token and zero-measurement refusals, the host refusals, and a refused record.
+# token and zero-measurement refusals, the host refusals, a window that was not sampled, and a
+# refused record.
 #
 # Usage:  bash scripts/bench/prefill_chunk_sweep_selftest.sh
 # Exit:   0 every case held; 1 a case did not, or none ran; 2 a fixture could not be built
@@ -278,6 +279,19 @@ why="$(st_check 125 --has "TAINTED" --has "/usr/bin/hog" --has "Nothing was reco
 want "records built" "$(ls "$home/out/records" 2>/dev/null || true)" ""
 want "record calls" "$(ls "$home/recorded.log" 2>/dev/null || true)" ""
 st_verdict exit_125_busy_host "$why" "a foreign process burning CPU over the slots ends 125 and builds no record"
+
+home="$(new_home busy_at_threshold)"
+: >"$home/hog"
+run_sweep "$home" --busy-pct 6000
+why="$(st_check 125 --has "slot p4096 r0 s0 level 256: busy 6000.0 /usr/bin/hog")"
+st_verdict exit_125_busy_at_the_threshold "$why" "a window whose foreign process burns exactly --busy-pct of one core is busy: the threshold is inclusive"
+
+home="$(new_home not_sampled)"
+mkdir -p "$home/out/raw"
+: >"$home/out/raw/cpu_p4096_c256_r0_s0_after.not-sampled"
+run_sweep "$home"
+why="$(st_check 0 --has "row 0 slot 0 level   256  not-sampled - -" --has "row 0 slot 1 level   512  quiet 0.0 -" --lacks "TAINTED")"
+st_verdict not_sampled_window_is_reported_and_not_a_taint "$why" "a slot window whose snapshot carries the not-sampled marker is reported as not sampled and taints nothing, while the other slots are still classified"
 
 home="$(new_home claim)"
 : >"$home/claim_held"

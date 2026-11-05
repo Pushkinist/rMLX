@@ -140,13 +140,13 @@ name lib/kv_boundary_default.py _REPO_ROOT
 name rmlx-capture.entitlements hyphen
 name suite/run_gpu_tests_selftest.sh ROOT
 name spec/broken_engine.sh ROOT
-size bench/ab.sh 1095
+size bench/ab.sh 1054
 size perf_ceiling.py 1110
 size report/debt_report_selftest.sh 1598
 size report/kv_census_selftest.sh 1212
 size suite/run_gpu_tests.sh 1322
 size bench/serve_bench.sh 1224
-size published/bench.sh 1182
+size published/bench.sh 1160
 size published/bench_selftest.sh 2788
 size bench/serve_bench_selftest.sh 2029
 size ssd_canary.sh 1284

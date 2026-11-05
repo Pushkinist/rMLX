@@ -102,6 +102,8 @@ set -eu
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
+# shellcheck source=scripts/lib/args.sh
+. "${REPO_ROOT}/scripts/lib/args.sh"
 # shellcheck source=scripts/lib/record_pending.sh
 . "${REPO_ROOT}/scripts/lib/record_pending.sh"
 # Slots that measured and whose ab_arm record did not land.
@@ -180,13 +182,6 @@ USAGE
 }
 
 # ---- argument parsing --------------------------------------------------------
-
-need_value() {
-	if [[ $2 -lt 2 ]]; then
-		echo "ERROR: $1 requires a value" >&2
-		exit 125
-	fi
-}
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -384,49 +379,13 @@ RESULT_JSON="${OUT_DIR}/${TS}.json"
 # basenames.
 CPU_SNAPSHOT_SKIP="$(basename "$BIN_A") $(basename "$BIN_B")"
 export CPU_SNAPSHOT_SKIP
-# `snapshot_ok` and `window_not_sampled` come from here too, and both read
+# `snapshot_ok` and `classify_window` come from here too, and both read
 # SYNTHETIC_ARMS -- which is why this is sourced after the flags are parsed.
 # shellcheck source=scripts/lib/cpu_snapshot.sh
 . "${REPO_ROOT}/scripts/lib/cpu_snapshot.sh"
 
 load_averages() {
 	uptime | sed -e 's/.*load averages*: *//' -e 's/,/ /g' | awk '{printf "%s %s %s", $1, $2, $3}'
-}
-
-# "<state> <pct> <comm>" for the window between two snapshots $3 seconds apart.
-# state is one of busy | quiet | unmeasured | not-sampled.
-#
-# `unmeasured` stays distinct from `quiet` all the way into the report, and it
-# covers three different ways of not knowing: the window was too short to divide
-# by, a snapshot was empty, or `ps` failed outright. Folding any of them into
-# "nothing was running" is how an interference gate quietly stops gating.
-classify_window() {
-	local raw pct
-	if window_not_sampled "$1" "$2"; then
-		echo "not-sampled - -"
-		return
-	fi
-	if [[ -e "$1.failed" || -e "$2.failed" ]]; then
-		echo "unmeasured - -"
-		return
-	fi
-	raw="$(awk -v window="$3" -f "$AWK_BUSIEST" "$1" "$2")"
-	case "${raw%% *}" in
-	unmeasured)
-		echo "unmeasured - -"
-		;;
-	idle)
-		echo "quiet 0.0 -"
-		;;
-	*)
-		pct="$(echo "$raw" | awk '{print $2}')"
-		if awk -v p="$pct" -v t="$BUSY_PCT" 'BEGIN { exit !(p >= t) }'; then
-			echo "busy ${raw#* }"
-		else
-			echo "quiet ${raw#* }"
-		fi
-		;;
-	esac
 }
 
 # Escape a free-form string for a JSON string literal. Process names, model

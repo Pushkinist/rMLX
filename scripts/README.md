@@ -271,7 +271,8 @@ section 3); that a code means what this table says is the reviewer's. [review]
 |---|---|
 | run identity for a §8.5 record | `lib/identity.sh` (`rmlx_export_identity`) |
 | start, wait for and attribute one `rmlx serve` | `lib/bench_server.sh` |
-| host CPU interference | `lib/cpu_snapshot.sh` + `lib/busiest_between.awk` |
+| host CPU interference, and the verdict on a window (`classify_window`) | `lib/cpu_snapshot.sh` + `lib/busiest_between.awk` |
+| a flag given without its value (`need_value`, exit 125) | `lib/args.sh` |
 | a recall-test case runner | `lib/selftest_support.sh` (`st_init`, `st_case`, `st_run`, `st_check`, `st_verdict`, `st_bounded`, `st_done`) |
 | the planted `scripts/` trees of the gate's recall tests | `lib/selftest_support.sh` (`sg_init`, `sg_fresh`, `sg_put`, `sg_gate`, ...) |
 | comment and literal blanking in a Rust scanner | `lib/awk_text.sh` |

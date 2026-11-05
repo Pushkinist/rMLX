@@ -81,6 +81,8 @@ set -eu
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
 AWK_BUSIEST="${REPO_ROOT}/scripts/lib/busiest_between.awk"
+# shellcheck source=scripts/lib/args.sh
+. "${REPO_ROOT}/scripts/lib/args.sh"
 
 BIN_A=""; BIN_B=""; ARGS_A=""; ARGS_B=""
 ENV_A=""; ENV_B=""
@@ -130,8 +132,6 @@ bench_llama_ab.sh --bin-a P --bin-b P --model GGUF --prompt-file F [options]
                            Required unless --synthetic-arms.
 USAGE
 }
-
-need_value() { [ "$2" -ge 2 ] || { echo "$1 needs a value" >&2; exit 125; }; }
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -238,7 +238,7 @@ refuse_pinned --args-b "$ARGS_B"
 
 CPU_SNAPSHOT_SKIP="$(basename "$BIN_A") $(basename "$BIN_B") llama-server"
 export CPU_SNAPSHOT_SKIP
-# `snapshot_ok` and `window_not_sampled` come from here too, and both read
+# `snapshot_ok` and `classify_window` come from here too, and both read
 # SYNTHETIC_ARMS -- which is why this is sourced after the flags are parsed.
 # shellcheck source=scripts/lib/cpu_snapshot.sh
 . "${REPO_ROOT}/scripts/lib/cpu_snapshot.sh"
@@ -277,24 +277,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-host_busiest() { # <before> <after> <window_s> -> "<state> <pct> <comm>"
-	local raw
-	if window_not_sampled "$1" "$2"; then echo "not-sampled - -"; return; fi
-	if [ -e "$1.failed" ] || [ -e "$2.failed" ]; then echo "unmeasured - -"; return; fi
-	raw="$(awk -v window="$3" -f "$AWK_BUSIEST" "$1" "$2")"
-	case "${raw%% *}" in
-	unmeasured) echo "unmeasured - -" ;;
-	idle) echo "quiet 0.0 -" ;;
-	*)
-		if awk -v p="$(echo "$raw" | awk '{print $2}')" -v t="$BUSY_PCT" 'BEGIN { exit !(p >= t) }'; then
-			echo "busy ${raw#* }"
-		else
-			echo "quiet ${raw#* }"
-		fi
-		;;
-	esac
-}
-
 # ---- entry gate --------------------------------------------------------------
 #
 # The only place this script reads the machine, besides the per-slot windows.
@@ -313,7 +295,7 @@ else
 	snapshot_ok "$TMP/entry_a" || true
 	sleep 5
 	snapshot_ok "$TMP/entry_b" || true
-	ENTRY="$(host_busiest "$TMP/entry_a" "$TMP/entry_b" 5)"
+	ENTRY="$(classify_window "$TMP/entry_a" "$TMP/entry_b" 5)"
 	ENTRY_STATE="${ENTRY%% *}"
 	if [ "$ENTRY_STATE" != "quiet" ]; then
 		echo "host is not quiescent: ${ENTRY}" >&2
@@ -389,7 +371,7 @@ run_slot() { # <bin> <args> <env> <slotdir>
 	t1="$(python3 -c 'import time; print(time.time())')"
 	snapshot_ok "$dir/cpu_after" || true
 	local window; window="$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.3f", b - a }')"
-	host_busiest "$dir/cpu_before" "$dir/cpu_after" "$window" >"$dir/window"
+	classify_window "$dir/cpu_before" "$dir/cpu_after" "$window" >"$dir/window"
 
 	kill "$pid" 2>/dev/null || true
 	wait "$pid" 2>/dev/null || true

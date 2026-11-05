@@ -62,6 +62,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
 AWK_BUSIEST="${REPO_ROOT}/scripts/lib/busiest_between.awk"
 
+# shellcheck source=scripts/lib/args.sh
+source "${REPO_ROOT}/scripts/lib/args.sh"
 # shellcheck source=scripts/lib/cpu_snapshot.sh
 source "${REPO_ROOT}/scripts/lib/cpu_snapshot.sh"
 # shellcheck source=scripts/lib/identity.sh
@@ -110,13 +112,6 @@ Options:
   --record               ingest the cells into runs.db through the §8.5 path
   --db PATH              metrics DB for --record    (default: the resolved one)
 USAGE
-}
-
-need_value() {
-	if [[ $2 -lt 2 ]]; then
-		echo "ERROR: $1 requires a value" >&2
-		exit 125
-	fi
 }
 
 while [[ $# -gt 0 ]]; do
@@ -197,29 +192,6 @@ if [[ "$claim_rc" -ne 0 ]]; then
 fi
 
 rmlx_export_identity "$BINARY"
-
-# Classify one CPU window. `unmeasured` is not `quiet`: not knowing must never
-# be folded into "nothing was there", or the gate silently stops gating.
-classify_window() {
-	local before="$1" after="$2" seconds="$3" raw pct
-	if [[ -e "$before.failed" || -e "$after.failed" ]]; then
-		echo "unmeasured - -"
-		return
-	fi
-	raw="$(awk -v window="$seconds" -f "$AWK_BUSIEST" "$before" "$after")"
-	case "${raw%% *}" in
-	unmeasured) echo "unmeasured - -" ;;
-	idle) echo "quiet 0.0 -" ;;
-	*)
-		pct="$(echo "$raw" | awk '{print $2}')"
-		if awk -v p="$pct" -v t="$BUSY_PCT" 'BEGIN { exit !(p >= t) }'; then
-			echo "busy ${raw#* }"
-		else
-			echo "quiet ${raw#* }"
-		fi
-		;;
-	esac
-}
 
 SHORT="$(basename "$MODEL")"
 cat <<HEADER

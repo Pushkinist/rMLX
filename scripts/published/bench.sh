@@ -263,22 +263,22 @@ SYNTHETIC_ARMS=false
 CLIENT_CLOCK=client
 SERVER_STAMPS_ARG=()
 
-need_value() { [[ -n "${2:-}" ]] || { echo "ERROR: $1 requires a value" >&2; exit 1; }; }
+require_value() { [[ -n "${2:-}" ]] || { echo "ERROR: $1 requires a value" >&2; exit 1; }; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --label) need_value "$1" "${2:-}"; LABEL="$2"; shift 2 ;;
-        --draft-model) need_value "$1" "${2:-}"; DRAFTER_MODEL="$2"; shift 2 ;;
-        --draft-kind) need_value "$1" "${2:-}"; DRAFT_KIND="$2"; shift 2 ;;
-        --draft-block-size) need_value "$1" "${2:-}"; DRAFT_BLOCK_SIZE="$2"; shift 2 ;;
-        --kv-quant) need_value "$1" "${2:-}"; KV_QUANT="$2"; shift 2 ;;
-        --max-ctx) need_value "$1" "${2:-}"; MAX_CTX="$2"; shift 2 ;;
-        --port) need_value "$1" "${2:-}"; PORT="$2"; shift 2 ;;
-        --samples-root) need_value "$1" "${2:-}"; SAMPLES_ROOT="$2"; shift 2 ;;
+        --label) require_value "$1" "${2:-}"; LABEL="$2"; shift 2 ;;
+        --draft-model) require_value "$1" "${2:-}"; DRAFTER_MODEL="$2"; shift 2 ;;
+        --draft-kind) require_value "$1" "${2:-}"; DRAFT_KIND="$2"; shift 2 ;;
+        --draft-block-size) require_value "$1" "${2:-}"; DRAFT_BLOCK_SIZE="$2"; shift 2 ;;
+        --kv-quant) require_value "$1" "${2:-}"; KV_QUANT="$2"; shift 2 ;;
+        --max-ctx) require_value "$1" "${2:-}"; MAX_CTX="$2"; shift 2 ;;
+        --port) require_value "$1" "${2:-}"; PORT="$2"; shift 2 ;;
+        --samples-root) require_value "$1" "${2:-}"; SAMPLES_ROOT="$2"; shift 2 ;;
         --allow-busy-host) ALLOW_BUSY_HOST=true; shift ;;
         --greedy-pass) GREEDY_PASS=true; shift ;;
-        --longctx) need_value "$1" "${2:-}"; LONGCTX_SIZES+=("$2"); shift 2 ;;
-        --greedy-against) need_value "$1" "${2:-}"; GREEDY_AGAINST="$2"; GREEDY_PASS=true; shift 2 ;;
+        --longctx) require_value "$1" "${2:-}"; LONGCTX_SIZES+=("$2"); shift 2 ;;
+        --greedy-against) require_value "$1" "${2:-}"; GREEDY_AGAINST="$2"; GREEDY_PASS=true; shift 2 ;;
         --synthetic-arms) SYNTHETIC_ARMS=true; shift ;;
         --server-stamps) CLIENT_CLOCK=server_stamps; SERVER_STAMPS_ARG=(--server-stamps); shift ;;
         -*) echo "ERROR: unknown flag: $1" >&2; exit 1 ;;
@@ -509,35 +509,13 @@ fi
 
 CPU_SNAPSHOT_SKIP="$(basename "${BINARY}")"
 export CPU_SNAPSHOT_SKIP
-# `snapshot_ok` and `window_not_sampled` read SYNTHETIC_ARMS, which is why this
+# `snapshot_ok` and `classify_window` read SYNTHETIC_ARMS, which is why this
 # is sourced after the flags are parsed.
 # shellcheck source=scripts/lib/cpu_snapshot.sh
 . "${REPO_ROOT}/scripts/lib/cpu_snapshot.sh"
 
 TAINT=""
 note_taint() { TAINT="${TAINT}$1; "; }
-
-# "<state> <pct> <comm>" for the window between two snapshots $3 seconds apart.
-# `unmeasured` stays distinct from `quiet` all the way into the report: folding
-# "nobody could look" into "nothing was running" is how a gate stops gating.
-host_window() {
-    local raw
-    if window_not_sampled "$1" "$2"; then echo "not-sampled - -"; return; fi
-    if [[ -e "$1.failed" || -e "$2.failed" ]]; then echo "unmeasured - -"; return; fi
-    raw="$(awk -v window="$3" -f "${AWK_BUSIEST}" "$1" "$2")"
-    case "${raw%% *}" in
-        unmeasured) echo "unmeasured - -" ;;
-        idle) echo "quiet 0.0 -" ;;
-        *)
-            if awk -v p="$(echo "${raw}" | awk '{print $2}')" -v t="${BUSY_PCT}" \
-                'BEGIN { exit !(p >= t) }'; then
-                echo "busy ${raw#* }"
-            else
-                echo "quiet ${raw#* }"
-            fi
-            ;;
-    esac
-}
 
 # One thermal reading, as a bare state word.
 #
@@ -614,7 +592,7 @@ else
     snapshot_ok "${WORK}/entry_a" || true
     sleep 5
     snapshot_ok "${WORK}/entry_b" || true
-    ENTRY="$(host_window "${WORK}/entry_a" "${WORK}/entry_b" 5)"
+    ENTRY="$(classify_window "${WORK}/entry_a" "${WORK}/entry_b" 5)"
     if [[ "${ENTRY%% *}" != "quiet" ]]; then
         echo "host is not quiescent: ${ENTRY}" >&2
         if ! $ALLOW_BUSY_HOST; then
@@ -807,7 +785,7 @@ for (( pass = 1; pass <= PASSES; pass++ )); do
     $SYNTHETIC_ARMS || note_thermal "pass ${pass} end"
     PASS_SECONDS=$(( $(date +%s) - PASS_STARTED ))
     snapshot_ok "${WORK}/pass${pass}_b" || true
-    WINDOW="$(host_window "${WORK}/pass${pass}_a" "${WORK}/pass${pass}_b" "${PASS_SECONDS}")"
+    WINDOW="$(classify_window "${WORK}/pass${pass}_a" "${WORK}/pass${pass}_b" "${PASS_SECONDS}")"
     HOST_WINDOWS+=("${WINDOW}")
     # Three outcomes, not two. `quiet` is nothing was running; `unmeasured` is a
     # snapshot nobody could take, and folding that into `quiet` is how an

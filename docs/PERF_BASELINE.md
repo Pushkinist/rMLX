@@ -158,9 +158,9 @@ so in its header, on every slot line and in `waivers.synthetic_arms`.
 `scripts/ingest/ingest.py ab` refuses such a result with no waiver. The
 arm-reading guards still apply.
 
-The boundary lives in `scripts/lib/cpu_snapshot.sh`, as `snapshot_ok` and
-`window_not_sampled`. `scripts/bench_llama_ab.sh` takes the same
-`--synthetic-arms` flag through it. Its result file carries `synthetic_arms`,
+The boundary lives in `scripts/lib/cpu_snapshot.sh`, as `snapshot_ok`,
+`window_not_sampled` and `classify_window`. `scripts/bench_llama_ab.sh` takes
+the same `--synthetic-arms` flag through it. Its result file carries `synthetic_arms`,
 and `scripts/ingest/ingest.py ab --harness llama` refuses that result with no waiver. A
 real `bench_llama_ab.sh` run ends by handing its result to that ingest, which
 records both arms as `ab_arm` rows under the identity `--record-args` carries;
