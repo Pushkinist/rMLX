@@ -938,7 +938,7 @@ PERF_ITER_E2B  ?= $(O_MODELS_ROOT)/mlx-community__gemma-4-e2b-it-mxfp8
 PERF_ITER_E4B  ?= $(O_MODELS_ROOT)/mlx-community__gemma-4-e4b-it-mxfp8
 PERF_ITER_QWEN38 ?= $(O_MODELS_ROOT)/mlx-community__Qwen3.8-27B-4bit
 
-perf-iter:       ## run 3-model regression bench in series (files diagnostic records in runs.db)
+perf-iter: build-perf  ## run 3-model regression bench in series (files diagnostic records in runs.db)
 	@echo "=== perf-iter: gemma-4-e2b k8v8 ==="
 	bash scripts/bench/serve_bench.sh --model "$(PERF_ITER_E2B)" --kv-quant k8v8 --record diagnostic
 	@echo "=== perf-iter: gemma-4-e4b k8v8 ==="

@@ -5,7 +5,8 @@
 #             [--draft-model DIR [--draft-kind KIND] [--draft-block-size N]] [--prompt-file F]
 #             [--port N] [--dry-run] [--kv-quant Q] [--max-ctx N] [--tag T] [--server-stamps]
 # Exit:   0 every arm measured and filed; 1 a usage error, a missing model or prompt file, or a
-#         run the checks refused; 125 the release-perf binary is missing; passthrough of rmlx
+#         run the checks refused; 75 every arm measured and a record did not land (it stays in the
+#         queue named on stderr); 125 the release-perf binary is missing; passthrough of rmlx
 #         serve (11: another process holds the Metal claim)
 #
 # --model is the verifier snapshot dir. Without --draft-model only the no-drafter arm runs and
@@ -87,6 +88,7 @@ BINARY="${REPO_ROOT}/target/release-perf/rmlx"
 # Run identity (backend / version / git sha / build profile / hardware tag)
 # comes from the measured binary — never hard-coded here.
 source "${REPO_ROOT}/scripts/lib/identity.sh"
+source "${REPO_ROOT}/scripts/lib/record_pending.sh"
 rmlx_export_identity "${BINARY}"
 RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
 LOG_DIR="${RMLX_HOME}/logs"
@@ -693,9 +695,23 @@ PYEOF
     fi
     echo "  [ingest] buffer: ${buf_file}" >&2
 
-    RMLX_HOME="${RMLX_HOME}" "${BINARY}" metrics record --file "${buf_file}" >&2
-    echo "  [ingest] done: ${buf_file}" >&2
     echo "${buf_file}"
+    if ! RMLX_HOME="${RMLX_HOME}" "${BINARY}" metrics record --file "${buf_file}" >&2; then
+        echo "  ERROR: ${config}: the record did not land; it is kept at ${buf_file} for" \
+             "\`rmlx metrics record --replay-pending\`" >&2
+        return "${RECORD_PENDING_EXIT}"
+    fi
+    echo "  [ingest] done: ${buf_file}" >&2
+}
+
+# The tool's exit status once every arm has run: RECORD_PENDING_EXIT if a record did not land.
+RECORD_STATUS=0
+
+# note_unrecorded <status of emit_and_ingest> — keep the reading and go on when only the
+# record was refused; any other failure ends the run.
+note_unrecorded() {
+    [[ "$1" -eq "${RECORD_PENDING_EXIT}" ]] || exit "$1"
+    RECORD_STATUS="${RECORD_PENDING_EXIT}"
 }
 
 # ── Phase 1: normal decode ─────────────────────────────────────────────────────
@@ -853,7 +869,7 @@ NORMAL_BUF_PATH=$(emit_and_ingest \
     "${NORMAL_KV_QUANT}" \
     "${NORMAL_PROMPT_TOKENS}" \
     "${NORMAL_ANSWER}" \
-    "${NORMAL_ANSWER_CHECK}")
+    "${NORMAL_ANSWER_CHECK}") || note_unrecorded $?
 
 echo ""
 echo "==> Phase 1 complete. Median decode TPS: ${NORMAL_MEDIAN_TPS}"
@@ -864,7 +880,7 @@ if [[ -z "${DRAFTER_MODEL}" ]]; then
     echo "  stddev : ${NORMAL_STDDEV_TPS}"
     echo "DB: ${DB_PATH}"
     echo "Done."
-    exit 0
+    exit "${RECORD_STATUS}"
 fi
 
 # Judge a speculative answer that differs from the no-drafter one, when no
@@ -1131,7 +1147,7 @@ MTP_BUF_PATH=$(emit_and_ingest \
     "${MTP_ANSWER}" \
     "${MTP_ANSWER_CHECK}" \
     "${MTP_SPEC_DATA}" \
-    "${MTP_ANSWER_NOTES}")
+    "${MTP_ANSWER_NOTES}") || note_unrecorded $?
 
 echo ""
 echo "==> Phase 2 complete. Median decode TPS: ${MTP_MEDIAN_TPS}"
@@ -1205,3 +1221,4 @@ echo "  spec server   : ${SCRATCH_DIR}/mtp_stdout.txt"
 echo ""
 echo "DB: ${DB_PATH}"
 echo "Done."
+exit "${RECORD_STATUS}"

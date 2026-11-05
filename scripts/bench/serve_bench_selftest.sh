@@ -445,6 +445,12 @@ metrics)
 		echo '{"backend":"rmlx","backend_version":"9.9.9","build_profile":"release-perf","hardware_tag":"m5_max_128gb"}'
 		;;
 	record)
+		case "\$4" in
+		*-\${STUB_RECORD_FAILS:-none}.json)
+			echo "stub: record refused \$4" >&2
+			exit 1
+			;;
+		esac
 		echo "stub: recorded \$4" >&2
 		;;
 	esac
@@ -936,6 +942,54 @@ for config in normal mtp; do
 done
 [ "$(grep -c 'stub: recorded' "$CASE_OUT")" = "2" ] ||
 	note_bad "the recorder was called $(grep -c 'stub: recorded' "$CASE_OUT") times (want once for each arm)"
+verdict
+
+# record_not_landed <config> — the recorder refused that arm's record: the run named
+# the file in an ERROR line, never called it done, and the file is still in the queue,
+# where `rmlx metrics record --file` leaves a record it failed to ingest.
+record_not_landed() {
+	local path
+	path="$(record_of "$1")"
+	if [ ! -e "$path" ]; then
+		note_bad "the $1 record is not in the buffer"
+		return 0
+	fi
+	case "$path" in
+	"$CASE_HOME"/metrics/buffer/pending/*) ;;
+	*) note_bad "the $1 record is not in the ingest queue: $path" ;;
+	esac
+	grep -F "ERROR: $1: the record did not land" "$CASE_OUT" | grep -qF "$path" ||
+		note_bad "no ERROR line says the $1 record did not land and names $path"
+	if grep -qF "[ingest] done: $path" "$CASE_OUT"; then
+		note_bad "the $1 record was reported done"
+	fi
+	return 0
+}
+
+# A run that measured and whose record did not land ends with 75, whatever the
+# --record class, and the reading stays in the queue (docs/METRICS_DB.md § 13, rule 24).
+run_case plain_only_record_not_landed_exits_75 75 \
+	"a plain-only run whose record the recorder refused ends with 75" \
+	"BASE:--model $VERIFIER_DIR" NO_STAMPS:1 READER_CLOCK:0.0166666667 RECORD:diagnostic \
+	STUB_RECORD_FAILS=normal \
+	'GREP:Phase 1 complete'
+record_not_landed normal
+verdict
+
+run_case drafter_run_goes_on_after_a_refused_record 75 \
+	"a refused no-drafter record does not stop the drafter arm, which files its own; the run ends with 75" \
+	NO_STAMPS:1 READER_CLOCK:0.0166666667 STUB_RECORD_FAILS=normal \
+	'GREP:Phase 2 complete'
+record_not_landed normal
+grep -qF "[ingest] done: $(record_of mtp)" "$CASE_OUT" || note_bad "the drafter arm's record was not filed"
+verdict
+
+run_case drafter_record_not_landed_exits_75 75 \
+	"a drafter record the recorder refused ends the run with 75 after the no-drafter arm filed its own" \
+	NO_STAMPS:1 READER_CLOCK:0.0166666667 RECORD:diagnostic STUB_RECORD_FAILS=mtp \
+	'GREP:Phase 2 complete'
+record_not_landed mtp
+grep -qF "[ingest] done: $(record_of normal)" "$CASE_OUT" || note_bad "the no-drafter arm's record was not filed"
 verdict
 
 # Two readings of one window that disagree are a finding, not a choice. The stub

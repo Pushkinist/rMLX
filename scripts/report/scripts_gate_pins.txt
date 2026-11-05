@@ -160,10 +160,10 @@ size perf_ceiling.py 1110
 size report/debt_report_selftest.sh 1598
 size report/kv_census_selftest.sh 1212
 size suite/run_gpu_tests.sh 1322
-size bench/serve_bench.sh 1207
+size bench/serve_bench.sh 1224
 size published/bench.sh 1182
 size published/bench_selftest.sh 2788
-size bench/serve_bench_selftest.sh 1975
+size bench/serve_bench_selftest.sh 2029
 size ssd_canary.sh 1284
 heredoc bench_llama_ab.sh 30,27
 heredoc published/samples_selftest.sh 23
