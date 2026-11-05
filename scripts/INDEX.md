@@ -38,9 +38,8 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
-| `bench/baseline_cells.sh` | make bench-codec-cell, make canary, bench/baseline_cells_selftest.sh | baseline_cells.sh — decode-rate cells through `rmlx baseline`: the canary, or one model and codec |
+| `bench/baseline_cells.sh` | make bench-codec-cell, make canary, bench/baseline_cells_selftest.sh, run_class_selftest.sh | baseline_cells.sh — cells through `rmlx baseline`: the canary, one codec, or the inertness sweep |
 | `bench/baseline_cells_selftest.sh` | make baseline-cells-selftest | Recall test for the baseline cells tool: canary rows, argv, records and exit codes under a stub rmlx |
-| `bench/codec_inertness_probe.sh` | run_class_selftest.sh | codec_inertness_probe.sh — does a KV codec change anything a caller can see? |
 
 ## scripts/check/
 
@@ -108,7 +107,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/mlx_pin.sh` | crates/rmlx-mlx/src/pin_tests.rs, host/mlx_restore_pin.sh | Read the validated MLX / mlx-c pair from its one declaration. |
 | `lib/prefill_ms.py` | mst_capture.sh | Read the prefill time of an rmlx run out of its log: `generate: prefill{prefill_ms}`. |
 | `lib/published_run_log.py` | lib/prefill_ms.py, published/bench.sh, published/binary_identity.py, +1 more scripts | Read one rmlx run log back as a per-request table. |
-| `lib/record_pending.sh` | crates/rmlx-cli/src/exit_tests.rs, bench/baseline_cells.sh, bench/codec_inertness_probe.sh, bench_cache_types.sh, +3 more scripts | The exit code `rmlx baseline --record` and `rmlx eval ppl --corpus` give a |
+| `lib/record_pending.sh` | crates/rmlx-cli/src/exit_tests.rs, bench/baseline_cells.sh, bench_cache_types.sh, gpu_capture.sh, +2 more scripts | The exit code `rmlx baseline --record` and `rmlx eval ppl --corpus` give a |
 | `lib/recorder_check.py` | ingest/ingest.py, ingest/llama_bench.py | Refuse a recorder that cannot state a run class. |
 | `lib/rmlx_home.py` | ingest/ingest.py, ingest/llama_bench.py | Resolve the runtime home the way the binary does. |
 | `lib/run_log_for_pid.py` | lib/bench_server.sh | Pick the run log a given process wrote, out of the candidates on stdin. |

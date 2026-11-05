@@ -530,9 +530,9 @@ the class. The tests that hold it, all in
 - `disposition_is_a_property_of_the_family_not_its_parameters` pins that the
   four parameterised families keep their class at every parameter set.
 
-`scripts/bench/codec_inertness_probe.sh` measures `kv_cache_bytes` and a greedy
-token-id digest for each codec against `none`. Generate at least 200 tokens:
-at 32 tokens, codecs that differ can give the same digest.
+`scripts/bench/baseline_cells.sh --measure inertness` measures `kv_cache_bytes`
+and a greedy token-id digest for each codec against `none`. Generate at least
+200 tokens: at 32 tokens, codecs that differ can give the same digest.
 
 #### Class 1 — the baseline (1 codec)
 

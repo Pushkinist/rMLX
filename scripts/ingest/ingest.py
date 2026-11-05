@@ -9,7 +9,7 @@ Usage:  ingest.py ab [--harness rmlx|llama] RESULT.json [flags]
 Exit:   0 records written, printed or filed; 1 the recorder refused a record, or the input
         cannot be read or is refused; 2 a usage error, a result the mode refuses to record,
         or a CSV with no usable row
-Not a mode of: bench/codec_inertness_probe.sh — that one runs a model and measures; this one
+Not a mode of: bench/baseline_cells.sh — that one runs a model and measures; this one
         promotes a finished result into records
 
 `ab` takes a `perf_ab.sh` result (`--harness rmlx`, the default) or a `bench_llama_ab.sh` result
@@ -720,9 +720,9 @@ def _llama_ab_record(
 
 # ── codec-inertness ───────────────────────────────────────────────────────────
 
-# Column the probe records its `--kv-boundary-layers` value in.
+# Column the sweep records its `--kv-boundary-layers` value in.
 KV_BOUNDARY_FIELD = "kv_boundary"
-# Column the probe sets on a row whose run it recorded itself.
+# Column the sweep sets on a row whose run it recorded itself.
 RECORDED_FIELD = "recorded_run_class"
 # Where `csv.DictReader` puts fields the header does not name. Checked, not ignored: a
 # non-empty bucket means the columns are shifted.
@@ -730,23 +730,23 @@ EXTRA_FIELDS_KEY = "__unnamed_fields__"
 
 
 def run_codec_inertness(argv: list[str]) -> int:
-    """Write the residency cells of a `codec_inertness_probe.sh` CSV as `diagnostic` records.
+    """Write the residency cells of a `baseline_cells.sh --measure inertness` CSV as `diagnostic` records.
 
-    The probe records its own runs and marks such a CSV row in `recorded_run_class`; that row is
+    The sweep records its own runs and marks such a CSV row in `recorded_run_class`; that row is
     skipped here, so no run's `kv_cache_bytes` is written twice. Every other usable row becomes
     one record per (model, context, codec).
 
-    **Only `kv_cache_bytes` is recorded.** The probe's throughput columns are single unpaired
+    **Only `kv_cache_bytes` is recorded.** The sweep's throughput columns are single unpaired
     runs on a shared host, where the same binary and flags have read 11% apart thirty minutes
     apart; promoting one into an append-only table would make an unusable number permanent.
     Throughput belongs to `perf_ab.sh` and `ab`. The greedy token-id digest travels in `notes`: it
     is an identity, not a measurement, and `observations` stores reals.
 
-    A sweep at non-default `--kv-boundary-layers` lands in a cell of its own: the probe's
+    A sweep at non-default `--kv-boundary-layers` lands in a cell of its own: the sweep's
     `kv_boundary` column becomes the record's `decode_config` (`docs/METRICS_SCHEMA.md` §3.2).
     """
     p = argparse.ArgumentParser(prog="ingest.py codec-inertness", description=run_codec_inertness.__doc__)
-    p.add_argument("csv", help="codec_inertness.csv written by the probe")
+    p.add_argument("csv", help="codec_inertness.csv written by the sweep")
     p.add_argument(
         "--backend-version",
         required=True,
@@ -791,7 +791,7 @@ def run_codec_inertness(argv: list[str]) -> int:
             "read under the wrong name. Refusing; split the sweep into its own file."
         )
     if KV_BOUNDARY_FIELD not in fieldnames:
-        # A sweep from before the probe recorded the column, when the boundary could not be
+        # A sweep that predates the column, when the boundary could not be
         # anything but the default; `_codec_decode_config` says so, this only makes it visible.
         print(
             f"note: {args.csv} has no `{KV_BOUNDARY_FIELD}` column, so it predates the "
@@ -800,7 +800,7 @@ def run_codec_inertness(argv: list[str]) -> int:
     recorded = [r for r in rows if (r.get(RECORDED_FIELD) or "").strip()]
     if recorded:
         print(
-            f"skipping {len(recorded)} row(s) the probe already recorded, or whose record is "
+            f"skipping {len(recorded)} row(s) the sweep already recorded, or whose record is "
             f"pending a replay (`{RECORDED_FIELD}` is set); ingesting them would write each "
             "byte count twice"
         )
@@ -835,9 +835,9 @@ def run_codec_inertness(argv: list[str]) -> int:
 def _codec_decode_config(row: dict[str, str]) -> str | None:
     """The `decode_config` cell term this row's boundary-layer counts imply.
 
-    Read off the `kv_boundary` column the probe writes from its own argument, so the term
+    Read off the `kv_boundary` column the sweep writes from its own argument, so the term
     describes the sweep that ran. `None` is the engine at its defaults, which is also the right
-    answer for a CSV written before the probe had the column: there was no way to run at anything
+    answer for a CSV written before the sweep had the column: there was no way to run at anything
     else then.
     """
     raw = (row.get(KV_BOUNDARY_FIELD) or "").strip()
@@ -857,7 +857,7 @@ def _codec_decode_config(row: dict[str, str]) -> str | None:
 def _codec_weight_quant(models_root: Path, model_dir: str) -> str:
     """The weight label the snapshot's `config.json` describes, as `rmlx baseline --record` reads it.
 
-    A label guessed from the name would file the row in another cell than the probe's own record.
+    A label guessed from the name would file the row in another cell than the sweep's own record.
     """
     try:
         return snapshot_weight_quant(str(models_root / model_dir))
@@ -866,7 +866,7 @@ def _codec_weight_quant(models_root: Path, model_dir: str) -> str:
 
 
 def _codec_prompt(fixture_tokens: int, prompts_dir: Path) -> tuple[str, str]:
-    """Resolve the canonical bench prompt the probe's `--prompt-tokens` names.
+    """Resolve the canonical bench prompt the sweep's `--prompt-tokens` names.
 
     The body is the fixture file's own text, which is what `ab` records, so the `prompts` row
     this record keys on is the one every other cell at that length already keys on.
@@ -888,17 +888,17 @@ def _codec_record(row: dict[str, str], args: argparse.Namespace, prompts_dir: Pa
     if not measured:
         raise SystemExit(
             "this CSV has no `prompt_tokens_measured` column (it predates the "
-            "probe recording one). Re-run the probe; the fixture name in "
+            "sweep recording one). Re-run the sweep; the fixture name in "
             "`prompt_tokens` is not a token count and is not substituted."
         )
     prompt_tokens = int(measured)
-    # `ctx_max` is a PK column and the probe accepts `--max-ctx`: re-deriving it from its default
+    # `ctx_max` is a PK column and the sweep accepts `--max-ctx`: re-deriving it from its default
     # formula would silently record a plausible wrong ceiling for a sweep that overrode one.
     raw_ctx = row.get("max_ctx") or ""
     if not raw_ctx:
         raise SystemExit(
-            "this CSV has no `max_ctx` column (it predates the probe recording "
-            "one). Re-run the probe; the default ceiling formula is not "
+            "this CSV has no `max_ctx` column (it predates the sweep recording "
+            "one). Re-run the sweep; the default ceiling formula is not "
             "re-derived here, because a sweep that passed --max-ctx would then "
             "be recorded under a ceiling it never ran at."
         )
@@ -931,10 +931,10 @@ def _codec_record(row: dict[str, str], args: argparse.Namespace, prompts_dir: Pa
             # promotion types some layers `K8V8`, so a store-reading codec sets it too. Rows
             # written before the rename spell it `packed_store_skipped` and carry no caveat;
             # `observations` is append-only, so a query over the column accepts either.
-            f"codec_inertness_probe; binary_sha={row['binary_sha']}; "
+            f"baseline_cells inertness; binary_sha={row['binary_sha']}; "
             f"token_ids_sha256_16={row['ids_sha']}; "
             f"any_layer_skipped_store={row['store_skipped']}; "
-            "residency only — the probe's throughput columns are single unpaired "
+            "residency only — the sweep's throughput columns are single unpaired "
             "runs on a shared host and are deliberately not recorded"
         ),
         "description": args.description,

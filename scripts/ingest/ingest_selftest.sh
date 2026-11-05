@@ -78,7 +78,7 @@ printf '{"messages":[{"role":"user","content":"hi"}]}' >"$ST_WORK/prompts/longct
 
 CSV_HEADER="timestamp,model,prompt_tokens,prompt_tokens_measured,max_ctx,max_tokens,codec,exit_code,kv_cache_bytes,ids_sha,store_skipped,ttft_ms,decode_tps,prefill_tps,binary_sha,kv_boundary,recorded_run_class,record_status"
 CSV_ROW="2026-10-01T00:00:00Z,host__m,4096,4200,8192,32,k8v8,0,1000,abc123,false,1,10.0,1.0,bin456"
-write_csv() { # write_csv <name> <row>... — a probe CSV with the given rows
+write_csv() { # write_csv <name> <row>... — an inertness CSV with the given rows
     local name="$1"
     shift
     {
@@ -138,8 +138,8 @@ st_case codec_missing_fixture 1 --what "a fixture that is not checked in is refu
     --has 'prompt fixture not found' -- codec "$home" no_fixture --dry-run
 st_case codec_wide_row 1 --what "a row wider than the header is refused" \
     --has 'carry more fields than the header names' -- codec "$home" wide --dry-run
-st_case codec_recorded_row_skipped 2 --what "a row the probe recorded is not written again" \
-    --has 'skipping 1 row(s) the probe already recorded' --has 'no usable rows' -- codec "$home" recorded --dry-run
+st_case codec_recorded_row_skipped 2 --what "a row the sweep recorded is not written again" \
+    --has 'skipping 1 row(s) the sweep already recorded' --has 'no usable rows' -- codec "$home" recorded --dry-run
 st_case codec_failed_row_skipped 2 --what "a run that did not measure has nothing to write" \
     --has 'skipping 1 row(s) with a non-zero exit code' --has 'no usable rows' -- codec "$home" failed --dry-run
 st_run codec "$home" one --record --rmlx-bin "$OLD_RECORDER"

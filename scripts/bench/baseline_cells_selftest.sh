@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Recall test for the baseline cells tool: canary rows, argv, records and exit codes under a stub rmlx
 #
-# Recall test for: bench/baseline_cells.sh --include-26b
+# Recall test for: bench/baseline_cells.sh --include-26b --measure inertness
 #
 # Each case drives the tool against a stub `rmlx` that logs the argv of every `baseline` call and
 # answers each call with the reading its call number names, then asserts the argv, the CSV rows,
 # the summary lines and the exit code: median and stddev of known readings, the gate record, a
-# record that did not land, a run that failed, a claim another process holds, a missing binary.
+# record that did not land, a run that failed, a claim another process holds, a missing binary,
+# and, for the inertness sweep, the columns of each row, the default codec list and the record argv.
 #
 # Usage:  bash scripts/bench/baseline_cells_selftest.sh
 # Exit:   0 every case held; 1 a case did not, or none ran; 2 a fixture could not be built
@@ -29,6 +30,8 @@ GEMMA26=mlx-community__gemma-4-26b-a4b-it-mxfp8
 #   pending_on   the recorded run whose argv holds this text prints its reading, then exits 75
 #   shared_log   name of a run log another process already wrote, which the run appends to
 #   claim_held   `claim run` exits 11
+#   inertness    lines `<call number> <kv_cache_bytes> <token ids> <store skipped 0|1>`: the residency the
+#                run prints, its `token_ids=` line and, for 1, the packed-store-skipped line on stderr
 make_stub() {
 	cat >"$1" <<'STUB'
 #!/usr/bin/env bash
@@ -67,7 +70,12 @@ baseline)
 	if holds silent_on; then exit 0; fi
 	row="$(awk -v n="$n" '$1 == n { print $2, $3 }' "$RMLX_HOME/readings" 2>/dev/null || true)"
 	set -- ${row:-10.0 1.0}
-	echo "baseline: model=stub  ttft_ms=1  decode_tps=$1  prefill_tps=$2  prompt_tokens=4200  kv_cache_bytes=1000"
+	bytes=1000 ids="" skipped=0
+	irow="$(awk -v n="$n" '$1 == n { print $2, $3, $4 }' "$RMLX_HOME/inertness" 2>/dev/null || true)"
+	[ -z "$irow" ] || read -r bytes ids skipped <<<"$irow"
+	echo "baseline: model=stub  ttft_ms=1  decode_tps=$1  prefill_tps=$2  prompt_tokens=4200  kv_cache_bytes=$bytes"
+	[ -z "$ids" ] || echo "baseline: token_ids=$ids"
+	[ "$skipped" = 0 ] || echo "exit_prefill: packed store skipped - decode reads the bf16 mirror only" >&2
 	case "$args" in *" --record "*)
 		if holds pending_on; then
 			echo "error: baseline: measured, but the record did not reach runs.db; it is kept at $RMLX_HOME/metrics/buffer/pending/stub.json for \`rmlx metrics record --replay-pending\`" >&2
@@ -387,6 +395,126 @@ want "runs asked to record" "$(argv_lines_with "$home/baseline_argv" "--record")
 want "files under the data root" "$(ls "$home/bench" 2>/dev/null || true)" ""
 st_verdict cell_without_record "$why" "a cell given no --record asks for no record and writes no file"
 
+# ── the inertness measure ─────────────────────────────────────────────────────
+
+INERTNESS_HEADER="timestamp,model,prompt_tokens,prompt_tokens_measured,max_ctx,max_tokens,codec,exit_code,kv_cache_bytes,ids_sha,store_skipped,ttft_ms,decode_tps,prefill_tps,binary_sha,kv_boundary,recorded_run_class,record_status"
+DEFAULT_CODECS="none k8v8 k8v4 planar planar3 planar_k k8vturbo3 k8vturbo3tcq k8vturbo2 k8vturbo2tcq tsym3 tsym4 iso3 iso4 rotor3 rotor4 rotor_k_4_asym_v4_g64 mixed_k8g64_v4g64 rot_k_v8g64 iso3_sym iso4_sym k_iso3 k_iso4 rotor3_sym rotor4_sym k_rotor3 k_rotor4"
+STUB_SHA="$(shasum -a 256 "$FAKE/target/release-perf/rmlx" | cut -c1-12)"
+IDS_123_SHA="$(printf '1,2,3\n' | shasum -a 256 | cut -c1-16)"
+IDS_456_SHA="$(printf '4,5,6\n' | shasum -a 256 | cut -c1-16)"
+
+# inertness_rows <home> — the inertness CSV without its header and its timestamp column.
+inertness_rows() {
+	sed 1d "$1/bench/codec_inertness.csv" | cut -d, -f2-
+}
+
+# argv_codecs <argv-file> — the --kv-quant values of the logged runs, in order, on one line.
+argv_codecs() {
+	sed -n 's/.* --kv-quant \([^ ]*\).*/\1/p' "$1" | tr '\n' ' ' | sed 's/ $//'
+}
+
+home="$(new_home inertness_rows_and_columns)"
+control "$home" inertness "$(printf '%s\n' '1 5000 1,2,3 0' '2 4000 1,2,3 1' '3 3000 4,5,6 0')"
+run_tool "$home" "$FAKE" --measure inertness --model "$CELL_MODEL" --kv-quant none --kv-quant k8v8 --kv-quant iso3 \
+	--prompt-tokens 2048 --max-tokens 50
+why="$(st_check 0)"
+want "csv header" "$(head -1 "$home/bench/codec_inertness.csv")" "$INERTNESS_HEADER"
+want "csv rows" "$(inertness_rows "$home")" "$(printf '%s\n' \
+	"host__m,2048,4200,4658,50,none,0,5000,$IDS_123_SHA,0,1,10.0,1.0,$STUB_SHA,\"\",diagnostic,landed" \
+	"host__m,2048,4200,4658,50,k8v8,0,4000,$IDS_123_SHA,1,1,10.0,1.0,$STUB_SHA,\"\",diagnostic,landed" \
+	"host__m,2048,4200,4658,50,iso3,0,3000,$IDS_456_SHA,0,1,10.0,1.0,$STUB_SHA,\"\",diagnostic,landed")"
+want "timestamps" "$(sed 1d "$home/bench/codec_inertness.csv" | cut -d, -f1 | grep -cE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' || true)" 3
+st_verdict inertness_rows_and_columns "$why" "one row per codec: residency, the digest of the greedy ids, whether the packed store was skipped, and the run's context"
+
+home="$(new_home inertness_default_codecs)"
+run_tool "$home" "$FAKE" --measure inertness --model "$CELL_MODEL"
+why="$(st_check 0)"
+want "codecs run" "$(argv_codecs "$home/baseline_argv")" "$DEFAULT_CODECS"
+want "csv codecs" "$(inertness_rows "$home" | cut -d, -f6 | tr '\n' ' ' | sed 's/ $//')" "$DEFAULT_CODECS"
+want "runs with the default sizes" "$(argv_lines_with "$home/baseline_argv" "--prompt-tokens 4096" "--max-tokens 100" "--max-ctx 7268")" 27
+st_verdict inertness_default_codecs "$why" "no --kv-quant runs the default codec list, at 4096 prompt tokens, 100 generated and room in the context"
+
+home="$(new_home inertness_record_argv)"
+run_tool "$home" "$FAKE" --measure inertness --model "$CELL_MODEL" --kv-quant none --kv-quant k8v8 \
+	--prompt-tokens 1024 --max-tokens 30 --max-ctx 9000
+why="$(st_check 0)"
+want "runs" "$(wc -l <"$home/baseline_argv" | tr -d ' ')" 2
+want "runs with the cell's options" "$(argv_lines_with "$home/baseline_argv" "--model $CELL_MODEL" "--prompt-tokens 1024" "--max-tokens 30" "--max-ctx 9000" "--emit-token-ids" "--log debug")" 2
+want "runs recording as diagnostic" "$(argv_lines_with "$home/baseline_argv" "--record --run-class diagnostic")" 2
+stamp="$(sed -n 's/.*--label codec_inertness:\([0-9]\{8\}T[0-9]\{6\}Z\):none .*/\1/p' "$home/baseline_argv")"
+want "label of the none run" "$(argv_lines_with "$home/baseline_argv" "--label codec_inertness:$stamp:none ")" 1
+want "label of the k8v8 run" "$(argv_lines_with "$home/baseline_argv" "--label codec_inertness:$stamp:k8v8 ")" 1
+want "runs given --git-sha or --warmup" "$(argv_lines_with "$home/baseline_argv" "--git-sha")$(argv_lines_with "$home/baseline_argv" "--warmup")" 00
+want "max_ctx column" "$(inertness_rows "$home" | cut -d, -f4 | sort -u)" 9000
+st_verdict inertness_record_argv "$why" "every run records as diagnostic under one codec_inertness stamp, emits its ids and logs at debug"
+
+home="$(new_home inertness_kv_boundary)"
+run_tool "$home" "$FAKE" --measure inertness --model "$CELL_MODEL" --kv-quant none --kv-quant iso3 --kv-boundary-layers 0,0
+why="$(st_check 0)"
+want "runs given the boundary" "$(argv_lines_with "$home/baseline_argv" "--kv-boundary-layers 0,0")" 2
+want "kv_boundary column" "$(inertness_rows "$home" | python3 -c 'import csv, sys; print(" ".join(r[14] for r in csv.reader(sys.stdin)))')" "0,0 0,0"
+want "fields per row" "$(inertness_rows "$home" | python3 -c 'import csv, sys; print(" ".join(str(len(r)) for r in csv.reader(sys.stdin)))')" "17 17"
+st_verdict inertness_kv_boundary "$why" "--kv-boundary-layers reaches every run and fills the kv_boundary column as one quoted field"
+
+home="$(new_home inertness_record_pending)"
+control "$home" pending_on "--kv-quant k8v8 "
+control "$home" inertness "$(printf '%s\n' '1 5000 1,2,3 0' '2 4000 1,2,3 0' '3 3000 4,5,6 0')"
+run_tool "$home" "$FAKE" --measure inertness --model "$CELL_MODEL" --kv-quant none --kv-quant k8v8 --kv-quant iso3
+why="$(st_check 75 --has "record pending: $home/metrics/buffer/pending/stub.json")"
+want "recorded_run_class/record_status" "$(inertness_rows "$home" | cut -d, -f6,7,16,17 | tr '\n' ' ')" \
+	'none,0,diagnostic,landed k8v8,0,diagnostic,pending iso3,0,diagnostic,landed '
+want "the pending run kept its reading" "$(inertness_rows "$home" | sed -n 2p | cut -d, -f8,9)" "4000,$IDS_123_SHA"
+want "runs" "$(wc -l <"$home/baseline_argv" | tr -d ' ')" 3
+st_verdict inertness_record_pending "$why" "a run that measured and whose record did not land keeps exit_code 0 and its reading, is marked pending, and the sweep ends 75"
+
+home="$(new_home inertness_run_fails)"
+control "$home" crash_on "--kv-quant k8v8 "
+control "$home" inertness "$(printf '%s\n' '1 5000 1,2,3 0' '3 3000 4,5,6 0')"
+run_tool "$home" "$FAKE" --measure inertness --model "$CELL_MODEL" --kv-quant none --kv-quant k8v8 --kv-quant iso3
+why="$(st_check 0)"
+want "rows" "$(inertness_rows "$home" | cut -d, -f6- | tr '\n' ' ')" \
+	"none,0,5000,$IDS_123_SHA,0,1,10.0,1.0,$STUB_SHA,\"\",diagnostic,landed k8v8,1,,,0,,,,$STUB_SHA,\"\",, iso3,0,3000,$IDS_456_SHA,0,1,10.0,1.0,$STUB_SHA,\"\",diagnostic,landed "
+st_verdict inertness_run_fails "$why" "a run that fails keeps its row with its own exit code and no reading, no record class, and the sweep goes on"
+
+home="$(new_home inertness_run_without_ids)"
+run_tool "$home" "$FAKE" --measure inertness --model "$CELL_MODEL" --kv-quant none
+why="$(st_check 0)"
+want "ids_sha and store_skipped" "$(inertness_rows "$home" | cut -d, -f8,9,10)" "1000,,0"
+st_verdict inertness_run_without_ids "$why" "a run that printed no token ids has an empty digest, not the digest of nothing"
+
+home="$(new_home inertness_claim_held)"
+control "$home" claim_held 1
+run_tool "$home" "$FAKE" --measure inertness --model "$CELL_MODEL" --kv-quant none --kv-quant k8v8
+why="$(st_check 11)"
+want "runs while the claim is held" "$(cat "$home/baseline_argv" 2>/dev/null || true)" ""
+st_verdict inertness_claim_held "$why" "a Metal claim another process holds ends the sweep with exit 11, before any run"
+
+home="$(new_home inertness_appends_under_one_header)"
+run_tool "$home" "$FAKE" --measure inertness --model "$CELL_MODEL" --kv-quant none
+run_tool "$home" "$FAKE" --measure inertness --model "$CELL_MODEL" --kv-quant k8v8
+why="$(st_check 0)"
+want "header lines" "$(grep -c '^timestamp,' "$home/bench/codec_inertness.csv" || true)" 1
+want "rows" "$(inertness_rows "$home" | wc -l | tr -d ' ')" 2
+st_verdict inertness_appends_under_one_header "$why" "a second sweep appends its rows under the header already on disk"
+
+home="$(new_home inertness_foreign_header)"
+mkdir -p "$home/bench"
+printf 'timestamp,model,codec\n' >"$home/bench/codec_inertness.csv"
+run_tool "$home" "$FAKE" --measure inertness --model "$CELL_MODEL" --kv-quant none
+why="$(st_check 2)"
+want "runs against a file of another header" "$(cat "$home/baseline_argv" 2>/dev/null || true)" ""
+want "file left as it was" "$(cat "$home/bench/codec_inertness.csv")" "timestamp,model,codec"
+st_verdict inertness_foreign_header "$why" "a CSV whose header is not this one's is refused before any run and left as it was"
+
+home="$(new_home inertness_csv_and_binary_flags)"
+make_stub "$ST_WORK/rmlx_named"
+run_tool "$home" "$FAKE" --measure inertness --model "$CELL_MODEL" --kv-quant none --csv "$ST_WORK/named.csv" --binary "$ST_WORK/rmlx_named"
+why="$(st_check 0)"
+want "binary that ran" "$(sort -u "$home/ran")" "$ST_WORK/rmlx_named"
+want "rows in the named file" "$(sed 1d "$ST_WORK/named.csv" | wc -l | tr -d ' ')" 1
+want "files under the data root" "$(ls "$home/bench" 2>/dev/null || true)" ""
+st_verdict inertness_csv_and_binary_flags "$why" "--csv names the file the rows go to and --binary the rmlx that runs"
+
 usage_case() { # <name> <needle> <args...>
 	local name="$1" needle="$2"
 	shift 2
@@ -405,5 +533,11 @@ usage_case usage_cell_with_canary_option "belong to --preset canary" --model "$C
 usage_case usage_record_class "--record takes diagnostic" --model "$CELL_MODEL" --kv-quant k8v8 --record gate
 usage_case usage_zero_runs "take a positive integer" --model "$CELL_MODEL" --kv-quant k8v8 --runs 0
 usage_case usage_missing_model "model path not found: $ST_WORK/no_such_model" --model "$ST_WORK/no_such_model" --kv-quant k8v8
+usage_case usage_unknown_measure "unknown measure: nope" --measure nope --model "$CELL_MODEL"
+usage_case usage_canary_with_measure "--preset canary takes none of: --measure" --preset canary --models-root "$MODELS" --measure inertness
+usage_case usage_inertness_with_rate_option "--measure inertness takes none of: --warmup --runs" --measure inertness --model "$CELL_MODEL" --warmup 2 --runs 3
+usage_case usage_rate_with_inertness_option "--csv belong to --measure inertness" --model "$CELL_MODEL" --kv-quant k8v8 --csv "$ST_WORK/x.csv"
+usage_case usage_rate_with_two_codecs "--kv-quant takes one codec without --measure inertness" --model "$CELL_MODEL" --kv-quant k8v8 --kv-quant iso3
+usage_case usage_inertness_missing_model "model path not found: $ST_WORK/no_such_model" --measure inertness --model "$ST_WORK/no_such_model"
 
 st_done

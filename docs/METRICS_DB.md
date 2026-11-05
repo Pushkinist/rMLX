@@ -744,7 +744,7 @@ change to what `bests` publishes, such as a `METRICS_SCHEMA.md` §4.1 bounds cha
     `ab_arm`: every A/B slot; `scripts/perf_ab.sh` records each slot, and
     `scripts/bench_llama_ab.sh` each arm's medians. `diagnostic`: profiling,
     traced and investigation runs, among them the canary's warmup and
-    measured calls, a GPU capture, a codec probe and the server's live
+    measured calls, a GPU capture, an inertness sweep and the server's live
     requests. Only `gate` rows reach `bests`, the gates and the exports.
     Bring a scratch DB's rows in with `rmlx metrics import` (§11). Not
     recorded, and why:

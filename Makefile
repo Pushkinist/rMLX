@@ -1019,10 +1019,10 @@ spec-bench-selftest: ## mutation-check the spec-decode bench against a stub serv
 bench-identity-selftest: ## mutation-check the commit and run-log sources of the canary, bench_decode_tps.sh and lib/identity.sh against stub binaries (no GPU, no model, no DB write)
 	bash scripts/bench_identity_selftest.sh
 
-baseline-cells-selftest: ## recall-check the canary preset and the single codec cell: argv, CSV rows, median and stddev, records, exit codes (stub binary; no GPU, no model, no DB write)
+baseline-cells-selftest: ## recall-check the canary preset, the single codec cell and the inertness sweep: argv, CSV rows, median and stddev, digests, records, exit codes (stub binary; no GPU, no model, no DB write)
 	bash scripts/bench/baseline_cells_selftest.sh
 
-run-class-selftest: ## check that the capture scripts, the codec probe and its ingest record under a stated run class, and record a run once (stub binaries; no GPU, no model, no DB write)
+run-class-selftest: ## check that the capture scripts, the inertness sweep and its ingest record under a stated run class, and record a run once (stub binaries; no GPU, no model, no DB write)
 	bash scripts/run_class_selftest.sh
 
 spec-bench-published-selftest: ## mutation-check the published-protocol bench against a stub server (no GPU, no model)

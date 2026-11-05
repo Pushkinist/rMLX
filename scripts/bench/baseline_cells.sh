@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# baseline_cells.sh — decode-rate cells through `rmlx baseline`: the canary, or one model and codec
+# baseline_cells.sh — cells through `rmlx baseline`: the canary, one codec, or the inertness sweep
 #
 # Usage:  bash scripts/bench/baseline_cells.sh --preset canary --models-root DIR [--include-26b]
 #             [--binary PATH]
 #         bash scripts/bench/baseline_cells.sh --model PATH --kv-quant CODEC [--prompt-tokens N]
 #             [--max-tokens N] [--warmup N] [--runs N] [--record diagnostic] [--label L]
 #             [--binary PATH]
+#         bash scripts/bench/baseline_cells.sh --measure inertness --model PATH [--kv-quant CODEC]...
+#             [--prompt-tokens N] [--max-tokens N] [--max-ctx N] [--kv-boundary-layers H,T]
+#             [--csv PATH] [--binary PATH]
 # Exit:   0 every run measured; 1 a run failed, gave no reading, or the gate record did not land;
 #         2 a usage error or a missing model; 11 passthrough of rmlx (another process holds the
-#         Metal claim); 75 a run measured and its record did not land; 125 the binary is missing
-# Not a mode of: bench/codec_inertness_probe.sh — that one reads residency and a token digest at
-#         temperature 0; this one reads decode rate
+#         Metal claim); 75 a run measured and its record did not land; 125 the binary is missing.
+#         The inertness sweep ends 0 or 75 whatever its runs did: a run that failed keeps its row.
+# Not a mode of: perf_ab.sh — that one interleaves the arms of two builds; this one measures one build
 #
 # --preset canary measures the three test-target models (and the 26b MoE with --include-26b), each
 # on the default KV codec and on k8vturbo3: 1 warmup and 3 measured calls, median decode_tps ±
@@ -29,6 +32,35 @@
 # --model with --kv-quant measures one cell: mean ± sample stddev of the measured runs. --record
 # diagnostic records every run, the warmup included, under one --label (default
 # codec_cell:<utc stamp>:<codec>) so the runs are found together.
+#
+# --measure inertness asks whether a KV codec changes anything a caller can see. For one model and
+# one prompt length it runs `rmlx baseline` once per codec (no --kv-quant: the default list, one
+# representative per parameterised family) at temperature 0, no warmup, and appends one row per
+# codec to <data root>/bench/codec_inertness.csv (or --csv). Every run is recorded `diagnostic`
+# under the label codec_inertness:<utc stamp>:<codec>, so no row reaches a champion or a gate.
+#   kv_cache_bytes  resident KV: a codec that saves no bytes is not a memory lever
+#   ids_sha         sha256 of the greedy token ids, 16 hex digits, empty when the run printed none:
+#                   the `none` arm's digest means the codec is not on the decode read path, which
+#                   decoded text cannot show
+#   store_skipped   1 when any layer logged `exit_prefill: packed store skipped`. Corroboration only,
+#                   not a per-codec fact: the head/tail layers of the iso and rotor codecs are
+#                   promoted to K8V8, so those store-reading codecs set it too
+# Columns, in order: timestamp,model,prompt_tokens,prompt_tokens_measured,max_ctx,max_tokens,codec,
+# exit_code,kv_cache_bytes,ids_sha,store_skipped,ttft_ms,decode_tps,prefill_tps,binary_sha,
+# kv_boundary,recorded_run_class,record_status. `docs/KV_QUANT.md` § "Codec disposition" says what a
+# row decides; `ingest/ingest.py codec-inertness` reads the CSV.
+#   exit_code       0 when the run measured (a pending record included), else its own exit code
+#   record_status   landed, pending (the run measured and its record did not land: its buffer file
+#                   is named on stderr and the tool ends 75), or empty for a run that did not measure
+#   kv_boundary     the --kv-boundary-layers value, quoted because it holds a comma; empty is the
+#                   engine default. It is a cell-identity term: another head/tail count is another cell
+#   prompt_tokens   the fixture name (4096 selects prompts/longctx_4k.json); prompt_tokens_measured
+#                   is what the run tokenized, ~5% more after the chat template
+#   ttft_ms, decode_tps, prefill_tps are context only: single unpaired runs on a shared host
+# --max-ctx defaults to 1.25 x the prompt + --max-tokens + 2048: a ceiling of prompt + generation
+# is refused mid-prefill, because the chat template lengthens the prompt and the ring rounds up.
+# --max-tokens 200 or more for a disposition run: at short lengths, codecs that differ can give
+# one digest. A CSV on disk under another header is refused with exit 2.
 #
 # This tool measures one build. Comparing two builds needs scripts/perf_ab.sh, which interleaves
 # the arms: ordering and thermal drift land on whichever arm ran second here.
@@ -49,15 +81,36 @@ INCLUDE_26B=false
 BINARY=""
 MODEL_PATH=""
 KV_QUANT=""
+KV_QUANTS=()
+MEASURE=""
+CSV_PATH=""
+KV_BOUNDARY=""
 RECORD_CLASS=""
 LABEL=""
 CELL_OPTIONS=""
+RATE_OPTIONS=""
+INERTNESS_OPTIONS=""
 PROMPT_TOKENS=4096
 MAX_TOKENS=100
 WARMUP_RUNS=1
 MEASURED_RUNS=3
 MAX_CTX=""
 BUILD_PROFILE="release-perf"
+
+INERTNESS_HEADER="timestamp,model,prompt_tokens,prompt_tokens_measured,max_ctx,max_tokens,codec,exit_code,kv_cache_bytes,ids_sha,store_skipped,ttft_ms,decode_tps,prefill_tps,binary_sha,kv_boundary,recorded_run_class,record_status"
+# One representative per parameterised family: 27 of the 28 codecs `ALL_KV_QUANTS` holds, with no
+# `rotor_k_3_asym_*` entry.
+DEFAULT_CODECS=(
+    none
+    k8v8 k8v4 planar planar3 planar_k
+    k8vturbo3 k8vturbo3tcq k8vturbo2 k8vturbo2tcq
+    tsym3 tsym4
+    iso3 iso4 rotor3 rotor4
+    rotor_k_4_asym_v4_g64
+    mixed_k8g64_v4g64 rot_k_v8g64
+    iso3_sym iso4_sym k_iso3 k_iso4
+    rotor3_sym rotor4_sym k_rotor3 k_rotor4
+)
 
 usage_error() {
     echo "ERROR: $1" >&2
@@ -76,13 +129,17 @@ while [[ $# -gt 0 ]]; do
         --models-root) MODELS_ROOT="$(value_of "$@")" ;;
         --binary) BINARY="$(value_of "$@")" ;;
         --model) MODEL_PATH="$(value_of "$@")"; CELL_OPTIONS+=" $1" ;;
-        --kv-quant) KV_QUANT="$(value_of "$@")"; CELL_OPTIONS+=" $1" ;;
+        --kv-quant) KV_QUANTS+=("$(value_of "$@")"); CELL_OPTIONS+=" $1" ;;
         --prompt-tokens) PROMPT_TOKENS="$(value_of "$@")"; CELL_OPTIONS+=" $1" ;;
         --max-tokens) MAX_TOKENS="$(value_of "$@")"; CELL_OPTIONS+=" $1" ;;
-        --warmup) WARMUP_RUNS="$(value_of "$@")"; CELL_OPTIONS+=" $1" ;;
-        --runs) MEASURED_RUNS="$(value_of "$@")"; CELL_OPTIONS+=" $1" ;;
-        --record) RECORD_CLASS="$(value_of "$@")"; CELL_OPTIONS+=" $1" ;;
-        --label) LABEL="$(value_of "$@")"; CELL_OPTIONS+=" $1" ;;
+        --warmup) WARMUP_RUNS="$(value_of "$@")"; CELL_OPTIONS+=" $1"; RATE_OPTIONS+=" $1" ;;
+        --runs) MEASURED_RUNS="$(value_of "$@")"; CELL_OPTIONS+=" $1"; RATE_OPTIONS+=" $1" ;;
+        --record) RECORD_CLASS="$(value_of "$@")"; CELL_OPTIONS+=" $1"; RATE_OPTIONS+=" $1" ;;
+        --label) LABEL="$(value_of "$@")"; CELL_OPTIONS+=" $1"; RATE_OPTIONS+=" $1" ;;
+        --measure) MEASURE="$(value_of "$@")"; CELL_OPTIONS+=" $1" ;;
+        --max-ctx) MAX_CTX="$(value_of "$@")"; CELL_OPTIONS+=" $1"; INERTNESS_OPTIONS+=" $1" ;;
+        --kv-boundary-layers) KV_BOUNDARY="$(value_of "$@")"; CELL_OPTIONS+=" $1"; INERTNESS_OPTIONS+=" $1" ;;
+        --csv) CSV_PATH="$(value_of "$@")"; CELL_OPTIONS+=" $1"; INERTNESS_OPTIONS+=" $1" ;;
         *) usage_error "unknown argument: $1" ;;
     esac
     shift 2
@@ -98,19 +155,36 @@ set RMLX_O_MODELS_ROOT (see .env.example) or pass --models-root"
         ;;
     "")
         [[ -n "${MODEL_PATH}" ]] || usage_error "--model is required without --preset"
-        [[ -n "${KV_QUANT}" ]] || usage_error "--kv-quant is required without --preset"
+        case "${MEASURE}" in
+            "")
+                [[ ${#KV_QUANTS[@]} -gt 0 ]] || usage_error "--kv-quant is required without --preset"
+                [[ ${#KV_QUANTS[@]} -eq 1 ]] || usage_error "--kv-quant takes one codec without --measure inertness"
+                KV_QUANT="${KV_QUANTS[0]}"
+                [[ -z "${INERTNESS_OPTIONS}" ]] || usage_error "${INERTNESS_OPTIONS# } belong to --measure inertness"
+                ;;
+            inertness)
+                [[ -z "${RATE_OPTIONS}" ]] || usage_error "--measure inertness takes none of:${RATE_OPTIONS}"
+                ;;
+            *) usage_error "unknown measure: ${MEASURE}" ;;
+        esac
         if [[ -n "${MODELS_ROOT}" ]] || ${INCLUDE_26B}; then
             usage_error "--models-root and --include-26b belong to --preset canary"
         fi
         [[ -z "${RECORD_CLASS}" || "${RECORD_CLASS}" == diagnostic ]] || usage_error "--record takes diagnostic"
         [[ -d "${MODEL_PATH}" ]] || usage_error "model path not found: ${MODEL_PATH}"
-        [[ -n "${LABEL}" ]] || LABEL="codec_cell:$(date -u +%Y%m%dT%H%M%SZ):${KV_QUANT}"
+        [[ -n "${MEASURE}" || -n "${LABEL}" ]] || LABEL="codec_cell:$(date -u +%Y%m%dT%H%M%SZ):${KV_QUANT}"
         ;;
     *) usage_error "unknown preset: ${PRESET}" ;;
 esac
 if ! [[ "${PROMPT_TOKENS}" =~ ^[1-9][0-9]*$ && "${MAX_TOKENS}" =~ ^[1-9][0-9]*$ &&
-    "${MEASURED_RUNS}" =~ ^[1-9][0-9]*$ && "${WARMUP_RUNS}" =~ ^[0-9]+$ ]]; then
-    usage_error "--prompt-tokens, --max-tokens and --runs take a positive integer, --warmup a non-negative one"
+    "${MEASURED_RUNS}" =~ ^[1-9][0-9]*$ && "${WARMUP_RUNS}" =~ ^[0-9]+$ &&
+    "${MAX_CTX:-1}" =~ ^[1-9][0-9]*$ ]]; then
+    usage_error "--prompt-tokens, --max-tokens, --max-ctx and --runs take a positive integer, --warmup a non-negative one"
+fi
+if [[ "${MEASURE}" == inertness ]]; then
+    MAX_CTX="${MAX_CTX:-$((PROMPT_TOKENS * 5 / 4 + MAX_TOKENS + 2048))}"
+    STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+    RECORD_CLASS=diagnostic
 fi
 
 TARGET_DIR="${REPO_ROOT}/target"
@@ -140,7 +214,26 @@ CSV="${DATA_ROOT}/bench/perf_canary.csv"
 
 ctx_args=()
 git_sha_args=()
-if [[ -n "${PRESET}" ]]; then
+boundary_args=()
+if [[ "${MEASURE}" == inertness ]]; then
+    ctx_args=(--max-ctx "${MAX_CTX}")
+    if [[ -n "${KV_BOUNDARY}" ]]; then
+        boundary_args=(--kv-boundary-layers "${KV_BOUNDARY}")
+    fi
+    if [[ ${#KV_QUANTS[@]} -eq 0 ]]; then
+        KV_QUANTS=(${DEFAULT_CODECS[@]+"${DEFAULT_CODECS[@]}"})
+    fi
+    BINARY_SHA="$(shasum -a 256 "${BINARY}" | cut -c1-12)"
+    CSV="${CSV_PATH:-${DATA_ROOT}/bench/codec_inertness.csv}"
+    mkdir -p "$(dirname "${CSV}")"
+    if [[ ! -f "${CSV}" ]]; then
+        echo "${INERTNESS_HEADER}" > "${CSV}"
+    elif [[ "$(head -1 "${CSV}")" != "${INERTNESS_HEADER}" ]]; then
+        # Rows appended under another header would land in the wrong columns, silently.
+        echo "ERROR: ${CSV} has a header this tool does not write; pass --csv with a new path" >&2
+        exit 2
+    fi
+elif [[ -n "${PRESET}" ]]; then
     ctx_args=(--max-ctx "${MAX_CTX}")
     mkdir -p "${DATA_ROOT}/bench"
     if [[ ! -f "${CSV}" ]]; then
@@ -162,6 +255,8 @@ trap 'rm -f "${PENDING}"' EXIT
 label_for() {
     if [[ -n "${PRESET}" ]]; then
         echo "canary sha=${GIT_SHA}${1:+ $1}"
+    elif [[ "${MEASURE}" == inertness ]]; then
+        echo "codec_inertness:${STAMP}:${1}"
     else
         echo "${LABEL}"
     fi
@@ -171,7 +266,8 @@ label_for() {
 # "<decode_tps>:<prefill_tps>", a missing reading as 0. A run that measured and
 # whose record did not land (exit RECORD_PENDING_EXIT) keeps its reading and is
 # noted in PENDING, except a gate run, which the canary cannot go on without.
-# Any other failure stops the tool.
+# Any other failure stops the tool, except in the inertness sweep, which keeps the failed
+# run's row. Leaves the run's exit code, stdout and stderr in RUN_RC, RUN_OUT and RUN_LOG.
 # Usage: run_once <phase> <class> <model_path> [baseline args...]
 run_once() {
     local phase="$1" class="$2" model_path="$3"
@@ -191,10 +287,13 @@ run_once() {
         ${record_args[@]+"${record_args[@]}"} \
         "$@" \
         2>"${err}")" || rc=$?
+    RUN_RC="${rc}"
+    RUN_OUT="${out}"
+    RUN_LOG="$(cat "${err}")"
     if [[ "${rc}" -eq "${RECORD_PENDING_EXIT}" && "${class}" != gate ]]; then
         record_pending_note "${err}"
         echo "${model_path##*/} ${phase}" >>"${PENDING}"
-    elif [[ "${rc}" -ne 0 ]]; then
+    elif [[ "${rc}" -ne 0 && "${MEASURE}" != inertness ]]; then
         if [[ "${rc}" -eq "${RECORD_PENDING_EXIT}" ]]; then
             record_pending_note "${err}"
             echo "  replaying it adds the gate row this canary reports as missing" >&2
@@ -336,7 +435,55 @@ canary_model() {
     fi
 }
 
-if [[ -n "${PRESET}" ]]; then
+# One codec of the inertness sweep: its run, then its CSV row. exit_code is 0 for a run that
+# measured, a pending record included, and the run's own code otherwise.
+# Usage: inertness_codec <codec>
+inertness_codec() {
+    local codec="$1" exit_code recorded="" record_status="" ids_sha="" skipped=0
+    local summary kv_bytes measured ttft dtps ptps
+    run_once "${codec}" diagnostic "${MODEL_PATH}" --kv-quant "${codec}" \
+        ${boundary_args[@]+"${boundary_args[@]}"} --emit-token-ids --log debug > /dev/null
+    exit_code="${RUN_RC}"
+    if [[ "${exit_code}" -eq 0 ]]; then
+        recorded=diagnostic
+        record_status=landed
+    elif [[ "${exit_code}" -eq "${RECORD_PENDING_EXIT}" ]]; then
+        recorded=diagnostic
+        record_status=pending
+        exit_code=0
+    fi
+
+    # `token_ids=` is printed only for a completed generation; the digest of an empty
+    # string is not a result.
+    if grep -q '^baseline: token_ids=' <<<"${RUN_OUT}"; then
+        ids_sha="$(sed -n 's/^baseline: token_ids=//p' <<<"${RUN_OUT}" | sed -n 1p | shasum -a 256 | cut -c1-16)"
+    fi
+    if grep -q 'packed store skipped' <<<"${RUN_OUT}${RUN_LOG}"; then
+        skipped=1
+    fi
+
+    summary="$(grep -m1 '^baseline: model=' <<<"${RUN_OUT}" || true)"
+    kv_bytes="$(sed -n 's/.*kv_cache_bytes=\([0-9]*\).*/\1/p' <<<"${summary}")"
+    measured="$(sed -n 's/.*prompt_tokens=\([0-9]*\).*/\1/p' <<<"${summary}")"
+    ttft="$(sed -n 's/.*ttft_ms=\([0-9.]*\).*/\1/p' <<<"${summary}")"
+    dtps="$(sed -n 's/.*decode_tps=\([0-9.]*\).*/\1/p' <<<"${summary}")"
+    ptps="$(sed -n 's/.*prefill_tps=\([0-9.]*\).*/\1/p' <<<"${summary}")"
+
+    # kv_boundary holds a comma, so it is quoted: unquoted it would be two columns.
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"%s",%s,%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(basename "${MODEL_PATH}")" "${PROMPT_TOKENS}" "${measured}" \
+        "${MAX_CTX}" "${MAX_TOKENS}" "${codec}" "${exit_code}" "${kv_bytes}" "${ids_sha}" "${skipped}" \
+        "${ttft}" "${dtps}" "${ptps}" "${BINARY_SHA}" "${KV_BOUNDARY}" "${recorded}" "${record_status}" >>"${CSV}"
+    printf '  %-24s rc=%-3s bytes=%-12s ids=%-16s skipped=%s record=%s\n' \
+        "${codec}" "${RUN_RC}" "${kv_bytes:-NONE}" "${ids_sha:-NONE}" "${skipped}" "${record_status:-none}"
+}
+
+if [[ "${MEASURE}" == inertness ]]; then
+    echo "==> inertness × ${MODEL_PATH##*/}: ${#KV_QUANTS[@]} codec(s) -> ${CSV}" >&2
+    for codec in ${KV_QUANTS[@]+"${KV_QUANTS[@]}"}; do
+        inertness_codec "${codec}"
+    done
+elif [[ -n "${PRESET}" ]]; then
     MODEL_DIRS=(
         mlx-community__gemma-4-e4b-it-mxfp8
         mlx-community__Qwen3.8-27B-4bit
@@ -378,6 +525,6 @@ if [[ -n "${PRESET}" ]]; then
     echo "DB: ${DATA_ROOT}/metrics/runs.db (use 'make canary-gate SHA=<sha>' to gate)" >&2
 fi
 if [[ -s "${PENDING}" ]]; then
-    echo "${PRESET:-cell} INCOMPLETE: $(wc -l <"${PENDING}" | tr -d ' ') diagnostic record(s) did not land (named above)" >&2
+    echo "${PRESET:-${MEASURE:-cell}} INCOMPLETE: $(wc -l <"${PENDING}" | tr -d ' ') diagnostic record(s) did not land (named above)" >&2
     exit "${RECORD_PENDING_EXIT}"
 fi

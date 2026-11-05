@@ -249,7 +249,7 @@ recorded from the `done` line. Neither composes a drafter term.
 
 The `kv_boundary/*` pair is always written together, `head` before `tail`.
 The shipped default is `NULL`. The two Python ingesters derive the terms from
-the run's own recorded arguments: the probe's `kv_boundary` column and
+the run's own recorded arguments: the inertness sweep's `kv_boundary` column and
 `perf_ab.sh`'s per-arm `args`. They read the default from
 `rmlx_core::kv_boundary` through `scripts/lib/kv_boundary_default.py`;
 `make check-kv-boundary-default-parity` gates it.
