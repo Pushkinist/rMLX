@@ -333,6 +333,7 @@ verdict ingest_refuses_a_classless_recorder "a recorder without --run-class is r
 # ── ingest.py llama-bench ─────────────────────────────────────────────────────
 #
 mkdir -p "$WORK/oldbin" "$WORK/llama_root"
+cp -R "$REPO_ROOT/scripts" "$WORK/llama_root/scripts"
 cp "$OLD_RECORDER" "$WORK/oldbin/rmlx"
 printf '[]\n' >"$WORK/llama_bench.json"
 set +e
@@ -354,7 +355,7 @@ cat >"$WORK/llama_row.json" <<'ROW'
 ROW
 set +e
 RMLX_HOME="$WORK/llama_home" \
-	python3 "$REPO_ROOT/scripts/ingest/ingest.py" llama-bench "$WORK/llama_row.json" \
+	python3 "$WORK/llama_root/scripts/ingest/ingest.py" llama-bench "$WORK/llama_row.json" \
 	>"$WORK/llama_queue.out" 2>&1
 status=$?
 set -e
@@ -376,13 +377,12 @@ STUB
 	chmod +x "$1"
 }
 make_logging_recorder "$WORK/pathbin/rmlx" path
-CHECKOUT_RMLX="$WORK/llama_root2/target/release/rmlx"
-make_logging_recorder "$CHECKOUT_RMLX" checkout
+make_logging_recorder "$WORK/llama_root/target/release/rmlx" checkout
 : >"$WORK/llama_recorder.log"
 set +e
 PATH="$WORK/pathbin:$PATH" RMLX_HOME="$WORK/llama_home2" \
-	python3 "$REPO_ROOT/scripts/ingest/ingest.py" llama-bench "$WORK/llama_row.json" --record \
-	--rmlx-bin "$CHECKOUT_RMLX" >"$WORK/llama_record.out" 2>&1
+	python3 "$WORK/llama_root/scripts/ingest/ingest.py" llama-bench "$WORK/llama_row.json" --record \
+	>"$WORK/llama_record.out" 2>&1
 set -e
 bad=""
 used="$(sort -u "$WORK/llama_recorder.log" | tr '\n' ' ')"

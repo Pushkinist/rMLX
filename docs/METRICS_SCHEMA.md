@@ -232,7 +232,7 @@ its defaults. The empty string is refused.
 | `<drafter>/block=<n>` | speculative arm and its configured block | `rmlx_metrics::cell::decode_config`, called by the round loop, which logs it on its `done` line |
 | `<drafter>/depth=<policy>` | how the loop sizes each round's block, when it resizes | same |
 | `prefill_chunk=<n>` | non-default prefill chunk | `scripts/prefill_chunk_sweep.sh` |
-| `kv_boundary/head=<h>,kv_boundary/tail=<t>` | `--kv-boundary-layers` off its default | `rmlx baseline --record`, `rmlx eval ppl`, `scripts/ingest/{codec_inertness,perf_ab}_ingest.py` |
+| `kv_boundary/head=<h>,kv_boundary/tail=<t>` | `--kv-boundary-layers` off its default | `rmlx baseline --record`, `rmlx eval ppl`, `scripts/ingest/ingest.py {ab,codec-inertness}` |
 
 `<drafter>` is the `DraftKind::as_str` name: `mtp`, `dflash`, `dflash2`,
 `eagle3` or `two_model`.

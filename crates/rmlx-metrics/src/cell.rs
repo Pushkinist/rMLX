@@ -220,7 +220,7 @@ pub fn decode_config_with_inherent_depth(value: &str) -> Option<String> {
 /// the string here and logs it on its `done` line, and `scripts/spec_bench.sh`
 /// records what the engine said rather than spelling it a second time. It is not
 /// the only composer of the *column* — `rmlx_models::kv_cache`'s boundary terms,
-/// `scripts/ingest/{perf_ab,codec_inertness}_ingest.py` and
+/// `scripts/ingest/ingest.py` (`ab`, `codec-inertness`) and
 /// `scripts/prefill_chunk_sweep.sh` each build their own, sharing the values
 /// through `check-kv-boundary-default-parity` but not the format.
 ///

@@ -64,6 +64,8 @@ WEIGHT_QUANT="$7"   # mxfp8 | paro | ... (whitelist)
 PROGRESS=${RMLX_ROOT}/BENCH_PROGRESS.md
 CBB=${CROSS_BENCH_ROOT:-../Cross-Backend-Bench}
 RMLX_DIR=${RMLX_ROOT}
+# Read by the cross-backend harness to find this checkout's binary and metrics buffer.
+export RMLX_REPO_ROOT="${RMLX_DIR}"
 
 # Run identity (backend / version / git sha / build profile / hardware tag)
 # comes from the measured binary — never hard-coded here.
