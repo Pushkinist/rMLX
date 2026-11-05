@@ -252,12 +252,51 @@ st_verdict llama_bench_records_through_the_recorder "$why" "a record the recorde
 
 home="$(fresh_home llama_rejected)"
 st_run ingest_in "$home" llama-bench --record --rmlx-bin "$FAIL" "$ST_WORK/llama_rows.json"
-why="$(st_check 0 --has 'WARN: recorder rejected record' --has 'stderr: stub: rejected' --lacks 'recorded OK')"
+why="$(st_check 1 --has 'WARN: recorder rejected record' --has 'stderr: stub: rejected' --lacks 'recorded OK')"
 [ "$(count "$home/metrics/buffer/failed")" = 1 ] || why="${why:+$why
 }the rejected record is not under failed"
 [ "$(count "$home/metrics/buffer/pending")" = 0 ] || why="${why:+$why
 }the rejected record is still in pending"
-st_verdict llama_bench_rejected_record_moves_to_failed "$why" "a rejected record leaves the queue for failed/"
+st_verdict llama_bench_rejected_record_moves_to_failed "$why" "a rejected record leaves the queue for failed/ and the run ends 1"
+
+# The refused group comes first, so a run that stops at the first refusal never files the second.
+cat >"$ST_WORK/llama_two.json" <<'JSON'
+[{"model_filename": "meta-llama/Llama-3.2-3B-Instruct", "test_time": "2026-10-01T00:00:00Z",
+  "type_k": "f16", "type_v": "f16", "n_prompt": 0, "n_gen": 64, "avg_ts": 20.0},
+ {"model_filename": "/models/hf__Qwen3-8B-Q8_0.gguf", "test_time": "2026-10-01T00:00:00Z",
+  "type_k": "q8_0", "type_v": "q4_0", "n_prompt": 0, "n_gen": 128, "avg_ts": 50.0}]
+JSON
+cat >"$ST_WORK/llama_unbuildable.json" <<'JSON'
+[{"model_filename": "meta-llama/Llama-3.2-3B-Instruct", "test_time": "2026-10-01T00:00:00Z",
+  "type_k": "f16", "type_v": "f16", "n_prompt": 0, "n_gen": 64, "avg_ts": 0},
+ {"model_filename": "/models/hf__Qwen3-8B-Q8_0.gguf", "test_time": "2026-10-01T00:00:00Z",
+  "type_k": "q8_0", "type_v": "q4_0", "n_prompt": 0, "n_gen": 128, "avg_ts": 50.0}]
+JSON
+write_stub "$ST_WORK/rmlx_llama_half" "if grep -q Llama-3.2 \"\$4\"; then echo 'stub: rejected' >&2; exit 3; fi; cp \"\$4\" \"$FILED/\$(basename \"\$4\")\" && rm -f \"\$4\""
+
+home="$(fresh_home llama_one_refused)"
+st_run ingest_in "$home" llama-bench --record --rmlx-bin "$ST_WORK/rmlx_llama_half" "$ST_WORK/llama_two.json"
+why="$(st_check 1 --has 'WARN: recorder rejected record' --has 'metrics/buffer/failed/' --has 'recorded OK')"
+[ "$(count "$FILED")" = 1 ] || why="${why:+$why
+}the group after the refused one was not filed"
+grep -q 'Qwen3-8B-Q8_0' "$FILED"/*.json || why="${why:+$why
+}the record filed is not the good group"
+[ "$(count "$home/metrics/buffer/failed")" = 1 ] || why="${why:+$why
+}the refused record is not under failed"
+grep -q 'Llama-3.2' "$home"/metrics/buffer/failed/*.json || why="${why:+$why
+}the record under failed is not the refused group"
+[ "$(count "$home/metrics/buffer/pending")" = 0 ] || why="${why:+$why
+}a record is still in pending"
+st_verdict llama_bench_one_refused_group_does_not_stop_the_rest "$why" "a refused group is kept and named, the next group is filed, the run ends 1"
+
+home="$(fresh_home llama_unbuildable)"
+st_run ingest_in "$home" llama-bench --record --rmlx-bin "$OK" "$ST_WORK/llama_unbuildable.json"
+why="$(st_check 1 --has 'WARN: skipping group' --has 'Llama-3.2-3B-Instruct' --has 'no usable metrics' --has 'recorded OK')"
+[ "$(count "$FILED")" = 1 ] || why="${why:+$why
+}the group that can be built was not filed"
+grep -q 'Qwen3-8B-Q8_0' "$FILED"/*.json || why="${why:+$why
+}the record filed is not the good group"
+st_verdict llama_bench_unbuildable_group_ends_non_zero "$why" "a group that cannot be built is named with its reason, the rest is filed, the run ends 1"
 
 # ── ab: a bench/ab.sh result (--harness rmlx, the default) ─────────────────────
 

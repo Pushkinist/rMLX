@@ -1,7 +1,8 @@
 """Ingest llama-bench JSON output into the rMLX metrics DB.
 
 Module of: ingest/ingest.py
-Exit:   0 done; 1 the input cannot be read or is not JSON
+Exit:   0 done; 1 the input cannot be read or is not JSON, a group cannot be built, or the recorder
+        refused a record (the other groups are still filed)
 
 Converts `llama-bench -o json` result rows into the §8.5 universal ingest
 record shape and writes each one to `<RMLX_HOME>/metrics/buffer/pending/` for
@@ -417,10 +418,11 @@ def ingest(
     hardware_tag: str,
     rmlx_bin: str | None,
     dry_run: bool,
-) -> int:
+) -> tuple[int, int]:
     """Parse llama-bench JSON, build §8.5 records, write to buffer.
 
-    Returns the number of records successfully written (or printed for dry-run).
+    Returns (records processed, groups not filed): a group that cannot be built or whose record
+    the recorder refused is not filed, and a dry run files nothing, so it counts none.
     Raises SystemExit with code 1 on fatal input errors.
     """
     if source_path == "-":
@@ -450,7 +452,7 @@ def ingest(
 
     if not data:
         print("[llama_bench] WARN: empty input — no rows to ingest", file=sys.stderr)
-        return 0
+        return 0, 0
 
     # Group rows by (model, quant, config) to merge prefill + decode pairs.
     groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
@@ -465,6 +467,7 @@ def ingest(
         groups.setdefault(key, []).append(row)
 
     n_written = 0
+    n_not_filed = 0
     for key, rows in groups.items():
         try:
             payload = _build_record(rows, hardware_tag)
@@ -473,6 +476,8 @@ def ingest(
                 f"[llama_bench] WARN: skipping group {key}: {exc}",
                 file=sys.stderr,
             )
+            if not dry_run:
+                n_not_filed += 1
             continue
 
         if dry_run:
@@ -484,12 +489,13 @@ def ingest(
         print(f"[llama_bench] wrote {record_path}", flush=True)
 
         if rmlx_bin is not None:
-            ok = _invoke_recorder(record_path, rmlx_bin)
-            if ok:
+            if _invoke_recorder(record_path, rmlx_bin):
                 print("[llama_bench] recorded OK", flush=True)
+            else:
+                n_not_filed += 1
         n_written += 1
 
-    return n_written
+    return n_written, n_not_filed
 
 
 def main(argv: list[str]) -> int:
@@ -536,11 +542,14 @@ def main(argv: list[str]) -> int:
     if args.record:
         require_run_class_recorder(args.rmlx_bin)
 
-    n = ingest(
+    n, n_not_filed = ingest(
         source_path=args.input,
         hardware_tag=args.hardware_tag,
         rmlx_bin=args.rmlx_bin if args.record else None,
         dry_run=args.dry_run,
     )
     print(f"[llama_bench] done: {n} record(s) processed", flush=True)
+    if n_not_filed:
+        print(f"[llama_bench] ERROR: {n_not_filed} group(s) not filed", file=sys.stderr)
+        return 1
     return 0
