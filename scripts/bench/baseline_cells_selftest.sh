@@ -322,8 +322,9 @@ st_verdict cell_run_fails "$why" "a run that fails without measuring ends the ce
 home="$(new_home cell_zero_reading_fails)"
 control "$home" readings "3 0.0 1.0"
 run_tool "$home" "$FAKE" --model "$CELL_MODEL" --kv-quant k8v8 --record diagnostic
-why="$(st_check 1 --has "decode_tps")"
-st_verdict cell_zero_reading_fails "$why" "a measured run that reads 0 tok/s ends the cell with exit 1"
+why="$(st_check 1 --has "host__m [k8v8] run 2 read 0.0 tok/s")"
+want "runs" "$(wc -l <"$home/baseline_argv" | tr -d ' ')" 3
+st_verdict cell_zero_reading_fails "$why" "a measured run that reads 0 tok/s ends the cell with exit 1 and no later run"
 
 home="$(new_home cell_claim_held)"
 control "$home" claim_held 1
@@ -359,9 +360,12 @@ st_verdict cell_binary_missing "$why" "a --binary that is not there ends 125"
 
 home="$(new_home canary_zero_reading_stops)"
 control "$home" readings "3 0.0 1.0"
-run_tool "$home" "$FAKE" --preset canary --models-root "$MODELS"
-why="$(st_check 1 --has "failed to parse decode_tps for $BONSAI run 2")"
-st_verdict canary_zero_reading_stops "$why" "a measured run that reads 0 tok/s is a failure, not a row"
+run_tool "$home" "$FAKE" --preset canary --models-root "$MODELS_TWO" --include-26b
+why="$(st_check 1 --has "$BONSAI [default codec] run 2 read 0.0 tok/s")"
+want "csv rows" "$(csv_rows "$home" 2>/dev/null || true)" ""
+want "gate records" "$(argv_lines_with "$home/baseline_argv" "--run-class gate")" 0
+want "runs of the later model" "$(argv_lines_with "$home/baseline_argv" "$GEMMA26")" 0
+st_verdict canary_zero_reading_stops "$why" "a measured run that reads 0 tok/s stops the canary before a row, a gate record or the next model"
 
 home="$(new_home cell_warmup_and_runs)"
 control "$home" readings "$(printf '%s\n' '1 10.0 1.0' '2 20.0 3.0')"

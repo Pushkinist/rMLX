@@ -91,7 +91,8 @@ done
 case "${PRESET}" in
     canary)
         [[ -z "${CELL_OPTIONS}" ]] || usage_error "--preset canary takes none of:${CELL_OPTIONS}"
-        [[ -n "${MODELS_ROOT}" ]] || usage_error "--preset canary needs --models-root"
+        [[ -n "${MODELS_ROOT}" ]] || usage_error "--preset canary needs --models-root
+set RMLX_O_MODELS_ROOT (see .env.example) or pass --models-root"
         MAX_CTX=8192
         RECORD_CLASS=diagnostic
         ;;
@@ -209,7 +210,7 @@ run_once() {
     rm -f "${err}"
     dtps="$(printf '%s\n' "${out}" | grep -o 'decode_tps=[0-9.]*' | cut -d= -f2 || true)"
     ptps="$(printf '%s\n' "${out}" | grep -o 'prefill_tps=[0-9.]*' | cut -d= -f2 || true)"
-    echo "${dtps:-0}:${ptps:-0}"
+    echo "${dtps}:${ptps:-0}"
 }
 
 # Warmup runs, then measured runs, filling DECODE and PREFILL with the readings.
@@ -236,7 +237,11 @@ measure_arm() {
         ok="$(awk -v v="${dtps}" 'BEGIN { print (v+0 > 0.001) ? "yes" : "no" }')"
         if [[ "${ok}" != yes ]]; then
             if [[ "${strict}" -eq 1 ]]; then
-                echo "ERROR: failed to parse decode_tps for ${model_path##*/} run ${i}" >&2
+                if [[ -z "${dtps}" ]]; then
+                    echo "ERROR: failed to parse decode_tps for ${model_path##*/} run ${i}" >&2
+                else
+                    echo "ERROR: ${model_path##*/} [${KV_QUANT:-default codec}] run ${i} read ${dtps} tok/s decode_tps; a zero is not a measurement" >&2
+                fi
                 exit 1
             fi
             echo "  WARN: ${arm} run ${i} failed to parse decode_tps — skipping" >&2
