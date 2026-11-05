@@ -8,7 +8,7 @@
 >
 > - `plain`, `mtp_sidecar/block=7`, `dflash/block=16,dflash/depth=accept_rate`: the arms were **synthetic**. A stub answered every request and no model was ever served, so every rate under those modes is a fixture value and bounds nothing.
 
-Measured by `scripts/spec_bench_published.sh` under the protocol
+Measured by `scripts/published/bench.sh` under the protocol
 third-party on-device speculative-decoding posts report, so these numbers
 can sit beside theirs. Bounds by `scripts/perf_ceiling.py`.
 

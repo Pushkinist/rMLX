@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Mutation check for lib/published_table.py: a fixture snapshot, asserting exit code and reason.
+# Mutation check for published/table.py: a fixture snapshot, asserting exit code and reason.
 #
+# Usage:  bash scripts/published/table_selftest.sh
+# Exit:   0 every case behaved; 1 at least one did not; 2 the fixtures themselves could not be built
 # Set:    -uo — a non-zero status inside a case ends the run under -e, before the cases after it
 #
-# Recall test for: lib/published_table.py
+# Recall test for: published/table.py
 #
 # WHY THIS EXISTS
 #
@@ -32,21 +34,18 @@
 #
 # No GPU, no model, no server, no DB. The "snapshot" is a safetensors header
 # with no tensor data behind it.
-#
-# Exit codes: 0 — every case behaved; 1 — at least one did not; 2 — the fixtures
-# themselves could not be built.
 
 set -uo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-EMITTER="${REPO_ROOT}/scripts/lib/published_table.py"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+EMITTER="${REPO_ROOT}/scripts/published/table.py"
 FIXTURES="${REPO_ROOT}/scripts/fixtures/published_table"
 SNAPSHOT="${FIXTURES}/fixture__published-table-16L"
 
 [ -r "${EMITTER}" ] || { echo "ERROR: missing ${EMITTER}" >&2; exit 2; }
 [ -d "${SNAPSHOT}" ] || { echo "ERROR: missing ${SNAPSHOT}" >&2; exit 2; }
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/rmlx_published_table_selftest.XXXXXX")" || exit 2
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/rmlx_table_selftest.XXXXXX")" || exit 2
 trap 'rm -rf "${WORK}"' EXIT
 
 PASSED=0
@@ -233,7 +232,7 @@ else:
 PY
 }
 
-echo "published_table_selftest: the emitter, against a header-only fixture snapshot"
+echo "table_selftest: the emitter, against a header-only fixture snapshot"
 echo
 
 # ── The bound is the right number, not merely a number ───────────────────────
@@ -783,6 +782,6 @@ MAKE_ENV="PUBLISHED_TABLE_PPL=/env/ppl.json" make_case make_does_not_read_the_re
 verdict
 
 echo
-echo "published_table_selftest: ${PASSED} passed, ${FAILED} failed"
+echo "table_selftest: ${PASSED} passed, ${FAILED} failed"
 [ "${FAILED}" -eq 0 ] || exit 1
 exit 0

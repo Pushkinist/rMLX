@@ -1,5 +1,7 @@
 """Fit the published protocol's fixed-length prompt against a live server.
 
+Module of: published/bench.sh
+
 The protocol reports autoregressive output speed, input speed and resident
 memory on ONE prompt of a stated token length. That length is a property of the
 prompt AND of the tokenizer that reads it: a body of bytes is 1355 tokens to one
@@ -47,9 +49,8 @@ import urllib.error
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from published_samples import body_sha256  # noqa: E402
+from samples import body_sha256  # noqa: E402
 
 # Pinned so the fit is a function of the corpus, the target and the tokenizer,
 # and of nothing an operator typed.
@@ -213,7 +214,7 @@ def main():
     try:
         text = corpus_text(args.corpus)
     except Unreadable as exc:
-        print(f"published_fixed_prompt: {exc}", file=sys.stderr)
+        print(f"fixed_prompt: {exc}", file=sys.stderr)
         return 2
 
     counter = Counter(
@@ -222,10 +223,10 @@ def main():
     try:
         words, reps, prompt_tokens = fit(text, args.target, counter)
     except FitError as exc:
-        print(f"published_fixed_prompt: {exc}", file=sys.stderr)
+        print(f"fixed_prompt: {exc}", file=sys.stderr)
         return 1
     except Unreadable as exc:
-        print(f"published_fixed_prompt: {exc}", file=sys.stderr)
+        print(f"fixed_prompt: {exc}", file=sys.stderr)
         return 2
 
     ends = [m.end() for m in WORD.finditer(text)]

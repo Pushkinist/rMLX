@@ -1,5 +1,7 @@
 """Assemble one pass's fixed-length-prompt run.
 
+Module of: published/bench.sh
+
 The published protocol's second figure is autoregressive output speed, input
 speed and resident memory on one prompt of a stated token length. This is one
 run of it: the engine's own reading of the decode window, the client's reading
@@ -61,7 +63,7 @@ def number(values, key, cast=float):
         raise RunError(f"the client read {key}={values[key]!r}, not a number") from exc
 
 
-def peak_memory(path, what="the fixed-prompt request"):
+def peak_memory(path, what):
     """`(phys_bytes, rss_bytes, samples)` over the poll file."""
     peaks = {"phys": 0, "rss": 0}
     samples = 0
@@ -88,6 +90,28 @@ def peak_memory(path, what="the fixed-prompt request"):
                 "figure; the gauge was published but carries nothing"
             )
     return peaks["phys"], peaks["rss"], samples
+
+
+def memory_fields(args, what):
+    """The resident-memory fields of a pass record, off the memory poll file."""
+    phys, rss, samples = peak_memory(args.memory, what)
+    return {
+        "phys_footprint_bytes": phys,
+        "rss_bytes": rss,
+        "memory_samples": samples,
+        "memory_poll_ms": args.memory_poll_ms,
+    }
+
+
+def add_run_arguments(ap, record_flag, record_help):
+    """The arguments of a step that assembles one run: its three readings and the record."""
+    ap.add_argument("--engine", required=True, help="published_run_log.py output")
+    ap.add_argument("--client", required=True, help="the client-side key=value block")
+    ap.add_argument("--memory", required=True, help="the memory poll file")
+    ap.add_argument(record_flag, required=True, help=record_help)
+    ap.add_argument("--pass-number", type=int, required=True, dest="pass_number")
+    ap.add_argument("--memory-poll-ms", type=int, required=True)
+    ap.add_argument("--cross-check-pct", type=float, default=10.0)
 
 
 def cold_request(row, client, what, cross_check_pct):
@@ -181,7 +205,6 @@ def assemble(args):
         )
     figures = cold_request(row, client, "the fixed prompt", args.cross_check_pct)
 
-    phys, rss, samples = peak_memory(args.memory)
     return {
         "pass": args.pass_number,
         "target_tokens": fit["target_tokens"],
@@ -197,31 +220,22 @@ def assemble(args):
         "filler_word": fit["filler_word"],
         "filler_reps": fit["filler_reps"],
         **figures,
-        "phys_footprint_bytes": phys,
-        "rss_bytes": rss,
-        "memory_samples": samples,
-        "memory_poll_ms": args.memory_poll_ms,
+        **memory_fields(args, "the fixed-prompt request"),
     }
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--engine", required=True, help="published_run_log.py output")
-    ap.add_argument("--client", required=True, help="the client-side key=value block")
-    ap.add_argument("--memory", required=True, help="the memory poll file")
-    ap.add_argument("--fit", required=True, help="published_fixed_prompt.py record")
-    ap.add_argument("--pass-number", type=int, required=True, dest="pass_number")
-    ap.add_argument("--memory-poll-ms", type=int, required=True)
-    ap.add_argument("--cross-check-pct", type=float, default=10.0)
+    add_run_arguments(ap, "--fit", "fixed_prompt.py record")
     args = ap.parse_args()
 
     try:
         block = assemble(args)
     except RunError as exc:
-        print(f"published_fixed_run: pass {args.pass_number}: {exc}", file=sys.stderr)
+        print(f"fixed_run: pass {args.pass_number}: {exc}", file=sys.stderr)
         return 1
     except (OSError, KeyError, ValueError) as exc:
-        print(f"published_fixed_run: cannot read an input: {exc}", file=sys.stderr)
+        print(f"fixed_run: cannot read an input: {exc}", file=sys.stderr)
         return 2
 
     json.dump(block, sys.stdout)

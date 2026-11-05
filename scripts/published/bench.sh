@@ -2,7 +2,7 @@
 # Bench one verifier under the published on-device speculative-decoding protocol, three passes.
 #
 # Usage:
-#   bash scripts/spec_bench_published.sh <verifier-snapshot-dir> --label NAME [options]
+#   bash scripts/published/bench.sh <verifier-snapshot-dir> --label NAME [options]
 #
 #     --label NAME             the campaign this run belongs to (required); see below
 #     --draft-model DIR        serve with this drafter (absent = plain decode)
@@ -20,6 +20,11 @@
 #     --allow-busy-host        measure anyway, and taint the result
 #     --synthetic-arms         the server is a stub, so this run measures nothing
 #     --server-stamps          time the stream by the stub's own stamps; self-tests only
+# Exit:   0 three passes ran and every mean is within the range band; 1 a precondition failed,
+#         or a reading could not be attributed; 3 the run is readable and at least one mean is
+#         refused for its range (more than 5% of the mean; the mean is withheld and named, and
+#         the macro with it); 125 the host is not quiescent (pass --allow-busy-host to measure
+#         anyway)
 #
 # WHAT IT MEASURES
 #
@@ -87,14 +92,14 @@
 #                            log (`serve.jsonl`) and its stdout
 #       records/             what `ingest/ingest.py published` staged for runs.db
 #       db_summary.json      the figures re-queried from runs.db after recording
-#     summary.md             the table, from `lib/published_table.py --out`
+#     summary.md             the table, from `published/table.py --out`
 #
 # The label reaches runs.db as `label=<label>;` at the start of `notes` on every
 # row, so `rmlx metrics query` finds a campaign's rows and
-# `lib/published_requery.py` checks they reproduce the result. The label names a
+# `published/requery.py` checks they reproduce the result. The label names a
 # directory and enters a LIKE pattern, so it is lower-case letters, digits, `.`
 # and `-` only. A run never overwrites another: a directory that exists is an error.
-# `lib/published_table.py` takes one result per engine mode, so a label that holds
+# `published/table.py` takes one result per engine mode, so a label that holds
 # two runs of the same mode (a repeat, or a failed run's leftovers) cannot be
 # rendered with `*/result.json`: name the results to render, or use a new label.
 #
@@ -179,7 +184,7 @@
 # THE SAMPLE SETS
 #
 # The published number comes from `prompts/published/`, and that root is held to
-# `published_samples.py verify` before anything is served — no flag turns that
+# `published/samples.py verify` before anything is served — no flag turns that
 # off. `--samples-root` measures some other copy: it is an operator override for
 # working on the harness, it is NOT verified, and the result it writes carries
 # `unverified_samples: true` so nothing downstream can promote it as a published
@@ -199,17 +204,9 @@
 # the stub with itself. The result says so in `protocol.client_clock`, and
 # `ingest/ingest.py published` refuses any result whose clock is not `client`.
 #
-# Exit codes:
-#   0   — three passes ran and every mean is within the range band
-#   1   — a precondition failed, or a reading could not be attributed
-#   3   — the run is readable and at least one mean is refused for its range
-#         (more than 5% of the mean; the mean is withheld and named, and the
-#         macro with it)
-#   125 — the host is not quiescent (pass --allow-busy-host to measure anyway)
-
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BINARY="${REPO_ROOT}/target/release-perf/rmlx"
 RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
 LOG_DIR="${RMLX_HOME}/logs"
@@ -234,7 +231,7 @@ MACRO_MAX_TOKENS=1024
 # The fixed-length prompt the protocol reports autoregressive output speed,
 # input speed and resident memory on. The count is a property of the tokenizer
 # as well as the bytes, so the body is fitted against the server rather than
-# checked in — see lib/published_fixed_prompt.py.
+# checked in — see published/fixed_prompt.py.
 FIXED_PROMPT_TOKENS=1355
 FIXED_PROMPT_CORPUS="${REPO_ROOT}/prompts/longctx_4k.json"
 # Resident memory is a gauge, so a peak can only be sampled. This interval is
@@ -297,7 +294,7 @@ done
 if [[ -z "${VERIFIER_MODEL}" ]]; then
     echo "ERROR: a verifier snapshot directory is required." >&2
     echo "  Resolve a concrete path from LOCAL.md (gitignored):" >&2
-    echo "  bash scripts/spec_bench_published.sh \$O_MODELS/<snapshot>" >&2
+    echo "  bash scripts/published/bench.sh \$O_MODELS/<snapshot>" >&2
     exit 1
 fi
 
@@ -377,7 +374,7 @@ fi
 # off. A digest alone would not have caught the stash-build-unstash cycle that
 # once had an A/B compare a build against itself: both files hashed the same
 # because both were the same file.
-BINARY_IDENTITY="$(python3 "${REPO_ROOT}/scripts/lib/binary_identity.py" \
+BINARY_IDENTITY="$(python3 "${REPO_ROOT}/scripts/published/binary_identity.py" \
     "${BINARY}" --arm "${ARM}")" || exit 1
 BINARY_SHA256="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1])["sha256"])' \
     "${BINARY_IDENTITY}")"
@@ -404,17 +401,17 @@ if [[ -z "${SAMPLES_ROOT}" ]]; then
     # and verifying one root while measuring another proves nothing about the
     # number. The anchor it checks against lives in the gate's source either
     # way, so naming the root weakens nothing.
-    if ! python3 "${REPO_ROOT}/scripts/published_samples.py" verify \
+    if ! python3 "${REPO_ROOT}/scripts/published/samples.py" verify \
             --root "${PUBLISHED_ROOT}"; then
         echo "ERROR: the published sample sets do not re-derive from what" \
-             "published_samples.py pins; refusing to measure against them" >&2
+             "published/samples.py pins; refusing to measure against them" >&2
         exit 1
     fi
 else
     UNVERIFIED_SAMPLES=true
     cat >&2 <<'OVERRIDE'
 UNVERIFIED SAMPLES: --samples-root names a copy that is not the published one,
-  so it is not held to published_samples.py and this run is not a published
+  so it is not held to published/samples.py and this run is not a published
   measurement. The result carries `unverified_samples: true`.
 OVERRIDE
 fi
@@ -446,7 +443,7 @@ MODEL_ID="$(basename "${VERIFIER_MODEL%/}")"
 # A pre-flight refusal, not the published figure: the checkpoint has to state
 # the sampling this run will be measured under, or the engine substitutes a
 # fallback nobody chose. What it actually resolved to is read back later.
-SNAPSHOT_SAMPLING="$(python3 "${REPO_ROOT}/scripts/lib/snapshot_sampling.py" \
+SNAPSHOT_SAMPLING="$(python3 "${REPO_ROOT}/scripts/published/snapshot_sampling.py" \
     "${VERIFIER_MODEL}")" || exit 1
 SAMPLED="$(field_of "${SNAPSHOT_SAMPLING}" sampled)"
 
@@ -481,7 +478,7 @@ trap cleanup EXIT INT TERM
 CELL_INDEX="${WORK}/cells.tsv"
 CELL_ARGS=()
 for spec in "${CELLS[@]}"; do CELL_ARGS+=(--cell "${spec}"); done
-python3 "${REPO_ROOT}/scripts/lib/published_payloads.py" \
+python3 "${REPO_ROOT}/scripts/published/payloads.py" \
     --samples-root "${SAMPLES_ROOT}" \
     --out "${WORK}/payloads" \
     --model-id "${MODEL_ID}" \
@@ -590,7 +587,7 @@ if $UNVERIFIED_SAMPLES; then
     SAMPLES_LABEL="${SAMPLES_LABEL} (UNVERIFIED, not recordable)"
 fi
 
-echo "==> spec_bench_published.sh"
+echo "==> published/bench.sh"
 echo "    verifier   : ${MODEL_NAMESPACE}/${MODEL_NAME} (${WEIGHT_QUANT})"
 echo "    arm        : ${ARM}${DRAFTER_MODEL:+ (${DRAFT_KIND:-engine default} block ${DRAFT_BLOCK_SIZE:-engine default})}"
 echo "    samples    : ${SAMPLES_LABEL} — ${REQUESTS_PER_PASS} requests per pass"
@@ -719,7 +716,7 @@ if [[ "${ARM}" == "plain" ]]; then
     if ! start_server fit; then exit 1; fi
     FIXED_RECORD="${WORK}/fixed_fit.json"
     FIXED_PAYLOAD="${WORK}/fixed_payload.json"
-    if ! python3 "${REPO_ROOT}/scripts/lib/published_fixed_prompt.py" \
+    if ! python3 "${REPO_ROOT}/scripts/published/fixed_prompt.py" \
             --corpus "${FIXED_PROMPT_CORPUS}" \
             --target "${FIXED_PROMPT_TOKENS}" \
             --port "${PORT}" \
@@ -871,7 +868,7 @@ for (( pass = 1; pass <= PASSES; pass++ )); do
                  "${PASS_LOG}" >&2
             exit 1
         fi
-        if ! python3 "${REPO_ROOT}/scripts/lib/published_fixed_run.py" \
+        if ! python3 "${REPO_ROOT}/scripts/published/fixed_run.py" \
                 --engine "${PASS_DIR}/engine_with_fixed.json" \
                 --client "${PASS_DIR}/fixed.kv" \
                 --memory "${PASS_DIR}/memory.txt" \
@@ -885,7 +882,7 @@ for (( pass = 1; pass <= PASSES; pass++ )); do
         FIXED_FILES+=("${RUN_DIR}/passes/${pass}/fixed.json")
     fi
 
-    if ! python3 "${REPO_ROOT}/scripts/lib/published_aggregate.py" pass \
+    if ! python3 "${REPO_ROOT}/scripts/published/aggregate.py" pass \
             --index "${PASS_INDEX}" \
             --engine "${PASS_DIR}/engine.json" \
             --pass-number "${pass}" \
@@ -930,7 +927,7 @@ for size in ${LONGCTX_SIZES[@]+"${LONGCTX_SIZES[@]}"}; do
     mkdir -p "${LC_DIR}"
     LC_PAYLOAD="${WORK}/${label}.json"
     LC_META="${WORK}/${label}.meta.json"
-    python3 "${REPO_ROOT}/scripts/lib/published_longctx.py" payload \
+    python3 "${REPO_ROOT}/scripts/published/longctx.py" payload \
         --file "${REPO_ROOT}/prompts/${label}.json" --model-id "${MODEL_ID}" \
         --max-tokens "${LONGCTX_MAX_TOKENS}" --out "${LC_PAYLOAD}" --meta "${LC_META}" || exit 1
     LC_CTX="$(python3 -c 'import json, sys
@@ -979,7 +976,7 @@ print(json.load(open(sys.argv[1]))["ctx_max"])' "${LC_META}")"
             echo "ERROR: ${label} run ${run}: no usable per-request record in ${LC_LOG}" >&2
             exit 1
         fi
-        if ! python3 "${REPO_ROOT}/scripts/lib/published_longctx.py" run \
+        if ! python3 "${REPO_ROOT}/scripts/published/longctx.py" run \
                 --engine "${LC_RUN_DIR}/engine.json" --client "${LC_RUN_DIR}/client.kv" \
                 --memory "${LC_RUN_DIR}/memory.txt" --meta "${LC_META}" \
                 --pass-number "${run}" --memory-poll-ms "${MEMORY_POLL_MS}" \
@@ -1008,7 +1005,7 @@ if $GREEDY_PASS; then
         [[ "${spec#*:}" == "${MACRO_MAX_TOKENS}" ]] && GREEDY_CELL_ARGS+=(--cell "${spec}")
     done
     GREEDY_INDEX="${WORK}/greedy_cells.tsv"
-    python3 "${REPO_ROOT}/scripts/lib/published_payloads.py" --greedy \
+    python3 "${REPO_ROOT}/scripts/published/payloads.py" --greedy \
         --samples-root "${SAMPLES_ROOT}" \
         --out "${WORK}/greedy_payloads" \
         --model-id "${MODEL_ID}" \
@@ -1057,7 +1054,7 @@ if $GREEDY_PASS; then
         exit 1
     fi
     /bin/cp "${GREEDY_LOG}" "${GREEDY_DIR}/serve.jsonl"
-    python3 "${REPO_ROOT}/scripts/lib/published_greedy.py" cold \
+    python3 "${REPO_ROOT}/scripts/published/greedy.py" cold \
         --log "${GREEDY_LOG}" --expect "${g}" || exit 1
 
     GREEDY_DECODE_CONFIG=""
@@ -1065,7 +1062,7 @@ if $GREEDY_PASS; then
         GREEDY_DECODE_CONFIG="$(python3 -c 'import json, sys
 print(json.load(open(sys.argv[1]))["decode_config"])' "${RUN_DIR}/passes/1/engine.json")"
     fi
-    python3 "${REPO_ROOT}/scripts/lib/published_greedy.py" seal \
+    python3 "${REPO_ROOT}/scripts/published/greedy.py" seal \
         --dir "${GREEDY_DIR}" --arm "${ARM}" \
         --model-namespace "${MODEL_NAMESPACE}" --model "${MODEL_NAME}" \
         --weight-quant "${WEIGHT_QUANT}" --kv-quant "${KV_QUANT_SEEN}" \
@@ -1074,7 +1071,7 @@ print(json.load(open(sys.argv[1]))["decode_config"])' "${RUN_DIR}/passes/1/engin
     GREEDY_REPORT_ARGS+=(--greedy-pass "${GREEDY_DIR}/meta.json")
 
     if [[ -n "${GREEDY_AGAINST}" ]]; then
-        RMLX_HOME="${RMLX_HOME}" python3 "${REPO_ROOT}/scripts/lib/published_greedy.py" compare \
+        RMLX_HOME="${RMLX_HOME}" python3 "${REPO_ROOT}/scripts/published/greedy.py" compare \
             --plain "${GREEDY_AGAINST}/greedy" --spec "${GREEDY_DIR}" \
             --rmlx-bin "${BINARY}" --out "${WORK}/greedy_match.json" || exit 1
         /bin/cp "${WORK}/greedy_match.json" "${GREEDY_DIR}/match.json"
@@ -1159,7 +1156,7 @@ PY
 
 RESULT="${RUN_DIR}/result.json"
 set +e
-python3 "${REPO_ROOT}/scripts/lib/published_aggregate.py" report \
+python3 "${REPO_ROOT}/scripts/published/aggregate.py" report \
     "${PASS_FILES[@]}" \
     --range-pct "${RANGE_REFUSAL_PCT}" \
     --macro-max-tokens "${MACRO_MAX_TOKENS}" \
@@ -1175,7 +1172,7 @@ echo ""
 echo "sampling: ${SAMPLING_SEEN}  (read back from the engine)"
 echo "result: ${RESULT}"
 echo "  record it:  python3 scripts/ingest/ingest.py published --record ${RESULT} --git-sha <sha>"
-echo "  render it:  python3 scripts/lib/published_table.py ${CAMPAIGN_ROOT}/${LABEL}/*/result.json --model ${VERIFIER_MODEL} [--ppl <rmlx eval ppl line>] --out ${CAMPAIGN_ROOT}/${LABEL}/summary.md"
+echo "  render it:  python3 scripts/published/table.py ${CAMPAIGN_ROOT}/${LABEL}/*/result.json --model ${VERIFIER_MODEL} [--ppl <rmlx eval ppl line>] --out ${CAMPAIGN_ROOT}/${LABEL}/summary.md"
 if $UNVERIFIED_SAMPLES; then
     echo "UNVERIFIED SAMPLES: not a published measurement, not recordable."
 fi

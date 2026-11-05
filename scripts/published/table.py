@@ -1,6 +1,12 @@
+#!/usr/bin/env python3
 """Render published-protocol runs as the Markdown table a post needs.
 
-Reads one `spec_bench_published.sh` result file per engine mode — plain, and
+Usage:  table.py RESULT.json... --model SNAPSHOT_DIR [--ppl JSON] [--out FILE]
+        [--bandwidth-gbs N] [--ceiling-spread-pct N] [--runs-db DB] [--command TEXT]
+Exit:   0 rendered; 1 an input could not be read, or the inputs do not describe one
+        comparison; 3 a ceiling that cannot describe a cell it is asked to bound
+
+Reads one `published/bench.sh` result file per engine mode — plain, and
 each speculative arm — and prints Markdown. Writes no DB row, serves nothing,
 never launches a model. The only thing it runs is `scripts/perf_ceiling.py`,
 itself a static census over the snapshot's `config.json` and safetensors
@@ -73,10 +79,6 @@ PERPLEXITY IS NOT MEASURED HERE.
 snapshot being rendered and adds a section for it. The record must name that
 snapshot and that corpus, or it is refused: a perplexity of another checkpoint
 renders as plausibly as the right one.
-
-Exit codes: 0 — rendered; 1 — an input could not be read, or the inputs do not
-describe one comparison; 3 — a ceiling that cannot describe a cell it is asked
-to bound.
 """
 
 from __future__ import annotations
@@ -88,14 +90,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-_LIB = Path(__file__).resolve().parent
-sys.path.insert(0, str(_LIB))
-sys.path.insert(0, str(_LIB.parent))
+_SCRIPTS = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_SCRIPTS / "lib"))
+sys.path.insert(0, str(_SCRIPTS))
 
 from perf_ceiling import HOST_BW_BYTES_PER_S, HOST_BW_HARDWARE_TAG  # noqa: E402
 from snapshot_identity import split_model_dir  # noqa: E402
 
-PERF_CEILING = _LIB.parent / "perf_ceiling.py"
+PERF_CEILING = _SCRIPTS / "perf_ceiling.py"
 
 # Datasets in the order a reader expects, ahead of any cell a run adds.
 DATASET_ORDER = ("mt_bench", "math_500", "humaneval")
@@ -811,7 +813,7 @@ def render(results: list[dict], snapshot: Path, bounds: dict, meta: dict,
     ]
     lines += banner(results)
     lines += [
-        "Measured by `scripts/spec_bench_published.sh` under the protocol",
+        "Measured by `scripts/published/bench.sh` under the protocol",
         "third-party on-device speculative-decoding posts report, so these numbers",
         "can sit beside theirs. Bounds by `scripts/perf_ceiling.py`.",
         "",
@@ -947,7 +949,7 @@ def run(args) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("result", nargs="+",
-                    help="one spec_bench_published.sh result per engine mode")
+                    help="one published/bench.sh result per engine mode")
     ap.add_argument("--model", required=True,
                     help="the verifier snapshot the runs measured")
     ap.add_argument("--ppl", default=None,
@@ -969,13 +971,13 @@ def main() -> int:
     try:
         text = run(args)
     except InputError as exc:
-        print(f"published_table: {exc}", file=sys.stderr)
+        print(f"table: {exc}", file=sys.stderr)
         return 1
     except CeilingError as exc:
-        print(f"published_table: {exc}", file=sys.stderr)
+        print(f"table: {exc}", file=sys.stderr)
         return 3
     except (OSError, KeyError, ValueError) as exc:
-        print(f"published_table: {exc}", file=sys.stderr)
+        print(f"table: {exc}", file=sys.stderr)
         return 1
     if args.out:
         Path(args.out).write_text(text, encoding="utf-8")

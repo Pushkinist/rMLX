@@ -48,7 +48,7 @@ fails: make the heading unique.
 Readers it does parse, and so holds a cut to: every citation above in code,
 scripts, docs, `README.md` and `CLAUDE.md`; the section names in CLI help
 text (`crates/rmlx-cli/src/main.rs`, `serve.rs`, `preset_table.rs`); the
-emitter `scripts/lib/published_table.py`, which writes `PROFILING.md` §9 into
+emitter `scripts/published/table.py`, which writes `PROFILING.md` §9 into
 a generated doc; and the tests that pin a figure the docs record, whose
 failure messages cite the doc and the phrase that states the figure
 (`isoquant_msl_tests.rs`, `isoquant_msl_v4_tests.rs`, `rate_distortion_tests.rs`,

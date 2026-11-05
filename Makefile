@@ -569,11 +569,11 @@ spec-round-stream-selftest: ## CI gate: recall test for the round-stream manifes
 
 .PHONY: check-published-samples
 check-published-samples: ## CI gate: fail if the checked-in published sample sets do not re-derive from their recorded seeds, digests and templates
-	@python3 scripts/published_samples.py verify
+	@python3 scripts/published/samples.py verify
 
 .PHONY: check-published-samples-fixtures
 check-published-samples-fixtures: ## CI gate: recall test for the above — one synthetic sample-set root per case, asserting the reason as well as the exit code
-	@bash scripts/check_published_samples_fixtures.sh
+	@bash scripts/published/samples_selftest.sh
 
 # The committed published-protocol table is generated, never hand-written. It
 # is rendered from the checked-in fixture until a real three-pass run's result
@@ -593,7 +593,7 @@ PUBLISHED_TABLE_MODEL ?= $(PUBLISHED_TABLE_FIXTURES)/fixture__published-table-16
 
 .PHONY: published-table
 published-table: ## regenerate docs/PUBLISHED_PROTOCOL.md (PUBLISHED_TABLE_RESULTS= / PUBLISHED_TABLE_MODEL= / PUBLISHED_TABLE_PPL= to render a real run)
-	@python3 scripts/lib/published_table.py $(PUBLISHED_TABLE_RESULTS) \
+	@python3 scripts/published/table.py $(PUBLISHED_TABLE_RESULTS) \
 		--model $(PUBLISHED_TABLE_MODEL) $(if $(PUBLISHED_TABLE_PPL_ARG),--ppl $(PUBLISHED_TABLE_PPL_ARG)) \
 		--out docs/PUBLISHED_PROTOCOL.md
 	@echo "wrote docs/PUBLISHED_PROTOCOL.md"
@@ -601,7 +601,7 @@ published-table: ## regenerate docs/PUBLISHED_PROTOCOL.md (PUBLISHED_TABLE_RESUL
 .PHONY: check-published-table
 check-published-table: ## CI gate: the committed published-protocol table is what the emitter renders from its checked-in inputs
 	@rendered=$$(mktemp) && trap 'rm -f "$$rendered"' EXIT && \
-	python3 scripts/lib/published_table.py \
+	python3 scripts/published/table.py \
 		$(PUBLISHED_TABLE_FIXTURES)/result_plain.json \
 		$(PUBLISHED_TABLE_FIXTURES)/result_mtp.json \
 		$(PUBLISHED_TABLE_FIXTURES)/result_dflash.json \
@@ -616,7 +616,7 @@ check-published-table: ## CI gate: the committed published-protocol table is wha
 
 .PHONY: published-table-selftest
 published-table-selftest: ## CI gate: mutation check for the published-protocol table emitter (no GPU, no model)
-	@bash scripts/published_table_selftest.sh
+	@bash scripts/published/table_selftest.sh
 
 check-doc-source-citations: ## CI gate: fail if a `crates/...` source path cited in docs/ does not exist
 	@python3 scripts/check/doc_refs.py --source-paths
@@ -1003,7 +1003,7 @@ canary-ab-host-gate-fixtures: ## recall-check the A/B harness's host gates again
 	bash scripts/perf_ab_host_gate_fixtures.sh
 
 canary-ab-ingest-selftest: ## mutation-check the A/B -> runs.db promoter (no GPU, no model, no DB write)
-	bash scripts/perf_ab_ingest_selftest.sh
+	bash scripts/ingest/ab_selftest.sh
 
 ingest-selftest: ## recall-check the ingest entry: record fields, refusals and the stage-and-record tail of every mode (stub recorder; no DB write)
 	bash scripts/ingest/ingest_selftest.sh
@@ -1021,11 +1021,11 @@ run-class-selftest: ## check that the capture scripts, the codec probe and its i
 	bash scripts/run_class_selftest.sh
 
 spec-bench-published-selftest: ## mutation-check the published-protocol bench against a stub server (no GPU, no model)
-	bash scripts/spec_bench_published_selftest.sh
+	bash scripts/published/bench_selftest.sh
 
 .PHONY: published-ingest-selftest
 published-ingest-selftest: ## mutation-check the published-protocol runs.db ingester against synthetic results (no DB write)
-	bash scripts/published_ingest_selftest.sh
+	bash scripts/ingest/published_selftest.sh
 
 # Gate one canary against a recorded SHA via `rmlx metrics deltas`.
 # $(1) is the gate target's name, $(2) the target that writes the rows it reads.

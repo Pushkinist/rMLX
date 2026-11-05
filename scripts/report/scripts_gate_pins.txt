@@ -18,7 +18,6 @@ class bench_codec_cell.sh
 class bench_identity_selftest.sh
 class bench_llama_ab.sh
 class bench_llama_ab_selftest.sh
-class check_published_samples_fixtures.sh
 class codec_smoke_runner_selftest.sh
 class convert_silero_vad.py
 class eval/wikitext2_ppl.py
@@ -29,14 +28,10 @@ class mst_capture.sh
 class perf-iter/bench_decode_tps.sh
 class perf_ab.sh
 class perf_ab_host_gate_fixtures.sh
-class perf_ab_ingest_selftest.sh
 class perf_ab_selftest.sh
 class perf_canary.sh
 class perf_ceiling.py
 class prefill_chunk_sweep.sh
-class published_ingest_selftest.sh
-class published_samples.py
-class published_table_selftest.sh
 class release_e2e/stage6_perf/codec_smoke_runner.sh
 class release_e2e/stage6_perf/kv_codec_matrix.toml
 class release_e2e/stage6_perf/niah_long_context.sh
@@ -45,8 +40,6 @@ class rmlx-capture.entitlements
 class schema_constraint_canary.sh
 class sdpa_headdim_bench.py
 class spec_bench.sh
-class spec_bench_published.sh
-class spec_bench_published_selftest.sh
 class spec_bench_selftest.sh
 class ssd_canary.sh
 class ssd_canary_selftest.sh
@@ -56,7 +49,6 @@ purpose codec_smoke_runner_selftest.sh
 purpose gpu_capture.sh
 purpose mst_capture.sh
 purpose prefill_chunk_sweep.sh
-purpose published_ingest_selftest.sh
 purpose lib/record_pending.sh
 purpose run_class_selftest.sh
 usage bench_cell.sh
@@ -65,43 +57,27 @@ usage bench_llama_ab.sh
 usage bench_llama_ab_selftest.sh
 usage check/eval_lock.sh
 usage check/gpu_device_census_selftest.sh
-usage check_published_samples_fixtures.sh
 usage codec_smoke_runner_selftest.sh
 usage eval/wikitext2_ppl.py
 usage suite/eval_lock_stress.sh
-usage lib/binary_identity.py
 usage lib/prefill_ms.py
-usage lib/published_aggregate.py
-usage lib/published_fixed_prompt.py
-usage lib/published_fixed_run.py
-usage lib/published_greedy.py
-usage lib/published_longctx.py
-usage lib/published_payloads.py
-usage lib/published_requery.py
 usage lib/published_run_log.py
-usage lib/published_table.py
 usage lib/run_log_for_pid.py
 usage lib/server_decode_tps.py
 usage lib/server_kv_quant.py
 usage lib/server_sampling.py
 usage lib/snapshot_identity.py
-usage lib/snapshot_sampling.py
 usage lib/spec_round_log.py
 usage mst_capture.sh
 usage perf_ab.sh
 usage perf_ab_host_gate_fixtures.sh
-usage perf_ab_ingest_selftest.sh
 usage perf_ab_selftest.sh
 usage prefill_chunk_sweep.sh
-usage published_ingest_selftest.sh
-usage published_samples.py
-usage published_table_selftest.sh
 usage release/release_cpu.py
 usage release/release_cpu_selftest.sh
 usage suite/run_gpu_tests.sh
 usage suite/run_gpu_tests_selftest.sh
 usage schema_constraint_canary.sh
-usage spec_bench_published_selftest.sh
 usage spec_bench_selftest.sh
 usage spec/broken_engine.sh
 usage spec/round_stream_compare.py
@@ -117,7 +93,6 @@ exit-undeclared bench_llama_ab.sh 0,4,125
 exit-undeclared bench_llama_ab_selftest.sh 1
 exit-undeclared check/eval_lock.sh 1
 exit-undeclared check/gpu_device_census.sh 2
-exit-undeclared check_published_samples_fixtures.sh 1
 exit-undeclared codec_smoke_runner_selftest.sh 0,1
 exit-undeclared eval/wikitext2_ppl.py 1
 exit-undeclared suite/eval_lock_stress.sh 1
@@ -127,19 +102,14 @@ exit-undeclared mst_capture.sh 0,1,2,75
 exit-undeclared perf-iter/bench_decode_tps.sh 1,2
 exit-undeclared perf_ab.sh 0,1,125
 exit-undeclared perf_ab_host_gate_fixtures.sh 1,2
-exit-undeclared perf_ab_ingest_selftest.sh 1
 exit-undeclared perf_ab_selftest.sh 1
 exit-undeclared perf_canary.sh 1,125
 exit-undeclared prefill_chunk_sweep.sh 0,125
-exit-undeclared published_ingest_selftest.sh 1,2
-exit-undeclared published_table_selftest.sh 0,1,2
 exit-undeclared release_e2e/stage6_perf/codec_smoke_runner.sh 0,1,2,3
 exit-undeclared release_e2e/stage6_perf/niah_long_context.sh 1,2
 exit-undeclared suite/run_gpu_tests.sh 0,1
 exit-undeclared schema_constraint_canary.sh 0,2
 exit-undeclared spec_bench.sh 1,125
-exit-undeclared spec_bench_published.sh 1,125
-exit-undeclared spec_bench_published_selftest.sh 1,2
 exit-undeclared spec_bench_selftest.sh 1,2
 exit-undeclared spec/broken_engine.sh 2,3
 exit-undeclared spec/round_stream_compare.py 2
@@ -156,46 +126,25 @@ caller spec/broken_engine.sh
 recall-missing bench_identity_selftest.sh default
 recall-missing bench_llama_ab_selftest.sh default
 recall-missing codec_smoke_runner_selftest.sh default
-recall-missing perf_ab_ingest_selftest.sh default
 recall-missing perf_ab_selftest.sh default
-recall-missing published_ingest_selftest.sh default
 recall-missing run_class_selftest.sh default
-silenced lib/published_table.py default
+silenced published/table.py default
 silenced report/debt_report.py --file-sizes,default
-lib-consumers lib/binary_identity.py
 lib-consumers lib/prefill_ms.py
-lib-consumers lib/published_aggregate.py
-lib-consumers lib/published_fixed_prompt.py
-lib-consumers lib/published_greedy.py
-lib-consumers lib/published_longctx.py
-lib-consumers lib/published_payloads.py
-lib-consumers lib/published_table.py
 lib-consumers lib/run_log_for_pid.py
-lib-consumers lib/snapshot_sampling.py
-lib-run lib/binary_identity.py spec_bench_published.sh
 lib-run lib/prefill_ms.py mst_capture.sh
-lib-run lib/published_aggregate.py spec_bench_published.sh,spec_bench_published_selftest.sh
-lib-run lib/published_fixed_prompt.py spec_bench_published.sh
-lib-run lib/published_fixed_run.py spec_bench_published.sh
-lib-run lib/published_greedy.py spec_bench_published.sh
-lib-run lib/published_longctx.py spec_bench_published.sh
-lib-run lib/published_payloads.py spec_bench_published.sh,spec_bench_published_selftest.sh
-lib-run lib/published_requery.py published_ingest_selftest.sh
-lib-run lib/published_run_log.py spec_bench_published.sh
-lib-run lib/published_table.py make:check-published-table,make:published-table,published_table_selftest.sh
+lib-run lib/published_run_log.py published/bench.sh
 lib-run lib/run_log_for_pid.py lib/bench_server.sh
 lib-run lib/server_decode_tps.py perf-iter/bench_decode_tps.sh,spec_bench.sh
 lib-run lib/server_kv_quant.py lib/bench_server.sh,perf_canary.sh,ssd_canary.sh
 lib-run lib/server_sampling.py spec_bench.sh
-lib-run lib/snapshot_identity.py bench_cache_types.sh,perf-iter/bench_decode_tps.sh,perf_canary.sh,spec_bench.sh,spec_bench_published.sh
-lib-run lib/snapshot_sampling.py spec_bench_published.sh
+lib-run lib/snapshot_identity.py bench_cache_types.sh,perf-iter/bench_decode_tps.sh,perf_canary.sh,published/bench.sh,spec_bench.sh
 lib-run lib/spec_round_log.py spec_bench.sh
-lib-run lib/sse_decode_window.py spec_bench.sh,spec_bench_published.sh,spec_bench_selftest.sh
+lib-run lib/sse_decode_window.py published/bench.sh,spec_bench.sh,spec_bench_selftest.sh
 shebang lib/snapshot_identity.py
 shebang lib/record_pending.sh
 exec-bit bench_identity_selftest.sh
 exec-bit perf_ceiling.py
-exec-bit published_ingest_selftest.sh
 dead-path perf_canary.sh regression_gate.sh
 set-mode bench/codec_inertness_probe.sh
 set-mode bench_cache_types.sh
@@ -209,10 +158,8 @@ set-mode gpu_capture.sh
 set-mode gputrace_preflight.sh
 set-mode mst_capture.sh
 set-mode perf_ab.sh
-set-mode perf_ab_ingest_selftest.sh
 set-mode perf_ab_selftest.sh
 set-mode prefill_chunk_sweep.sh
-set-mode published_ingest_selftest.sh
 set-mode schema_constraint_canary.sh
 set-mode spec_bench_selftest.sh
 set-mode spec/broken_engine.sh
@@ -233,33 +180,33 @@ size report/debt_report_selftest.sh 1598
 size report/kv_census_selftest.sh 1212
 size suite/run_gpu_tests.sh 1322
 size spec_bench.sh 1172
-size spec_bench_published.sh 1185
-size spec_bench_published_selftest.sh 2790
+size published/bench.sh 1182
+size published/bench_selftest.sh 2788
 size spec_bench_selftest.sh 1875
 size ssd_canary.sh 1284
 heredoc bench_cell.sh 41
 heredoc bench_llama_ab.sh 30,27
-heredoc check_published_samples_fixtures.sh 23
+heredoc published/samples_selftest.sh 23
 heredoc perf-iter/bench_decode_tps.sh 57
-heredoc perf_ab_ingest_selftest.sh 29
+heredoc ingest/ab_selftest.sh 29
 heredoc prefill_chunk_sweep.sh 162
-heredoc published_ingest_selftest.sh 198
-heredoc published_table_selftest.sh 31
+heredoc ingest/published_selftest.sh 198
+heredoc published/table_selftest.sh 31
 heredoc report/debt_report_selftest.sh 26,24,24
 heredoc schema_constraint_canary.sh 140,27
 heredoc spec_bench.sh 141
-heredoc spec_bench_published.sh 56
-heredoc spec_bench_published_selftest.sh 34,23
+heredoc published/bench.sh 56
+heredoc published/bench_selftest.sh 33,23
 heredoc ssd_canary.sh 65,50,38
 twin lib/published_run_log.py+lib/spec_round_log.py 42
-twin published_ingest_selftest.sh+published_table_selftest.sh 89
-twin published_ingest_selftest.sh+spec_bench_published_selftest.sh 66
-twin published_ingest_selftest.sh+spec_bench_selftest.sh 69
-twin published_table_selftest.sh+spec_bench_published_selftest.sh 82
-twin published_table_selftest.sh+spec_bench_selftest.sh 81
-twin spec_bench.sh+spec_bench_published.sh 51
+twin ingest/published_selftest.sh+published/table_selftest.sh 89
+twin ingest/published_selftest.sh+published/bench_selftest.sh 66
+twin ingest/published_selftest.sh+spec_bench_selftest.sh 68
+twin published/bench_selftest.sh+published/table_selftest.sh 82
+twin published/table_selftest.sh+spec_bench_selftest.sh 80
+twin published/bench.sh+spec_bench.sh 51
 twin spec_bench.sh+ssd_canary.sh 96
-twin spec_bench_published_selftest.sh+spec_bench_selftest.sh 199
+twin published/bench_selftest.sh+spec_bench_selftest.sh 198
 lib-shadow perf-iter/bench_decode_tps.sh field_of
 lib-shadow schema_constraint_canary.sh wait_for_server
 lib-shadow ssd_canary.sh wait_for_server
@@ -283,7 +230,7 @@ binary-literal release_e2e/stage6_perf/codec_smoke_runner.sh 1
 binary-literal release_e2e/stage6_perf/niah_long_context.sh 1
 binary-literal schema_constraint_canary.sh 1
 binary-literal spec_bench.sh 1
-binary-literal spec_bench_published.sh 1
+binary-literal published/bench.sh 1
 binary-literal ssd_canary.sh 1
 binary-literal run_class_selftest.sh 5
 env-knob bench/codec_inertness_probe.sh RMLX_BINARY,RMLX_HOME
@@ -305,25 +252,25 @@ env-knob perf-iter/bench_decode_tps.sh KV_QUANT,MAX_CTX,MEASURE_RUNS,METRICS_DB,
 env-knob perf_ab.sh RMLX_HOME,RMLX_O_MODELS_ROOT
 env-knob perf_canary.sh RMLX_HOME,RMLX_O_MODELS_ROOT
 env-knob prefill_chunk_sweep.sh RMLX_HOME
-env-knob published_table_selftest.sh MAKE_ENV
+env-knob published/table_selftest.sh MAKE_ENV
 env-knob release_e2e/stage6_perf/codec_smoke_runner.sh RMLX_O_MODELS_ROOT
 env-knob suite/run_gpu_tests.sh RMLX_O_MODELS_ROOT,RMLX_SKIP_GPU
 env-knob schema_constraint_canary.sh BONSAI_MODEL,GEMMA_E2B_MODEL,PORT,RMLX_O_MODELS_ROOT
 env-knob spec_bench.sh BENCH_PROMPT,BENCH_PROMPT_FILE,BENCH_PROMPT_NAME,DRAFTER_MODEL,PORT,RMLX_HARDWARE_TAG,RMLX_HOME,VERIFIER_MODEL
-env-knob spec_bench_published.sh KV_QUANT_SEEN,MEMORY_PID,RMLX_HOME,SAMPLING_SEEN,SERVER_PID
+env-knob published/bench.sh KV_QUANT_SEEN,MEMORY_PID,RMLX_HOME,SAMPLING_SEEN,SERVER_PID
 env-knob spec_bench_selftest.sh OUT_PATH
 env-knob ssd_canary.sh PORT,SSD_GB,VERIFIER_MODEL
 env-knob bench_identity_selftest.sh STUB_CRASH_MEASURED,STUB_FAIL_GATE,STUB_FAIL_MEASURED,STUB_TURBO_NO_TPS
 env-knob lib/rmlx_home.py RMLX_HOME
-unguarded-array check_published_samples_fixtures.sh args
+unguarded-array published/samples_selftest.sh args
 unguarded-array mst_capture.sh run_cmd
 unguarded-array perf_ab.sh A_KV,A_MEM,A_TPS,B_KV,B_MEM,B_TPS,MODELS,record
 unguarded-array perf_ab_host_gate_fixtures.sh RESULT_PATHS
 unguarded-array perf_ab_selftest.sh COMMON
-unguarded-array published_table_selftest.sh inputs
+unguarded-array published/table_selftest.sh inputs
 unguarded-array spec_bench.sh MTP_ANSWER_DIGESTS,MTP_CLIENT_TPS_VALUES,MTP_ENGINE_TPS_VALUES,NORMAL_ANSWER_DIGESTS,NORMAL_CLIENT_TPS_VALUES,NORMAL_ENGINE_TPS_VALUES
-unguarded-array spec_bench_published.sh CELLS,CELL_ARGS,FIXED_FILES,GREEDY_CELL_ARGS,HOST_WINDOWS,LC_RUNS,PASS_FILES,THERMAL_READINGS,args
-unguarded-array spec_bench_published_selftest.sh cell_args
+unguarded-array published/bench.sh CELLS,CELL_ARGS,FIXED_FILES,GREEDY_CELL_ARGS,HOST_WINDOWS,LC_RUNS,PASS_FILES,THERMAL_READINGS,args
+unguarded-array published/bench_selftest.sh cell_args
 unguarded-array ssd_canary.sh ALL_PROMPTS
 unguarded-array bench_codec_cell.sh decode_values,prefill_values
 unguarded-array perf_canary.sh MODELS,tps_values,turbo3_values

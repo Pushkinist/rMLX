@@ -1,5 +1,7 @@
 """Say which binary a bench run measured, and prove it can produce the readings.
 
+Module of: published/bench.sh
+
 A digest alone answers "is this the same file as last time". It does not answer
 "is this the build I think it is": a stash-build-unstash cycle leaves the
 previous binary in `target/`, both arms hash the same, and a comparison of a
@@ -42,6 +44,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 
 import published_run_log  # noqa: E402
 import server_kv_quant  # noqa: E402

@@ -1,5 +1,7 @@
 """Re-query a recorded published-protocol run from `runs.db` and compare.
 
+Module of: ingest/ingest.py
+
 `ingest/ingest.py published` records the measured things and deliberately not
 their means: the per-dataset and macro averages are derived, and a stored
 derivation can disagree with what it was derived from. So the headline of a run
@@ -276,7 +278,7 @@ def check(result_path: Path, rmlx_bin: str, db: str | None, out: Path) -> list[s
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("result", help="JSON emitted by spec_bench_published.sh")
+    ap.add_argument("result", help="JSON emitted by published/bench.sh")
     ap.add_argument("--rmlx-bin", default="rmlx")
     ap.add_argument("--db", default=None, help="a runs.db other than the default")
     ap.add_argument("--out", default=None, help="default: db_summary.json beside the result")
@@ -286,13 +288,13 @@ def main() -> int:
     try:
         problems = check(result_path, args.rmlx_bin, args.db, out)
     except Unreadable as exc:
-        print(f"published_requery: {exc}", file=sys.stderr)
+        print(f"requery: {exc}", file=sys.stderr)
         return 2
     for problem in problems:
-        print(f"published_requery: {problem}", file=sys.stderr)
+        print(f"requery: {problem}", file=sys.stderr)
     if problems:
         return 1
-    print(f"published_requery: the rows reproduce the result; figures in {out}")
+    print(f"requery: the rows reproduce the result; figures in {out}")
     return 0
 
 

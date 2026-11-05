@@ -1,5 +1,7 @@
 """Assemble and summarise a published-protocol speculative-decoding run.
 
+Module of: published/bench.sh
+
 Two subcommands, one row schema:
 
   pass    zip one pass's client-side blocks with the engine's per-request rows
@@ -67,6 +69,8 @@ import json
 import statistics
 import sys
 
+from fixed_run import read_kv
+
 SCHEMA_VERSION = 1
 
 # Per-round figures the speculative arm carries through to the report. The
@@ -80,17 +84,6 @@ class InputError(Exception):
 
 
 # ── pass ──────────────────────────────────────────────────────────────────────
-
-
-def read_kv(path):
-    """The `key=value` block a client-side reader wrote for one request."""
-    values = {}
-    with open(path, encoding="utf-8") as handle:
-        for line in handle:
-            key, sep, value = line.rstrip("\n").partition("=")
-            if sep:
-                values[key] = value
-    return values
 
 
 def require_number(values, key, where, cast=float):
@@ -766,7 +759,7 @@ def main():
         "--greedy-match",
         default=None,
         metavar="MATCH.json",
-        help="published_greedy.py compare output, filed under greedy_match",
+        help="greedy.py compare output, filed under greedy_match",
     )
     r.set_defaults(func=cmd_report)
 
@@ -774,10 +767,10 @@ def main():
     try:
         return args.func(args)
     except InputError as exc:
-        print(f"published_aggregate: {exc}", file=sys.stderr)
+        print(f"aggregate: {exc}", file=sys.stderr)
         return 1
     except (OSError, KeyError, ValueError) as exc:
-        print(f"published_aggregate: {exc}", file=sys.stderr)
+        print(f"aggregate: {exc}", file=sys.stderr)
         return 1
 
 

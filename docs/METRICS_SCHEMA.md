@@ -463,7 +463,7 @@ controller tick with `stage = 'admission_ctrl'`:
 | `kv_cache_bytes` | `bytes` | `lower_better` | Resident KV bytes after decode. See below. |
 | `tps_per_gb_ram` | `ratio` | `higher_better` | `decode_tps_warm / peak_rss_gb`. |
 | `task_pass_at_1` | `ratio` | `higher_better` | Quality-probe pass rate, 0.0–1.0. |
-| `greedy_samples` | `count` | `higher_better` | Samples of a dataset a speculative run answered at temperature 0, to be judged against plain decode (`scripts/lib/published_greedy.py`). The five `greedy_*` rows of one dataset are one record and add up: identical, near tie, refused and unjudgeable are the classes of the samples. |
+| `greedy_samples` | `count` | `higher_better` | Samples of a dataset a speculative run answered at temperature 0, to be judged against plain decode (`scripts/published/greedy.py`). The five `greedy_*` rows of one dataset are one record and add up: identical, near tie, refused and unjudgeable are the classes of the samples. |
 | `greedy_identical` | `count` | `higher_better` | Samples whose speculative answer, reasoning included, equals the plain answer to the last character. |
 | `greedy_near_tie` | `count` | `lower_better` | Samples whose answers first differ at a decision the verifier was nearly tied on (`rmlx eval spec-answer`). A near tie is the oracle's reading of one divergence; it does not show the rest of the answer agrees. |
 | `greedy_refused` | `count` | `lower_better` | Samples whose answers differ where the verifier was not tied, or where one run stopped well before the other. |

@@ -1,5 +1,7 @@
 """Render one request payload per checked-in sample, and index them.
 
+Module of: published/bench.sh
+
 A cell is a `<dataset>:<max output tokens>` pair, and the protocol measures four
 of them: the three datasets at the pinned budget, plus MATH-500 again at the
 longer one. This turns the sample sets under a root into one payload file per
@@ -70,17 +72,20 @@ WARMUP_PROMPT = "Say hello."
 WARMUP_MAX_TOKENS = 64
 
 
-def payload(model_id, messages, max_tokens):
-    return {
+def payload(model_id, messages, max_tokens, temperature=None):
+    body = {
         "model": model_id,
         "messages": messages,
         "max_tokens": int(max_tokens),
         "enable_thinking": True,
-        "stream": True,
-        # The prompt length recorded with a request is the one the server
-        # counted, and it only says so when asked.
-        "stream_options": {"include_usage": True},
     }
+    if temperature is not None:
+        body["temperature"] = temperature
+    body["stream"] = True
+    # The prompt length recorded with a request is the one the server
+    # counted, and it only says so when asked.
+    body["stream_options"] = {"include_usage": True}
+    return body
 
 
 def greedy_payload(model_id, messages, max_tokens):
@@ -158,7 +163,7 @@ def main():
     for spec in args.cell:
         dataset, sep, max_tokens = spec.partition(":")
         if not sep or not max_tokens.isdigit():
-            print(f"published_payloads: --cell {spec!r} is not DATASET:MAX_TOKENS",
+            print(f"payloads: --cell {spec!r} is not DATASET:MAX_TOKENS",
                   file=sys.stderr)
             return 1
         cells.append((dataset, max_tokens))
@@ -167,10 +172,10 @@ def main():
     try:
         rows = render(root, pathlib.Path(args.out), args.model_id, cells, args.greedy)
     except (OSError, ValueError, KeyError) as exc:
-        print(f"published_payloads: cannot read {root}: {exc}", file=sys.stderr)
+        print(f"payloads: cannot read {root}: {exc}", file=sys.stderr)
         return 2
     except RootError as exc:
-        print(f"published_payloads: {root}: {exc}", file=sys.stderr)
+        print(f"payloads: {root}: {exc}", file=sys.stderr)
         return 1
 
     pathlib.Path(args.index).write_text(

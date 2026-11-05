@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# published_ingest_selftest.sh — mutation check for
-# the `published` mode of scripts/ingest/ingest.py.
+# Recall test for the ingest entry's published mode: refusals over a synthetic bench result.
+#
+# Usage:  bash scripts/ingest/published_selftest.sh
+# Exit:   0 every case behaved; 1 at least one did not; 2 the fixtures themselves could not be built
+# Set:    -uo — a case's non-zero status is read after it, and -e would end the run there
+#
+# Recall test for: ingest/ingest.py published
 #
 # WHY THIS EXISTS
 #
@@ -18,19 +23,16 @@
 # columns the real one has, and answers `metrics query` by running the SQL it is
 # sent against that store. So the re-query step's SQL is executed, not matched.
 # No GPU, no model, no real DB.
-#
-# Exit codes: 0 — every case behaved; 1 — at least one did not; 2 — the fixtures
-# themselves could not be built.
 
 set -uo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 INGEST="${REPO_ROOT}/scripts/ingest/ingest.py"
 PUBLISHED="${REPO_ROOT}/prompts/published"
 
 [ -r "${INGEST}" ] || { echo "ERROR: missing ${INGEST}" >&2; exit 2; }
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/rmlx_published_ingest_selftest.XXXXXX")" || exit 2
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/rmlx_ingest_published.XXXXXX")" || exit 2
 trap 'rm -rf "${WORK}"' EXIT
 
 PASSED=0
@@ -441,7 +443,7 @@ recs = json.load(sys.stdin)
 print(eval(sys.argv[1]))' "$1"
 }
 
-echo "published_ingest_selftest: one synthetic result over the checked-in samples"
+echo "published_selftest: one synthetic result over the checked-in samples"
 echo
 
 # ── What gets recorded ────────────────────────────────────────────────────────
@@ -607,7 +609,7 @@ ingest_case passes_that_named_different_bodies_are_refused 2 \
 verdict
 
 # The manifest's leg and the recorder's leg are layered behind
-# `published_samples.py verify`, which is re-run here: an edited sample set
+# `published/samples.py verify`, which is re-run here: an edited sample set
 # cannot reach the digest comparison because the root stops re-deriving first.
 ingest_case sample_set_that_moved_is_refused 2 \
     "a sample set edited between the run and the record files no row" \
@@ -887,7 +889,7 @@ CASE_BAD=""
 CASE_OUT="${WORK}/requery_unrecorded.log"
 mkdir -p "${WORK}/requery_home"
 env RMLX_HOME="${WORK}/requery_home" STUB_RECORDED="${WORK}/recorded.txt" \
-    python3 "${REPO_ROOT}/scripts/lib/published_requery.py" "${BASE}" \
+    python3 "${REPO_ROOT}/scripts/published/requery.py" "${BASE}" \
     --rmlx-bin "${STUB_RMLX}" --out "${WORK}/requery_unrecorded.json" >"${CASE_OUT}" 2>&1
 got=$?
 [ "${got}" -ne 1 ] && note_bad "exit=${got} (want 1)"

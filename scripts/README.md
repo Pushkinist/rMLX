@@ -394,7 +394,7 @@ the claim file. [gate: `make check-claim-bypass`, tree-wide]
   keeps the failure and a `|| true` that drops it are both pinned when they occur. The three such lines
   in the `make ci` closure are pinned: `debt_report.py --file-sizes` and
   `debt_report.py` (advisory reports; their `make ci` lines end in `|| true`) and
-  `lib/published_table.py` (`... && diff -u ... || { ...; exit 1; }`, which keeps
+  `published/table.py` (`... && diff -u ... || { ...; exit 1; }`, which keeps
   the failure).
   [gate: `silenced`]
 * A recall test never sources its gate, and a gate never sources the case

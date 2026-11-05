@@ -255,7 +255,7 @@ fn sync_dir_real_rmlx_prompts() {
 }
 
 /// Every sample under `prompts/published/` carries a `body_sha256` written by
-/// `scripts/published_samples.py`. That id is only worth anything if it is the
+/// `scripts/published/samples.py`. That id is only worth anything if it is the
 /// id this recorder would give the same body — two implementations of one
 /// content address, in two languages, with nothing else holding them together.
 /// The published-samples gate cannot check this side; this is where it is

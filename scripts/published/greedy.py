@@ -1,5 +1,7 @@
 """Seal a greedy pass, and judge a speculative one against a plain one.
 
+Module of: published/bench.sh
+
 The speed passes of the published protocol sample under the checkpoint's own
 defaults, so two arms never answer the same question there. Judging whether a
 drafter changed the answer needs a pass of its own: every sample once, at temperature 0, unstreamed and with
@@ -45,6 +47,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 
 import published_run_log  # noqa: E402
 
@@ -108,7 +111,7 @@ def seal(args):
         "protocol": PROTOCOL,
     }
     (directory / META).write_text(json.dumps(meta, indent=1) + "\n", encoding="utf-8")
-    print(f"published_greedy: sealed {len(rows)} answers in {directory}")
+    print(f"greedy: sealed {len(rows)} answers in {directory}")
 
 
 def load_pass(directory, role, arm):
@@ -159,7 +162,7 @@ def cold(args):
                 f"{number} from a prompt cache, so its answer is not from a full "
                 "prefill and is not a reference to judge another arm against"
             )
-    print(f"published_greedy: {len(events)} greedy requests, all from a full prefill")
+    print(f"greedy: {len(events)} greedy requests, all from a full prefill")
 
 
 def judge(rmlx_bin, plain_file, spec_file):
@@ -244,7 +247,7 @@ def compare(args):
     }
     pathlib.Path(args.out).write_text(json.dumps(result, indent=1) + "\n", encoding="utf-8")
     print(
-        f"published_greedy: {total['identical']} of {total['samples']} answers identical, "
+        f"greedy: {total['identical']} of {total['samples']} answers identical, "
         f"{total['near_tie']} differ at a near tie"
     )
 
@@ -279,10 +282,10 @@ def main():
     try:
         {"seal": seal, "cold": cold, "compare": compare}[args.command](args)
     except PassError as exc:
-        print(f"published_greedy: {exc}", file=sys.stderr)
+        print(f"greedy: {exc}", file=sys.stderr)
         return 1
     except (OSError, KeyError, ValueError) as exc:
-        print(f"published_greedy: cannot read an input: {exc!r}", file=sys.stderr)
+        print(f"greedy: cannot read an input: {exc!r}", file=sys.stderr)
         return 2
     return 0
 

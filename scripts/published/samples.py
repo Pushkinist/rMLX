@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Build and verify the checked-in published-protocol sample sets.
 
+Usage:  samples.py build [--out DIR] [--sources DIR]
+        samples.py verify [--root DIR] [--sources DIR]
+Exit:   0 everything agrees; 1 a recorded or pinned fact and the tree disagree; 2 the tree,
+        the manifest or an upstream file could not be read at all
+
 The published speculative-decoding protocol reports output speed as a
 macro-average over MT-Bench, MATH-500 and HumanEval subsets. Those subsets are
 checked in under ``prompts/published/`` so a number can be traced back to the
@@ -32,11 +37,6 @@ WHERE THE ANCHOR LIVES
   the body digest computed here equals the id the Rust recorder gives the same
   body is checked by `published_sample_body_digests_match_this_recorder` in
   `crates/rmlx-metrics/src/prompts_tests.rs`.
-
-Exit codes:
-  0  everything agrees
-  1  a recorded or pinned fact and the tree disagree
-  2  the tree, the manifest or an upstream file could not be read at all
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ import re
 import sys
 import urllib.request
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 PUBLISHED_DIR = REPO_ROOT / "prompts" / "published"
 MANIFEST_NAME = "manifest.json"
 SCRIPT_NAME = pathlib.Path(__file__).name

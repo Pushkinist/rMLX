@@ -1,4 +1,4 @@
-"""Promote a `scripts/spec_bench_published.sh` result into `runs.db`.
+"""Promote a `scripts/published/bench.sh` result into `runs.db`.
 
 Module of: ingest/ingest.py
 
@@ -43,8 +43,8 @@ WHAT IS CHECKED AFTER RECORDING
 
 `--record` ends by re-querying the rows it just wrote, by the run's label and
 start time, and rebuilding the per-cell and macro means from them
-(`lib/published_requery.py`). A result they do not reproduce is exit 1: the rows
-are not the measurement. The label is the run's own (`spec_bench_published.sh
+(`published/requery.py`). A result they do not reproduce is exit 1: the rows
+are not the measurement. The label is the run's own (`published/bench.sh
 --label`); it is written as `label=<label>;` at the start of every row's `notes`.
 
 WHAT IS REFUSED
@@ -64,7 +64,7 @@ WHAT IS REFUSED
                        `build_profile` describe one binary while the row asserts
                        another — permanently, in an append-only table.
   a moved sample set   the published root is re-verified against the pins in
-                       `published_samples.py`. Same failure, other input.
+                       `published/samples.py`. Same failure, other input.
   a body that moved    HARD. The digest recorded with each measurement, the
                        digest in the sample manifest, and the digest this
                        recorder gives the body about to be submitted must be one
@@ -89,10 +89,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from published_requery import LABEL_PATTERN, Unreadable, check
-from published_samples import body_sha256
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "scripts" / "published"))
+from requery import LABEL_PATTERN, Unreadable, check  # noqa: E402
+from samples import body_sha256  # noqa: E402
 
 SCHEMA_VERSION = 1
 # The identity fields the run stamped at emit time. §8.5.1: they are never
@@ -154,7 +154,7 @@ def check_samples_root(result: dict[str, Any], repo_root: Path) -> None:
     proc = subprocess.run(
         [
             sys.executable,
-            str(repo_root / "scripts" / "published_samples.py"),
+            str(repo_root / "scripts" / "published" / "samples.py"),
             "verify",
             "--root",
             str(root),
@@ -166,7 +166,7 @@ def check_samples_root(result: dict[str, Any], repo_root: Path) -> None:
     if proc.returncode != 0:
         raise Refused(
             f"the sample sets at {root} no longer re-derive from what "
-            f"published_samples.py pins:\n{proc.stdout}{proc.stderr}"
+            f"published/samples.py pins:\n{proc.stdout}{proc.stderr}"
         )
 
 
@@ -245,7 +245,7 @@ def run_notes(result: dict[str, Any], binary_sha: str) -> str:
     protocol = result["protocol"]
     parts = [
         f"label={result['label']}",
-        f"spec_bench_published.sh, {protocol['passes']} passes, "
+        f"published/bench.sh, {protocol['passes']} passes, "
         f"{protocol['warmups_per_pass']} untimed warmup each",
         f"sampling {protocol['thinking']}, seed {protocol['seed_policy']}",
         f"binary sha256:{binary_sha[:16]}",
@@ -340,7 +340,7 @@ def sample_records(
                     "body": messages,
                     "notes": (
                         f"{dataset} sample {sample_id} from prompts/published/, "
-                        "pinned by scripts/published_samples.py"
+                        "pinned by scripts/published/samples.py"
                     ),
                 },
                 "prompt_tokens": prompt_tokens.pop(),
@@ -507,7 +507,7 @@ def fixed_record(
                 f"tokenizer: the first {block['words']} words of "
                 f"{block['corpus']} (sha256:{block['corpus_sha256'][:16]}) plus "
                 f"{block['filler_reps']} x '{block['filler_word']}', behind the "
-                "instruction pinned in scripts/lib/published_fixed_prompt.py"
+                "instruction pinned in scripts/published/fixed_prompt.py"
             ),
         },
         "prompt_tokens": block["prompt_tokens"],
@@ -568,7 +568,7 @@ def gate(result: dict[str, Any], args: argparse.Namespace) -> None:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="ingest.py published", description=__doc__.splitlines()[0])
-    p.add_argument("result", help="JSON emitted by spec_bench_published.sh")
+    p.add_argument("result", help="JSON emitted by published/bench.sh")
     p.add_argument(
         "--git-sha",
         default=None,

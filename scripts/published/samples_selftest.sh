@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Recall test for published_samples.py verify: synthetic sample-set roots, one edit per case.
+# Recall test for published/samples.py verify: synthetic sample-set roots, one edit per case.
 #
-# Recall test for: published_samples.py verify
+# Usage:  bash scripts/published/samples_selftest.sh
+# Exit:   0 every case behaved; 1 at least one did not
+#
+# Recall test for: published/samples.py verify
 #
 # WHY
 #   The verifier's whole job is to refuse. It reads a manifest, re-derives what
@@ -21,15 +24,13 @@
 #
 #   Every case asserts the literal exit code AND greps the reason, because a
 #   gate that refuses for the wrong reason stops refusing when that reason moves.
-#
-# Exit 0 = every case behaved. Exit 1 = at least one did not.
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERIFY="${REPO_ROOT}/scripts/published_samples.py"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+VERIFY="${REPO_ROOT}/scripts/published/samples.py"
 PUBLISHED="${REPO_ROOT}/prompts/published"
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/rmlx_published_samples.XXXXXX")"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/rmlx_samples_selftest.XXXXXX")"
 trap 'rm -rf "${WORK}"' EXIT
 
 PASSED=0
@@ -41,7 +42,7 @@ root() {
 	local dir="${WORK}/$1"
 	mkdir -p "${dir}"
 	cp "${PUBLISHED}"/*.json "${dir}/"
-	cp "${VERIFY}" "${dir}/published_samples.py"
+	cp "${VERIFY}" "${dir}/samples.py"
 	echo "${dir}"
 }
 
@@ -58,7 +59,7 @@ import gzip, hashlib, json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
 (root / "upstream").mkdir(exist_ok=True)
 man = json.loads((root / "manifest.json").read_text())
-script = (root / "published_samples.py").read_text()
+script = (root / "samples.py").read_text()
 for entry in man["datasets"]:
     field = entry["pool_id_field"]
     doc = json.loads((root / entry["file"]).read_text())
@@ -74,7 +75,7 @@ for entry in man["datasets"]:
     new = hashlib.sha256(raw).hexdigest()
     script = script.replace(entry["source"]["sha256"], new)
     entry["source"]["sha256"] = new
-(root / "published_samples.py").write_text(script)
+(root / "samples.py").write_text(script)
 (root / "manifest.json").write_text(json.dumps(man, ensure_ascii=False, indent=2) + "\n")
 PY
 }
@@ -93,10 +94,10 @@ man = json.loads((root / "manifest.json").read_text())
 entry = next(e for e in man["datasets"] if e["key"] == key)
 blob = (root / entry["file"]).read_bytes()
 if mode == "with-pin":
-    script = (root / "published_samples.py").read_text()
+    script = (root / "samples.py").read_text()
     script = script.replace(str(entry["file_bytes"]), str(len(blob)))
     script = script.replace(entry["file_sha256"], hashlib.sha256(blob).hexdigest())
-    (root / "published_samples.py").write_text(script)
+    (root / "samples.py").write_text(script)
 elif mode != "manifest-only":
     raise SystemExit(f"rebless: unknown mode {mode!r}")
 entry["file_bytes"] = len(blob)
@@ -112,7 +113,7 @@ judge() {
 	local -a args=(verify --root "${dir}")
 	[ -n "${with_sources}" ] && args+=(--sources "${dir}/upstream")
 	set +e
-	python3 "${dir}/published_samples.py" "${args[@]}" >"${out}" 2>&1
+	python3 "${dir}/samples.py" "${args[@]}" >"${out}" 2>&1
 	got=$?
 	set -e
 	local bad=""
@@ -154,7 +155,7 @@ run_absent() {
 	! grep -qE "$2" "${WORK}/$1.log" || demote "$1" "unexpected /$2/"
 }
 
-echo "check_published_samples fixtures"
+echo "published/samples_selftest"
 echo
 
 # ── the tree as it stands ─────────────────────────────────────────────────────
@@ -183,7 +184,7 @@ PY
 rebless "${d}" math_500 manifest-only
 judge pin_not_reblessed 1 \
 	"a prompt rewritten with the manifest re-blessed around it hits the pin in the script" \
-	"disagrees with published_samples.py, which pins"
+	"disagrees with samples.py, which pins"
 run_extra pin_not_reblessed "math_500.json size changed"
 run_absent pin_not_reblessed "ok \(336"
 
@@ -258,7 +259,7 @@ PY
 judge wrong_seed 1 "a seed the selection was not drawn with is caught and located" \
 	"math_500: selection does not re-derive from the recorded seed"
 run_extra wrong_seed "first divergence at index"
-run_extra wrong_seed "manifest sampling is .* and disagrees with published_samples.py"
+run_extra wrong_seed "manifest sampling is .* and disagrees with samples.py"
 
 # ── manifest facts the script pins ────────────────────────────────────────────
 
@@ -273,7 +274,7 @@ entry["user_template"] = "You are graded on brevity. Answer with the final value
 (root / "manifest.json").write_text(json.dumps(man, ensure_ascii=False, indent=2) + "\n")
 PY
 judge template_edited 1 "a preamble injected into every prompt of a set is caught at the template" \
-	"manifest user_template is .* and disagrees with published_samples.py"
+	"manifest user_template is .* and disagrees with samples.py"
 
 d="$(root revision_edited)"
 python3 - "${d}" <<'PY'
@@ -286,7 +287,7 @@ entry["source"]["revision"] = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 (root / "manifest.json").write_text(json.dumps(man, ensure_ascii=False, indent=2) + "\n")
 PY
 judge revision_edited 1 "the pinned revision is compared, not echoed back in a message" \
-	"manifest source.revision is 'deadbeef.*' and disagrees with published_samples.py"
+	"manifest source.revision is 'deadbeef.*' and disagrees with samples.py"
 
 d="$(root license_edited)"
 python3 - "${d}" <<'PY'
@@ -299,7 +300,7 @@ entry["source"]["license"]["spdx"] = "Proprietary"
 (root / "manifest.json").write_text(json.dumps(man, ensure_ascii=False, indent=2) + "\n")
 PY
 judge license_edited 1 "the recorded licence of a redistributed dataset cannot be edited quietly" \
-	"manifest source.license is .* and disagrees with published_samples.py"
+	"manifest source.license is .* and disagrees with samples.py"
 
 d="$(root count_zeroed)"
 python3 - "${d}" <<'PY'
@@ -317,8 +318,8 @@ doc["samples"] = []
 PY
 rebless "${d}" math_500 with-pin
 judge count_zeroed 1 "a set emptied to nothing is refused, not reported as ok over zero samples" \
-	"manifest count is 0 and disagrees with published_samples.py"
-run_extra count_zeroed "checked 208 samples, published_samples.py pins 336"
+	"manifest count is 0 and disagrees with samples.py"
+run_extra count_zeroed "checked 208 samples, samples.py pins 336"
 run_absent count_zeroed "ok \(0 samples"
 
 # ── the selection vs the file ─────────────────────────────────────────────────
@@ -379,7 +380,7 @@ PY
 rebless "${d}" math_500 with-pin
 judge sample_dropped 1 "a short set is refused with both counts" \
 	"holds 127 samples, manifest records 128"
-run_extra sample_dropped "checked 335 samples, published_samples.py pins 336"
+run_extra sample_dropped "checked 335 samples, samples.py pins 336"
 
 # ── the content address, and laundering it ────────────────────────────────────
 
@@ -454,8 +455,8 @@ p = root / "upstream" / "math_500.test.jsonl"
 old = hashlib.sha256(p.read_bytes()).hexdigest()
 raw = b"{not json at all\n"
 p.write_bytes(raw)
-script = (root / "published_samples.py").read_text()
-(root / "published_samples.py").write_text(
+script = (root / "samples.py").read_text()
+(root / "samples.py").write_text(
     script.replace(old, hashlib.sha256(raw).hexdigest())
 )
 PY
@@ -472,8 +473,8 @@ p = root / "upstream" / "math_500.test.jsonl"
 old = hashlib.sha256(p.read_bytes()).hexdigest()
 raw = ("\n".join(json.dumps({"not_the_id": i}) for i in range(500)) + "\n").encode()
 p.write_bytes(raw)
-script = (root / "published_samples.py").read_text()
-(root / "published_samples.py").write_text(
+script = (root / "samples.py").read_text()
+(root / "samples.py").write_text(
     script.replace(old, hashlib.sha256(raw).hexdigest())
 )
 PY
@@ -540,7 +541,7 @@ man["datasets"] = [e for e in man["datasets"] if e["key"] != "humaneval"]
 (root / "manifest.json").write_text(json.dumps(man, ensure_ascii=False, indent=2) + "\n")
 PY
 judge dataset_dropped 2 "checking two of the three sets is refused, not reported as ok" \
-	"are not the sources published_samples.py builds"
+	"are not the sources samples.py builds"
 
 d="$(root schema_bumped)"
 python3 - "${d}" <<'PY'

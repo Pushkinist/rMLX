@@ -5,8 +5,8 @@
 #
 # Each case drives the tool in one mode over a synthetic result or CSV and a stub `rmlx` that only
 # files what it is handed, then asserts the literal exit code, the reason text and what is left in
-# staging and in the pending queue. `perf_ab_ingest_selftest.sh`, `bench_llama_ab_selftest.sh` and
-# `published_ingest_selftest.sh` hold the refusals of their own sources; this file holds the
+# staging and in the pending queue. `ab_selftest.sh`, `bench_llama_ab_selftest.sh` and
+# `published_selftest.sh` hold the refusals of their own sources; this file holds the
 # record fields of codec-inertness and llama-bench, which nothing else watches, and the tail the
 # modes share: dry run, staged but not ingested, ingested, and a recorder that refuses.
 #

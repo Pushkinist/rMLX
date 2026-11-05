@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Mutation check for spec_bench_published.sh: a stub server, asserting exit codes and refusals.
+# Mutation check for published/bench.sh: a stub server, asserting exit codes and refusals.
 #
+# Usage:  bash scripts/published/bench_selftest.sh
+# Exit:   0 every case behaved; 1 at least one did not; 2 the fixtures themselves could not be built
 # Set:    -uo — a non-zero status inside a case ends the run under -e, before the cases after it
 #
-# Recall test for: spec_bench_published.sh
+# Recall test for: published/bench.sh
 #
 # WHY THIS EXISTS
 #
@@ -39,15 +41,12 @@
 # delivered, and by a case that shows the client sends the request itself.
 #
 # No GPU, no model, no DB.
-#
-# Exit codes: 0 — every case behaved; 1 — at least one did not; 2 — the
-# fixtures themselves could not be built.
 
 set -uo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-HARNESS="${REPO_ROOT}/scripts/spec_bench_published.sh"
-AGGREGATE="${REPO_ROOT}/scripts/lib/published_aggregate.py"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+HARNESS="${REPO_ROOT}/scripts/published/bench.sh"
+AGGREGATE="${REPO_ROOT}/scripts/published/aggregate.py"
 PUBLISHED="${REPO_ROOT}/prompts/published"
 
 [ -r "${HARNESS}" ] || { echo "ERROR: missing ${HARNESS}" >&2; exit 2; }
@@ -74,7 +73,7 @@ ln -s "${REPO_ROOT}/prompts" "${FAKE_ROOT}/prompts"
 # ── Sample sets ───────────────────────────────────────────────────────────────
 #
 # A shrunken copy of the checked-in sets: the first few samples of each dataset.
-# It is NOT held to `published_samples.py`, and nothing here asks it to be — that
+# It is NOT held to `published/samples.py`, and nothing here asks it to be — that
 # gate anchors the published sets against constants in its own source, so a
 # shrunken copy cannot satisfy it and should not. The harness reaches this root
 # only through `--samples-root`, which is the unverified operator override, and
@@ -674,7 +673,7 @@ STUB="${FAKE_ROOT}/target/release-perf/rmlx"
 cat >"${STUB}" <<STUBEOF
 #!/usr/bin/env bash
 set -eu
-# The log-message literals \`lib/binary_identity.py\` requires a binary to
+# The log-message literals \`published/binary_identity.py\` requires a binary to
 # contain before a run is started against it. A real rmlx carries them because
 # it writes them; this stub carries them because it fakes writing them, and a
 # case below removes one to show the check is not decorative.
@@ -897,7 +896,7 @@ LOGEOF
         STUB_BODIES="${CASE_HOME}/bodies.jsonl" \
         STUB_TOKEN_BASE=100 \
         ${env_pairs[@]+"${env_pairs[@]}"} \
-        bash "${root}/scripts/spec_bench_published.sh" \
+        bash "${root}/scripts/published/bench.sh" \
         "${verifier}" --port "${PORT}" \
         ${extra_args[@]+"${extra_args[@]}"} >"${CASE_OUT}" 2>&1
     got=$?
@@ -969,7 +968,7 @@ except ValueError:
 sys.exit(0 if abs(g - w) <= float(tol) * abs(w) else 1)' "$1" "$2" "$3"
 }
 
-echo "spec_bench_published_selftest: stub server on 127.0.0.1:${PORT}"
+echo "bench_selftest: stub server on 127.0.0.1:${PORT}"
 echo "  ${REQUESTS_PER_PASS} requests per pass over four cells"
 echo
 # ── The measured number ───────────────────────────────────────────────────────
@@ -1116,9 +1115,8 @@ bodies_check() {
     python3 - "${CASE_HOME}/bodies.jsonl" "${SAMPLES}" "$1" "${REPO_ROOT}" <<'PY'
 import hashlib, json, pathlib, sys
 
-sys.path.insert(0, str(pathlib.Path(sys.argv[4]) / "scripts" / "lib"))
-sys.path.insert(0, str(pathlib.Path(sys.argv[4]) / "scripts"))
-from published_fixed_prompt import INSTRUCTION
+sys.path.insert(0, str(pathlib.Path(sys.argv[4]) / "scripts" / "published"))
+from fixed_prompt import INSTRUCTION
 
 bodies = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
 root = pathlib.Path(sys.argv[2])
@@ -1197,10 +1195,10 @@ verdict
 run_case fixed_prompt_disagreement_precedes_sampling_read 1 \
     "a fixed-prompt cross-check failure is the fixed-prompt band, not a lost sampling read" \
     'STUB_ITL_MEAN_MS=20' 'STUB_ITL_MEAN_FROM=0' \
-    'GREP:published_fixed_run: pass 1: .*past the 10% band' \
+    'GREP:fixed_run: pass 1: .*past the 10% band' \
     'GREP:over the fixed prompt.s decode window' \
     'NOGREP:sampling: ' \
-    'NOGREP:published_aggregate'
+    'NOGREP:^aggregate: '
 no_result
 verdict
 
@@ -1471,7 +1469,7 @@ verdict
 
 # ── The inputs ────────────────────────────────────────────────────────────────
 
-# The published root is held to `published_samples.py` and no flag turns that
+# The published root is held to `published/samples.py` and no flag turns that
 # off. This runs out of a repo whose prompts/published IS the shrunken copy and
 # passes no --samples-root, so the harness reaches it as the published root and
 # the anchor refuses it. Every other case here measures that same copy through
@@ -1479,7 +1477,7 @@ verdict
 run_case canonical_root_is_verified 1 \
     "the published root is verified, and nothing measured against it can skip that" \
     CANONICAL:1 \
-    'GREP:manifest count is 1 and disagrees with published_samples.py' \
+    'GREP:manifest count is 1 and disagrees with samples.py' \
     'GREP:do not re-derive from what'
 no_result
 verdict
@@ -1493,7 +1491,7 @@ run_case override_root_is_marked_unverified 0 \
 verdict
 
 # The cell table and the sample sets can drift apart two ways, and neither is
-# reachable by editing a manifest: `published_samples.py verify` pins the
+# reachable by editing a manifest: `published/samples.py verify` pins the
 # manifest's dataset keys to its own source list first. The drift is a cell
 # table that stopped matching a rebuilt sample root, so these two drive the
 # renderer against roots that hold what such a rebuild would produce.
@@ -1509,7 +1507,7 @@ payload_case() { # payload_case <name> <want-exit> <what-it-proves> <grep> <cell
     mkdir -p "${dir}"
     local cell_args=() c
     for c in "$@"; do cell_args+=(--cell "$c"); done
-    python3 "${REPO_ROOT}/scripts/lib/published_payloads.py" \
+    python3 "${REPO_ROOT}/scripts/published/payloads.py" \
         --samples-root "${SAMPLES}" --out "${dir}" --model-id stub \
         --index "${dir}/index.tsv" "${cell_args[@]}" >"${CASE_OUT}" 2>&1
     local got=$?
@@ -2670,7 +2668,7 @@ sigterm_case() {
         RMLX_HOME="${CASE_HOME}" \
         STUB_BOUND_FLAG="${CASE_HOME}/stub_bound" \
         STUB_TOKEN_BASE=100 \
-        bash "${FAKE_ROOT}/scripts/spec_bench_published.sh" \
+        bash "${FAKE_ROOT}/scripts/published/bench.sh" \
         "${VERIFIER}" --port "${PORT}" --samples-root "${SAMPLES}" \
         --label selftest-campaign --synthetic-arms --server-stamps >"${CASE_OUT}" 2>&1 &
     local harness=$!

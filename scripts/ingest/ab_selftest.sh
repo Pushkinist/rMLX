@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# perf_ab_ingest_selftest.sh — mutation check for the `ab` mode of scripts/ingest/ingest.py.
+# Recall test for the ingest entry's ab mode: dry-run records and refusals under a stub rmlx.
+#
+# Usage:  bash scripts/ingest/ab_selftest.sh
+# Exit:   0 every case behaved; 1 at least one did not
+#
+# Recall test for: ingest/ingest.py ab
 #
 # WHY THIS EXISTS
 #
@@ -13,12 +18,10 @@
 # a stub `rmlx` binary, in --dry-run, so nothing here can reach `runs.db`. The
 # suite asserts the exit code AND the reason text, because a guard that refuses
 # for the wrong reason is a guard that will stop refusing when that reason moves.
-#
-# Exit codes: 0 — every case behaved; 1 — at least one did not.
 
-set -eu
+set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT="$REPO_ROOT/scripts/ingest/ingest.py"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/rmlx_ab_ingest_selftest.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
@@ -281,7 +284,7 @@ check multi_model_result_refused 1 \
 
 echo ""
 if [[ "$FAILED" -ne 0 ]]; then
-	echo "perf_ab_ingest selftest: FAIL ($FAILED of $((PASSED + FAILED)))" >&2
+	echo "ab_selftest: FAIL ($FAILED of $((PASSED + FAILED)))" >&2
 	exit 1
 fi
-echo "perf_ab_ingest selftest: ok ($PASSED cases)"
+echo "ab_selftest: ok ($PASSED cases)"

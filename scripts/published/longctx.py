@@ -1,5 +1,7 @@
 """The long-context row: one canonical prompt, plain decode, a cold cache.
 
+Module of: published/bench.sh
+
 The protocol's fixed prompt is 1 355 tokens, which says nothing about how time to
 first token and the decode rate grow with the context. The row this builds is the
 same measurement on `prompts/longctx_<size>.json`, one of the checked-in canonical
@@ -38,10 +40,10 @@ import pathlib
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import published_fixed_run  # noqa: E402
-from published_samples import body_sha256  # noqa: E402
+import fixed_run  # noqa: E402
+import payloads  # noqa: E402
+from samples import body_sha256  # noqa: E402
 
 # How far the server's count may sit from the size the file was built for.
 SIZE_TOLERANCE = 0.25
@@ -56,21 +58,13 @@ def ctx_ceiling(target_tokens, max_tokens):
     return target_tokens + target_tokens // 4 + max_tokens
 
 
-def payload(args):
+def write_payload(args):
     path = pathlib.Path(args.file)
     blob = path.read_bytes()
     doc = json.loads(blob)
     messages = doc["messages"]
     target = int(doc["target_tokens"])
-    body = {
-        "model": args.model_id,
-        "messages": messages,
-        "max_tokens": args.max_tokens,
-        "enable_thinking": True,
-        "temperature": 0,
-        "stream": True,
-        "stream_options": {"include_usage": True},
-    }
+    body = payloads.payload(args.model_id, messages, args.max_tokens, temperature=0)
     pathlib.Path(args.out).write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
     meta = {
         "label": doc["label"],
@@ -91,9 +85,9 @@ def run(args):
     rows = engine["requests"]
     if len(rows) != 1:
         raise RunError(f"the engine reported {len(rows)} requests for this run, not one")
-    client = published_fixed_run.read_kv(args.client)
+    client = fixed_run.read_kv(args.client)
     what = f"the {meta['label']} prompt"
-    figures = published_fixed_run.cold_request(rows[0], client, what, args.cross_check_pct)
+    figures = fixed_run.cold_request(rows[0], client, what, args.cross_check_pct)
 
     target = meta["target_tokens"]
     off = abs(figures["prompt_tokens"] - target) / target
@@ -103,15 +97,11 @@ def run(args):
             f"{off * 100:.0f}% away from the {target} it was built for and past the "
             f"{SIZE_TOLERANCE * 100:.0f}% allowed: this is not a prompt of that size"
         )
-    phys, rss, samples = published_fixed_run.peak_memory(args.memory, f"{what}'s request")
     return {
         "pass": args.pass_number,
         **meta,
         **figures,
-        "phys_footprint_bytes": phys,
-        "rss_bytes": rss,
-        "memory_samples": samples,
-        "memory_poll_ms": args.memory_poll_ms,
+        **fixed_run.memory_fields(args, f"{what}'s request"),
     }
 
 
@@ -127,26 +117,20 @@ def main():
     pl.add_argument("--meta", required=True, help="where to write what the file holds")
 
     rn = sub.add_parser("run", help="assemble one run")
-    rn.add_argument("--engine", required=True, help="published_run_log.py output")
-    rn.add_argument("--client", required=True, help="the client-side key=value block")
-    rn.add_argument("--memory", required=True, help="the memory poll file")
-    rn.add_argument("--meta", required=True, help="the payload step's meta")
-    rn.add_argument("--pass-number", type=int, required=True, dest="pass_number")
-    rn.add_argument("--memory-poll-ms", type=int, required=True)
-    rn.add_argument("--cross-check-pct", type=float, default=10.0)
+    fixed_run.add_run_arguments(rn, "--meta", "the payload step's meta")
 
     args = ap.parse_args()
     try:
         if args.command == "payload":
-            payload(args)
+            write_payload(args)
         else:
             json.dump(run(args), sys.stdout)
             print()
-    except (RunError, published_fixed_run.RunError) as exc:
-        print(f"published_longctx: {exc}", file=sys.stderr)
+    except (RunError, fixed_run.RunError) as exc:
+        print(f"longctx: {exc}", file=sys.stderr)
         return 1
     except (OSError, KeyError, ValueError) as exc:
-        print(f"published_longctx: cannot read an input: {exc!r}", file=sys.stderr)
+        print(f"longctx: cannot read an input: {exc!r}", file=sys.stderr)
         return 2
     return 0
 

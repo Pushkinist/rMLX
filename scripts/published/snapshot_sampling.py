@@ -1,5 +1,7 @@
 """Read the sampling defaults a snapshot states, for a run that sends none.
 
+Module of: published/bench.sh
+
 The published protocol measures a checkpoint under its own sampling, and the way
 to send a checkpoint's own sampling is to send no sampling field at all: the
 engine then resolves request > server default > `generation_config.json` >
