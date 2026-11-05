@@ -11,10 +11,10 @@
 #     a measured run's status apart from its record's (`landed` or `pending`).
 #   - bench_codec_cell.sh, the bench_cache_types.sh smoke probes and
 #     eval/wikitext2_ppl.py keep a reading whose record did not land (exit 75).
-#   - ingest/codec_inertness_ingest.py skips a row the probe already recorded,
+#   - ingest/ingest.py codec-inertness skips a row the probe already recorded,
 #     refuses a snapshot with no recordable label, and refuses a recorder built
 #     before the run class before writing anything.
-#   - ingest/llama_bench_ingest.py refuses that recorder before writing anything,
+#   - ingest/ingest.py llama-bench refuses that recorder before writing anything,
 #     queues its records under $RMLX_HOME, and records through the checkout's
 #     build rather than an `rmlx` on PATH.
 #
@@ -257,14 +257,14 @@ print(" ".join("%s:%s/%s/%s" % (c, rows[c]["exit_code"], rows[c]["recorded_run_c
 	bad="${bad:+$bad; }exit_code/recorded_run_class/record_status = '$columns'"
 verdict probe_keeps_measured_runs_apart_from_their_records "a measured run keeps exit_code 0 whatever its record did; a pending record is named and ends the probe 75" "$bad"
 
-# ── codec_inertness_ingest.py ─────────────────────────────────────────────────
+# ── ingest.py codec-inertness ─────────────────────────────────────────────────
 #
 # Over the probe's own CSV: the landed row and the pending one are both
 # recorded (the replay writes the pending one), and the run that did not
 # measure has nothing to write, so nothing is promoted.
-INGEST="$REPO_ROOT/scripts/ingest/codec_inertness_ingest.py"
+INGEST="$REPO_ROOT/scripts/ingest/ingest.py"
 set +e
-out="$(RMLX_HOME="$WORK/home" python3 "$INGEST" --dry-run "$CSV" --models-root "$WORK/models" \
+out="$(RMLX_HOME="$WORK/home" python3 "$INGEST" codec-inertness --dry-run "$CSV" --models-root "$WORK/models" \
 	--backend-version 9.9.9 --build-profile release-perf 2>&1)"
 status=$?
 set -e
@@ -285,7 +285,7 @@ w = csv.DictWriter(open(sys.argv[2], "w", newline=""), fieldnames=cols, extrasac
 w.writeheader()
 w.writerows(rows)' "$CSV" "$LEGACY"
 set +e
-out="$(RMLX_HOME="$WORK/home" python3 "$INGEST" --dry-run "$LEGACY" --models-root "$WORK/models" \
+out="$(RMLX_HOME="$WORK/home" python3 "$INGEST" codec-inertness --dry-run "$LEGACY" --models-root "$WORK/models" \
 	--backend-version 9.9.9 --build-profile release-perf 2>&1)"
 status=$?
 set -e
@@ -306,7 +306,7 @@ for snap in $(python3 -c 'import csv,sys; print(" ".join(sorted({r["model"] for 
 	printf '{"quantization": {"mode": "mxfp6", "bits": 6, "group_size": 32}}\n' >"$WORK/models_mxfp6/$snap/config.json"
 done
 set +e
-out="$(RMLX_HOME="$WORK/home" python3 "$INGEST" --dry-run "$LEGACY" --models-root "$WORK/models_mxfp6" \
+out="$(RMLX_HOME="$WORK/home" python3 "$INGEST" codec-inertness --dry-run "$LEGACY" --models-root "$WORK/models_mxfp6" \
 	--backend-version 9.9.9 --build-profile release-perf 2>&1)"
 status=$?
 set -e
@@ -320,7 +320,7 @@ OLD_RECORDER="$WORK/rmlx_old"
 printf '#!/usr/bin/env bash\necho "      --file <FILE>"\n' >"$OLD_RECORDER"
 chmod +x "$OLD_RECORDER"
 set +e
-out="$(RMLX_HOME="$WORK/home" python3 "$INGEST" --record "$LEGACY" --rmlx-bin "$OLD_RECORDER" --models-root "$WORK/models" \
+out="$(RMLX_HOME="$WORK/home" python3 "$INGEST" codec-inertness --record "$LEGACY" --rmlx-bin "$OLD_RECORDER" --models-root "$WORK/models" \
 	--backend-version 9.9.9 --build-profile release-perf 2>&1)"
 status=$?
 set -e
@@ -330,14 +330,14 @@ grep -q "rmlx_old has no \`metrics record --run-class\`" <<<"$out" || bad="${bad
 [ ! -d "$WORK/home/bench/codec_inertness/records" ] || bad="${bad:+$bad; }records were staged before the refusal"
 verdict ingest_refuses_a_classless_recorder "a recorder without --run-class is refused before anything is written" "$bad"
 
-# ── llama_bench_ingest.py ─────────────────────────────────────────────────────
+# ── ingest.py llama-bench ─────────────────────────────────────────────────────
 #
 mkdir -p "$WORK/oldbin" "$WORK/llama_root"
 cp "$OLD_RECORDER" "$WORK/oldbin/rmlx"
 printf '[]\n' >"$WORK/llama_bench.json"
 set +e
-out="$(RMLX_HOME="$WORK/llama_home0" RMLX_REPO_ROOT="$WORK/llama_root" \
-	python3 "$REPO_ROOT/scripts/ingest/llama_bench_ingest.py" "$WORK/llama_bench.json" --record \
+out="$(RMLX_HOME="$WORK/llama_home0" \
+	python3 "$REPO_ROOT/scripts/ingest/ingest.py" llama-bench "$WORK/llama_bench.json" --record \
 	--rmlx-bin "$WORK/oldbin/rmlx" 2>&1)"
 status=$?
 set -e
@@ -353,8 +353,8 @@ cat >"$WORK/llama_row.json" <<'ROW'
   "stddev_ts": 0.5, "build_commit": "abc1234", "n_gpu_layers": 99}]
 ROW
 set +e
-RMLX_HOME="$WORK/llama_home" RMLX_REPO_ROOT="$WORK/llama_root" \
-	python3 "$REPO_ROOT/scripts/ingest/llama_bench_ingest.py" "$WORK/llama_row.json" \
+RMLX_HOME="$WORK/llama_home" \
+	python3 "$REPO_ROOT/scripts/ingest/ingest.py" llama-bench "$WORK/llama_row.json" \
 	>"$WORK/llama_queue.out" 2>&1
 status=$?
 set -e
@@ -376,12 +376,13 @@ STUB
 	chmod +x "$1"
 }
 make_logging_recorder "$WORK/pathbin/rmlx" path
-make_logging_recorder "$WORK/llama_root2/target/release/rmlx" checkout
+CHECKOUT_RMLX="$WORK/llama_root2/target/release/rmlx"
+make_logging_recorder "$CHECKOUT_RMLX" checkout
 : >"$WORK/llama_recorder.log"
 set +e
-PATH="$WORK/pathbin:$PATH" RMLX_HOME="$WORK/llama_home2" RMLX_REPO_ROOT="$WORK/llama_root2" \
-	python3 "$REPO_ROOT/scripts/ingest/llama_bench_ingest.py" "$WORK/llama_row.json" --record \
-	>"$WORK/llama_record.out" 2>&1
+PATH="$WORK/pathbin:$PATH" RMLX_HOME="$WORK/llama_home2" \
+	python3 "$REPO_ROOT/scripts/ingest/ingest.py" llama-bench "$WORK/llama_row.json" --record \
+	--rmlx-bin "$CHECKOUT_RMLX" >"$WORK/llama_record.out" 2>&1
 set -e
 bad=""
 used="$(sort -u "$WORK/llama_recorder.log" | tr '\n' ' ')"
@@ -498,8 +499,8 @@ BROKEN_RECORDER="$WORK/rmlx_broken"
 printf '#!/usr/bin/env bash\necho "dyld: library not loaded" >&2\nexit 2\n' >"$BROKEN_RECORDER"
 chmod +x "$BROKEN_RECORDER"
 set +e
-out="$(RMLX_HOME="$WORK/llama_home3" RMLX_REPO_ROOT="$WORK/llama_root" \
-	python3 "$REPO_ROOT/scripts/ingest/llama_bench_ingest.py" "$WORK/llama_bench.json" --record \
+out="$(RMLX_HOME="$WORK/llama_home3" \
+	python3 "$REPO_ROOT/scripts/ingest/ingest.py" llama-bench "$WORK/llama_bench.json" --record \
 	--rmlx-bin "$BROKEN_RECORDER" 2>&1)"
 set -e
 bad=""

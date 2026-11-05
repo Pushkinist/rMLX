@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# perf_ab_ingest_selftest.sh — mutation check for scripts/ingest/perf_ab_ingest.py.
+# perf_ab_ingest_selftest.sh — mutation check for the `ab` mode of scripts/ingest/ingest.py.
 #
 # WHY THIS EXISTS
 #
@@ -19,7 +19,7 @@
 set -eu
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SCRIPT="$REPO_ROOT/scripts/ingest/perf_ab_ingest.py"
+SCRIPT="$REPO_ROOT/scripts/ingest/ingest.py"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/rmlx_ab_ingest_selftest.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -103,7 +103,7 @@ check() {
 	done
 	local out="$WORK/$name.log" got=0
 	set +e
-	python3 "$SCRIPT" --dry-run "$result" \
+	python3 "$SCRIPT" ab --dry-run "$result" \
 		--model snap --model-namespace mlx-community --weight-quant mxfp8 \
 		--arm-a-kv-quant none --arm-b-kv-quant mixed_k8g64_v4g64 \
 		--rmlx-bin "$STUB" ${keep[@]+"${keep[@]}"} ${args[@]+"${args[@]}"} >"$out" 2>&1
@@ -246,7 +246,7 @@ check keep_arm_is_required 2 \
 # `--run-class`, as a binary built before the run class would.
 REC_HOME="$WORK/recorder_home"
 set +e
-RMLX_HOME="$REC_HOME" python3 "$SCRIPT" --record "$CLEAN" \
+RMLX_HOME="$REC_HOME" python3 "$SCRIPT" ab --record "$CLEAN" \
 	--model snap --model-namespace mlx-community --weight-quant mxfp8 \
 	--arm-a-kv-quant none --arm-b-kv-quant mixed_k8g64_v4g64 --keep-arm A \
 	--rmlx-bin "$STUB" >"$WORK/recorder.log" 2>&1

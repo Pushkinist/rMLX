@@ -456,7 +456,7 @@ check "a half-recorded tainted run exits 4" 4 "TAINTED"
 HALF_BAD=""
 grep -q 'not recorded: .*llama_cpp_tq' <<<"$OUT" || HALF_BAD="the record that did not land is not named"
 grep -q 'metrics record --file' <<<"$OUT" || HALF_BAD="${HALF_BAD:+$HALF_BAD; }no command to record it"
-grep -q 're-run scripts/ingest/llama_ab_ingest.py' <<<"$OUT" && HALF_BAD="${HALF_BAD:+$HALF_BAD; }the run says to re-run the ingest"
+grep -q 're-run scripts/ingest/ingest.py' <<<"$OUT" && HALF_BAD="${HALF_BAD:+$HALF_BAD; }the run says to re-run the ingest"
 grep -q 'not recorded: .*-llama_cpp-' <<<"$OUT" && HALF_BAD="${HALF_BAD:+$HALF_BAD; }arm A, which landed, is named as not recorded"
 if [ -z "$HALF_BAD" ]; then
 	echo "  PASS  a half-recorded run names the record that did not land, and how to record it alone"
@@ -470,7 +470,7 @@ fi
 # The ingest checks its recorder on the real path too, not only under
 # --check-args: a classless recorder is refused before anything is staged.
 POST_HOME="$WORK/home/post_check"
-POST_OUT="$(RMLX_HOME="$POST_HOME" python3 "$ROOT/scripts/ingest/llama_ab_ingest.py" "$(printf '%s' "$OUT" | sed -n 's/^result     //p' | tail -1)" \
+POST_OUT="$(RMLX_HOME="$POST_HOME" python3 "$ROOT/scripts/ingest/ingest.py" ab --harness llama "$(printf '%s' "$OUT" | sed -n 's/^result     //p' | tail -1)" \
 	--prompt-file "$PROMPT" --accept-tainted --record --rmlx-bin "$OLD_RECORDER" $RECORD_ARGS_REAL 2>&1)"
 POST_CODE=$?
 if [ "$POST_CODE" -ne 0 ] && grep -q "claim_rmlx_old has no \`metrics record --run-class\`" <<<"$POST_OUT" &&
@@ -485,7 +485,7 @@ fi
 
 # --keep-arm writes the surviving arm alone, as gate, under its own backend.
 REAL_RESULT="$(printf '%s' "$OUT" | sed -n 's/^result     //p' | tail -1)"
-KEEP_OUT="$(python3 "$ROOT/scripts/ingest/llama_ab_ingest.py" --dry-run "$REAL_RESULT" \
+KEEP_OUT="$(python3 "$ROOT/scripts/ingest/ingest.py" ab --harness llama --dry-run "$REAL_RESULT" \
 	--prompt-file "$PROMPT" --accept-tainted --keep-arm B $RECORD_ARGS_REAL 2>&1)"
 KEEP_RECORDS="$(grep -c '"schema_version"' <<<"$KEEP_OUT" || true)"
 if [ "$KEEP_RECORDS" = 1 ] && grep -q '"run_class": "gate"' <<<"$KEEP_OUT" &&
@@ -523,7 +523,7 @@ check "a busy host is refused before anything is measured" 125 "host is not quie
 run_ab --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2
 SYNTH_RESULT="$(printf '%s' "$OUT" | sed -n 's/^result     //p' | tail -1)"
 if [ -n "$SYNTH_RESULT" ] && [ -r "$SYNTH_RESULT" ]; then
-	INGEST_OUT="$(python3 "$ROOT/scripts/ingest/llama_ab_ingest.py" --dry-run "$SYNTH_RESULT" \
+	INGEST_OUT="$(python3 "$ROOT/scripts/ingest/ingest.py" ab --harness llama --dry-run "$SYNTH_RESULT" \
 		--prompt-file "$PROMPT" --prompt-name selftest --model stub \
 		--weight-quant mxfp8 --arm-a-backend llama.cpp --arm-b-backend llama.cpp \
 		--arm-a-kv-quant none --arm-b-kv-quant none 2>&1)"

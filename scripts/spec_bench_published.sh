@@ -85,7 +85,7 @@
 #                            table, the client's reading of every request, the
 #                            memory poll, the fixed-prompt run, the server's run
 #                            log (`serve.jsonl`) and its stdout
-#       records/             what `ingest/published_ingest.py` staged for runs.db
+#       records/             what `ingest/ingest.py published` staged for runs.db
 #       db_summary.json      the figures re-queried from runs.db after recording
 #     summary.md             the table, from `lib/published_table.py --out`
 #
@@ -197,7 +197,7 @@
 # `--server-stamps` is the other declaration a self-test makes. The client rate
 # is then read from the stub's own stamps, which makes the cross-check compare
 # the stub with itself. The result says so in `protocol.client_clock`, and
-# `ingest/published_ingest.py` refuses any result whose clock is not `client`.
+# `ingest/ingest.py published` refuses any result whose clock is not `client`.
 #
 # Exit codes:
 #   0   — three passes ran and every mean is within the range band
@@ -1174,7 +1174,7 @@ set -e
 echo ""
 echo "sampling: ${SAMPLING_SEEN}  (read back from the engine)"
 echo "result: ${RESULT}"
-echo "  record it:  python3 scripts/ingest/published_ingest.py --record ${RESULT} --git-sha <sha>"
+echo "  record it:  python3 scripts/ingest/ingest.py published --record ${RESULT} --git-sha <sha>"
 echo "  render it:  python3 scripts/lib/published_table.py ${CAMPAIGN_ROOT}/${LABEL}/*/result.json --model ${VERIFIER_MODEL} [--ppl <rmlx eval ppl line>] --out ${CAMPAIGN_ROOT}/${LABEL}/summary.md"
 if $UNVERIFIED_SAMPLES; then
     echo "UNVERIFIED SAMPLES: not a published measurement, not recordable."

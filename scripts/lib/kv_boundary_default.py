@@ -1,5 +1,7 @@
 """The engine's default KV boundary-layer counts, read from the engine.
 
+Module of: ingest/ingest.py
+
 `rmlx_core::kv_boundary` is the one definition of these numbers — it exists so
 that `rmlx-models` (which applies them) and `rmlx-metrics` (which has to
 recognise a `decode_config` spelling them out) cannot drift apart. A Python

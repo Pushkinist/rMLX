@@ -153,13 +153,13 @@ measurement.** It declares the arms are stubs, for a caller that checks this
 script's own logic. The machine is then not consulted: no quiescence probe, no
 interference sampling, no exclusivity check and no load average. The run says
 so in its header, on every slot line and in `waivers.synthetic_arms`.
-`scripts/ingest/perf_ab_ingest.py` refuses such a result with no waiver. The
+`scripts/ingest/ingest.py ab` refuses such a result with no waiver. The
 arm-reading guards still apply.
 
 The boundary lives in `scripts/lib/cpu_snapshot.sh`, as `snapshot_ok` and
 `window_not_sampled`. `scripts/bench_llama_ab.sh` takes the same
 `--synthetic-arms` flag through it. Its result file carries `synthetic_arms`,
-and `scripts/ingest/llama_ab_ingest.py` refuses that result with no waiver. A
+and `scripts/ingest/ingest.py ab --harness llama` refuses that result with no waiver. A
 real `bench_llama_ab.sh` run ends by handing its result to that ingest, which
 records both arms as `ab_arm` rows under the identity `--record-args` carries;
 `--keep-arm A|B` on a second run of the ingest records the surviving arm as
@@ -195,7 +195,7 @@ per arm. A `--synthetic-arms` run passes `--metrics off` to every slot and
 records nothing. A slot whose record does not land keeps its reading and the
 verdict, names its buffer file, and ends the run 75 when nothing else failed.
 Promoting the surviving
-arm is a separate step: `scripts/ingest/perf_ab_ingest.py --keep-arm A|B`
+arm is a separate step: `scripts/ingest/ingest.py ab --keep-arm A|B`
 turns one result file into one `gate` RunRecord (`docs/METRICS_DB.md` §8.5;
 `decode_tps_warm`, `kv_cache_bytes`) for that arm, whose slots are already
 `ab_arm` rows. It refuses a TAINTED run unless told otherwise, and carries the

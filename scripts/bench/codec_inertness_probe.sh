@@ -32,7 +32,7 @@
 # Every run is recorded in runs.db by `rmlx baseline --record --run-class
 # diagnostic --label codec_inertness:<ts>:<codec>`, so its rows reach no
 # champion and no gate. The CSV's `recorded_run_class` and `record_status`
-# columns say so per row (below), and `codec_inertness_ingest.py` skips such a
+# columns say so per row (below), and `ingest/ingest.py codec-inertness` skips such a
 # row rather than write its `kv_cache_bytes` a second time.
 #
 # Usage:
@@ -55,13 +55,13 @@
 # (`baseline` exit 75; its buffer file is printed for `rmlx metrics record
 # --replay-pending`), and empty for a run that did not measure.
 # `recorded_run_class` is `diagnostic` for both `landed` and `pending` rows,
-# which `codec_inertness_ingest.py` therefore never promotes: the replay
+# which `ingest/ingest.py codec-inertness` therefore never promotes: the replay
 # writes a pending one once. The probe ends 75 when any record is pending.
 #
 # `kv_boundary` is the `--kv-boundary-layers` value the sweep ran at, empty for
 # the engine default. It is a cell-identity term, not context: a sweep at a
 # different head/tail count is not another measurement of the same cell, and
-# `codec_inertness_ingest.py` reads this column to say so.
+# `ingest/ingest.py codec-inertness` reads this column to say so.
 #
 # `prompt_tokens` is the fixture NAME (`--prompt-tokens 4096` selects
 # `prompts/longctx_4k.json`); `prompt_tokens_measured` is what the run actually

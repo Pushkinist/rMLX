@@ -791,7 +791,7 @@ def provenance_block(results: list[dict], snapshot: Path) -> list[str]:
     out += [
         "",
         "Every per-sample row behind these means is recordable into `runs.db` by",
-        "`scripts/ingest/published_ingest.py`, which is a separate and explicit",
+        "`scripts/ingest/ingest.py published`, which is a separate and explicit",
         "step: a measurement and a record are different acts, and `observations`",
         "is append-only.",
         "",

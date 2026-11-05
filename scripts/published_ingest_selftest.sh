@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # published_ingest_selftest.sh — mutation check for
-# scripts/ingest/published_ingest.py.
+# the `published` mode of scripts/ingest/ingest.py.
 #
 # WHY THIS EXISTS
 #
@@ -25,7 +25,7 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-INGEST="${REPO_ROOT}/scripts/ingest/published_ingest.py"
+INGEST="${REPO_ROOT}/scripts/ingest/ingest.py"
 PUBLISHED="${REPO_ROOT}/prompts/published"
 
 [ -r "${INGEST}" ] || { echo "ERROR: missing ${INGEST}" >&2; exit 2; }
@@ -395,9 +395,9 @@ PY
     fi
 
     rm -f "${WORK}/recorded.txt"
-    env RMLX_HOME="${CASE_HOME}" RMLX_REPO_ROOT="${REPO_ROOT}" \
+    env RMLX_HOME="${CASE_HOME}" \
         STUB_RECORDED="${WORK}/recorded.txt" \
-        python3 "${INGEST}" "${CASE_RESULT}" \
+        python3 "${INGEST}" published "${CASE_RESULT}" \
         --rmlx-bin "${STUB_RMLX}" \
         ${extra_args[@]+"${extra_args[@]}"} >"${CASE_OUT}" 2>&1
     local got=$?

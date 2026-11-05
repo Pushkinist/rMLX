@@ -83,7 +83,6 @@ BUDGET_S=$((BUDGET_MIN * 60))
 RMLX_HOME="${RMLX_HOME:-${RMLX_DIR}/.rmlx}"
 export RMLX_HOME
 export RMLX_METRICS_DB="${RMLX_HOME}/metrics/runs.db"
-export RMLX_REPO_ROOT="${RMLX_DIR}"
 
 # --- env-var override resolution -------------------------------------------
 # Detect cache-type mode: any of the new env vars set?
@@ -570,7 +569,7 @@ case "$BACKEND" in
     # `model` field, so this is a label, not a lookup key. Strip the `.gguf`
     # extension: the CBB harness derives the recorded `model` column from it,
     # and `Qwen3-8B-Q8_0.gguf` would become a second champion for the cell that
-    # `scripts/ingest/llama_ab_ingest.py` already records as `Qwen3-8B-Q8_0`.
+    # `scripts/ingest/ingest.py ab --harness llama` already records as `Qwen3-8B-Q8_0`.
     HARNESS_MODEL="$(basename "$MODEL_PATH" .gguf)"
     # The measured binary's own commit, not the literal "head" the other arms
     # pass. A version column that says "head" for every run of every build
@@ -579,7 +578,7 @@ case "$BACKEND" in
     # NOTE: the CBB legacy path still derives `model_namespace` itself, from the
     # `--model-path` basename, so these cells land under `local` while the A/B
     # ingest path records them under `hf`. That split lives in the sibling
-    # harness, not here. `bench_llama_ab.sh` + `llama_ab_ingest.py` is the
+    # harness, not here. `bench_llama_ab.sh` + `ingest/ingest.py` is the
     # canonical recorder for GGUF cells; this arm is a smoke/coverage path.
     ;;
   *)

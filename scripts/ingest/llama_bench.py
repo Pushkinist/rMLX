@@ -1,27 +1,29 @@
-#!/usr/bin/env python3
 """Ingest llama-bench JSON output into the rMLX metrics DB.
+
+Module of: ingest/ingest.py
+Exit:   0 done; 1 the input cannot be read or is not JSON
 
 Converts `llama-bench -o json` result rows into the §8.5 universal ingest
 record shape and writes each one to `<RMLX_HOME>/metrics/buffer/pending/` for
 pickup by `rmlx metrics record --file <path>`. `--record` records through
-`--rmlx-bin`, by default the checkout's `target/release/rmlx`, never an `rmlx`
+`--rmlx-bin`, by default the checkout's release build, never an `rmlx`
 found on PATH.
 
-Usage:
+Examples:
     # Write pending buffer file(s) only — human can inspect before ingest:
-    python3 scripts/ingest/llama_bench_ingest.py llama_bench_output.json
+    python3 scripts/ingest/ingest.py llama-bench llama_bench_output.json
 
     # Write buffer file then immediately call `rmlx metrics record`:
-    python3 scripts/ingest/llama_bench_ingest.py --record llama_bench_output.json
+    python3 scripts/ingest/ingest.py llama-bench --record llama_bench_output.json
 
     # Read from stdin:
-    llama-bench -o json ... | python3 scripts/ingest/llama_bench_ingest.py -
+    llama-bench -o json ... | python3 scripts/ingest/ingest.py llama-bench -
 
     # Override hardware tag (default: m5_max_128gb):
-    python3 scripts/ingest/llama_bench_ingest.py --hardware-tag m4_max_64gb run.json
+    python3 scripts/ingest/ingest.py llama-bench --hardware-tag m4_max_64gb run.json
 
     # Dry-run: print the §8.5 JSON records without writing files:
-    python3 scripts/ingest/llama_bench_ingest.py --dry-run run.json
+    python3 scripts/ingest/ingest.py llama-bench --dry-run run.json
 
 Input:
     llama-bench -o json produces a JSON array of result objects.  Each object
@@ -59,7 +61,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 import time
@@ -67,21 +68,17 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from recorder_check import require_run_class_recorder
+from rmlx_home import rmlx_home
+from snapshot_identity import split_model_dir
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
-# rMLX repo root: this file lives at scripts/ingest/llama_bench_ingest.py.
-_SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(_SCRIPT_DIR.parent / "lib"))
-from recorder_check import require_run_class_recorder  # noqa: E402
-from rmlx_home import rmlx_home  # noqa: E402
-from snapshot_identity import split_model_dir  # noqa: E402
-RMLX_REPO_ROOT = Path(os.environ.get("RMLX_REPO_ROOT", str(_SCRIPT_DIR.parents[1])))
+REPO_ROOT = Path(__file__).resolve().parents[2]
 # Runtime state lives under a single root (CLAUDE.md). `RMLX_HOME` wins; the
 # in-repo `.rmlx/` is the dev default. The recorder resolves the DB itself.
-RMLX_HOME = rmlx_home(RMLX_REPO_ROOT)
-_BUFFER_PENDING = RMLX_HOME / "metrics" / "buffer" / "pending"
-_BUFFER_FAILED = RMLX_HOME / "metrics" / "buffer" / "failed"
+_BUFFER_PENDING = rmlx_home(REPO_ROOT) / "metrics" / "buffer" / "pending"
+_BUFFER_FAILED = rmlx_home(REPO_ROOT) / "metrics" / "buffer" / "failed"
 
 DEFAULT_HARDWARE_TAG = "m5_max_128gb"
 
@@ -406,7 +403,7 @@ def _invoke_recorder(record_path: Path, rmlx_bin: str) -> bool:
     except OSError:
         pass
     print(
-        f"[llama_bench_ingest] WARN: recorder rejected record; "
+        f"[llama_bench] WARN: recorder rejected record; "
         f"see {failed_path}\n  stderr: {result.stderr.strip()[:400]}",
         file=sys.stderr,
     )
@@ -432,7 +429,7 @@ def ingest(
         p = Path(source_path)
         if not p.exists():
             print(
-                f"[llama_bench_ingest] ERROR: input file not found: {source_path}",
+                f"[llama_bench] ERROR: input file not found: {source_path}",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -442,7 +439,7 @@ def ingest(
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
         print(
-            f"[llama_bench_ingest] ERROR: invalid JSON: {exc}",
+            f"[llama_bench] ERROR: invalid JSON: {exc}",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -452,7 +449,7 @@ def ingest(
         data = [data]
 
     if not data:
-        print("[llama_bench_ingest] WARN: empty input — no rows to ingest", file=sys.stderr)
+        print("[llama_bench] WARN: empty input — no rows to ingest", file=sys.stderr)
         return 0
 
     # Group rows by (model, quant, config) to merge prefill + decode pairs.
@@ -460,7 +457,7 @@ def ingest(
     for row in data:
         if not isinstance(row, dict):
             print(
-                f"[llama_bench_ingest] WARN: skipping non-object row: {row!r}",
+                f"[llama_bench] WARN: skipping non-object row: {row!r}",
                 file=sys.stderr,
             )
             continue
@@ -473,7 +470,7 @@ def ingest(
             payload = _build_record(rows, hardware_tag)
         except ValueError as exc:
             print(
-                f"[llama_bench_ingest] WARN: skipping group {key}: {exc}",
+                f"[llama_bench] WARN: skipping group {key}: {exc}",
                 file=sys.stderr,
             )
             continue
@@ -484,19 +481,20 @@ def ingest(
             continue
 
         record_path = _write_pending(payload)
-        print(f"[llama_bench_ingest] wrote {record_path}", flush=True)
+        print(f"[llama_bench] wrote {record_path}", flush=True)
 
         if rmlx_bin is not None:
             ok = _invoke_recorder(record_path, rmlx_bin)
             if ok:
-                print(f"[llama_bench_ingest] recorded OK", flush=True)
+                print("[llama_bench] recorded OK", flush=True)
         n_written += 1
 
     return n_written
 
 
-def main() -> None:
+def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
+        prog="ingest.py llama-bench",
         description=(
             "Ingest llama-bench -o json output into the rMLX metrics DB.\n\n"
             "Writes §8.5 universal JSON records to metrics/buffer/pending/.\n"
@@ -523,7 +521,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--rmlx-bin",
-        default=str(RMLX_REPO_ROOT / "target" / "release" / "rmlx"),
+        default=str(REPO_ROOT / "target" / "release" / "rmlx"),
         help="the rmlx that records with --record (default: the checkout's release build)",
     )
     parser.add_argument(
@@ -531,7 +529,7 @@ def main() -> None:
         default=DEFAULT_HARDWARE_TAG,
         help=f"hardware_tag for the observations (default: {DEFAULT_HARDWARE_TAG}).",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.dry_run and args.record:
         parser.error("--dry-run and --record are mutually exclusive")
@@ -544,8 +542,5 @@ def main() -> None:
         rmlx_bin=args.rmlx_bin if args.record else None,
         dry_run=args.dry_run,
     )
-    print(f"[llama_bench_ingest] done: {n} record(s) processed", flush=True)
-
-
-if __name__ == "__main__":
-    main()
+    print(f"[llama_bench] done: {n} record(s) processed", flush=True)
+    return 0

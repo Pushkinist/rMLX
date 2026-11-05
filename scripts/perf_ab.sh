@@ -42,7 +42,7 @@
 # exercise of this script's own logic and not a measurement of anything. The
 # machine is then not consulted at all -- no quiescence probe, no interference
 # sampling, no Metal-exclusivity check -- and the run says so on stdout and in
-# `waivers.synthetic_arms`, which `ingest/perf_ab_ingest.py` refuses outright.
+# `waivers.synthetic_arms`, which `ingest/ingest.py ab` refuses outright.
 # The arm-reading preconditions are untouched by it. The machine is read in
 # exactly four places -- `probe_host`, `snapshot_ok`, the exclusivity gate, and
 # the load average recorded as context -- and the flag guards each of them;
@@ -63,7 +63,7 @@
 # `rmlx baseline --record --run-class ab_arm --label perf_ab:<ts>:<A|B>:<slot>`,
 # so `runs.db` keeps the whole comparison and no row of it reaches `bests` or a
 # gate (docs/METRICS_DB.md section 13). Find a run's rows with
-# `notes LIKE 'label=perf_ab:<ts>:%'`. `ingest/perf_ab_ingest.py` promotes the
+# `notes LIKE 'label=perf_ab:<ts>:%'`. `ingest/ingest.py ab` promotes the
 # surviving arm of an accepted comparison as `gate`. A binary built before the
 # run class existed rejects `--run-class`, so each arm's binary is asked once,
 # through `baseline --help`, before the first slot: an arm whose binary lacks

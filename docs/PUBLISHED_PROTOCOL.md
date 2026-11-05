@@ -279,6 +279,6 @@ Thermal state and binary identity, the other two, are under Provenance.
 | `dflash/block=16,dflash/depth=accept_rate` | 2026-09-06T11:00:00Z | — | synthetic — no reading taken off this machine |
 
 Every per-sample row behind these means is recordable into `runs.db` by
-`scripts/ingest/published_ingest.py`, which is a separate and explicit
+`scripts/ingest/ingest.py published`, which is a separate and explicit
 step: a measurement and a record are different acts, and `observations`
 is append-only.

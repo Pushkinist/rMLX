@@ -123,7 +123,6 @@ exit-undeclared eval/wikitext2_ppl.py 1
 exit-undeclared suite/eval_lock_stress.sh 1
 exit-undeclared gen_lloyd_codebook.py 1
 exit-undeclared gpu_capture.sh 1,2
-exit-undeclared ingest/llama_bench_ingest.py 1
 exit-undeclared mst_capture.sh 0,1,2,75
 exit-undeclared perf-iter/bench_decode_tps.sh 1,2
 exit-undeclared perf_ab.sh 0,1,125
@@ -195,8 +194,6 @@ lib-run lib/sse_decode_window.py spec_bench.sh,spec_bench_published.sh,spec_benc
 shebang lib/snapshot_identity.py
 shebang lib/record_pending.sh
 exec-bit bench_identity_selftest.sh
-exec-bit ingest/codec_inertness_ingest.py
-exec-bit ingest/published_ingest.py
 exec-bit perf_ceiling.py
 exec-bit published_ingest_selftest.sh
 dead-path perf_canary.sh regression_gate.sh
@@ -254,12 +251,6 @@ heredoc spec_bench.sh 141
 heredoc spec_bench_published.sh 56
 heredoc spec_bench_published_selftest.sh 34,23
 heredoc ssd_canary.sh 65,50,38
-twin ingest/codec_inertness_ingest.py+ingest/llama_ab_ingest.py 71
-twin ingest/codec_inertness_ingest.py+ingest/perf_ab_ingest.py 80
-twin ingest/codec_inertness_ingest.py+ingest/published_ingest.py 57
-twin ingest/llama_ab_ingest.py+ingest/perf_ab_ingest.py 106
-twin ingest/llama_ab_ingest.py+ingest/published_ingest.py 68
-twin ingest/perf_ab_ingest.py+ingest/published_ingest.py 77
 twin lib/published_run_log.py+lib/spec_round_log.py 42
 twin published_ingest_selftest.sh+published_table_selftest.sh 89
 twin published_ingest_selftest.sh+spec_bench_published_selftest.sh 66
@@ -294,7 +285,6 @@ binary-literal schema_constraint_canary.sh 1
 binary-literal spec_bench.sh 1
 binary-literal spec_bench_published.sh 1
 binary-literal ssd_canary.sh 1
-binary-literal ingest/llama_bench_ingest.py 1
 binary-literal run_class_selftest.sh 5
 env-knob bench/codec_inertness_probe.sh RMLX_BINARY,RMLX_HOME
 env-knob bench_cell.sh CROSS_BENCH_ROOT,CTK,CTV,CTX_MAX,KV_CANON_OVERRIDE,LABEL_PREFIX,LLAMA_CPP_ROOT,LLAMA_CPP_TURBOQUANT_ROOT,MAX_TOKENS,MEASURED_RUNS,MLX_LM_ROOT,MLX_LM_TURBOQUANT_ROOT,OMLX_ROOT,PAROQUANT_ROOT,PROMPT_ID,RMLX_HARDWARE_TAG,RMLX_HOME,RMLX_ROOT,WARMUP_RUNS
@@ -304,11 +294,6 @@ env-knob bench_llama_ab_selftest.sh FORCE_UNMEASURED_ROWS,NO_RECORD_ARGS
 env-knob codec_smoke_runner_selftest.sh GATE_BIN
 env-knob eval/wikitext2_ppl.py RMLX_HOME
 env-knob suite/eval_lock_stress.sh RUNS,TIMEOUT_SECS
-env-knob ingest/codec_inertness_ingest.py RMLX_REPO_ROOT
-env-knob ingest/llama_ab_ingest.py RMLX_REPO_ROOT
-env-knob ingest/llama_bench_ingest.py RMLX_REPO_ROOT
-env-knob ingest/perf_ab_ingest.py RMLX_REPO_ROOT
-env-knob ingest/published_ingest.py RMLX_REPO_ROOT
 env-knob lib/bench_server.sh PORT
 env-knob lib/cpu_snapshot.sh CPU_SNAPSHOT_MIN_ROWS,SYNTHETIC_ARMS
 env-knob lib/identity.sh RMLX_IDENTITY_JSON

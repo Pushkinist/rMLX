@@ -94,7 +94,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         metrics-champions metrics-champions-rmlx \
         build-perf build-debug test-perf ci-perf gpu-test claim-rmlx model-check model-check-full \
         profile-samply profile-samply-debug profile-instruments bench asm perf-iter \
-        canary canary-gate canary-ab canary-ab-selftest canary-ab-ingest-selftest \
+        canary canary-gate canary-ab canary-ab-selftest canary-ab-ingest-selftest ingest-selftest \
         canary-ab-host-gate-fixtures codec-smoke-runner-selftest llama-ab-selftest spec-bench-selftest bench-identity-selftest run-class-selftest \
         spec-bench-published-selftest published-ingest-selftest \
         published-table check-published-table published-table-selftest \
@@ -795,6 +795,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@$(MAKE) --no-print-directory codec-smoke-runner-selftest
 	@$(MAKE) --no-print-directory canary-ab-host-gate-fixtures
 	@$(MAKE) --no-print-directory canary-ab-ingest-selftest
+	@$(MAKE) --no-print-directory ingest-selftest
 	@$(MAKE) --no-print-directory llama-ab-selftest
 	@$(MAKE) --no-print-directory spec-bench-selftest
 	@$(MAKE) --no-print-directory bench-identity-selftest
@@ -1003,6 +1004,9 @@ canary-ab-host-gate-fixtures: ## recall-check the A/B harness's host gates again
 
 canary-ab-ingest-selftest: ## mutation-check the A/B -> runs.db promoter (no GPU, no model, no DB write)
 	bash scripts/perf_ab_ingest_selftest.sh
+
+ingest-selftest: ## recall-check the ingest entry: record fields, refusals and the stage-and-record tail of every mode (stub recorder; no DB write)
+	bash scripts/ingest/ingest_selftest.sh
 
 llama-ab-selftest: ## mutation-check the llama-server A/B harness against a stub server (no GPU, no GGUF)
 	bash scripts/bench_llama_ab_selftest.sh

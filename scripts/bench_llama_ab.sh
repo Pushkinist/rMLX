@@ -37,7 +37,7 @@
 #     overlap the verdict is INCONCLUSIVE, whatever the medians say.
 #
 # EVERY REAL RUN IS RECORDED. At the end of a comparison that is not
-# `--synthetic-arms`, the result is handed to `ingest/llama_ab_ingest.py`, which
+# `--synthetic-arms`, the result is handed to `ingest/ingest.py ab --harness llama`, which
 # writes both arms as `ab_arm` records: they reach no champion and no gate
 # (docs/METRICS_DB.md section 13). A TAINTED run is recorded too, with the taint
 # in `notes`. The identity of the rows (model label, weight quant, each arm's
@@ -60,7 +60,7 @@
 # `--synthetic-arms` declares that the arms are stub servers, so the run is an
 # exercise of this script's own logic and not a measurement. The machine is then
 # not consulted at all, the run says so on stdout and in `synthetic_arms` in the
-# result file, and `ingest/llama_ab_ingest.py` refuses to promote it. The
+# result file, and `ingest/ingest.py` refuses to promote it. The
 # arm-reading preconditions are untouched. The boundary itself is shared with
 # `perf_ab.sh` through `scripts/lib/cpu_snapshot.sh` rather than restated here.
 #
@@ -122,7 +122,7 @@ bench_llama_ab.sh --bin-a P --bin-b P --model GGUF --prompt-file F [options]
   --claim-rmlx PATH        the rmlx binary each slot's server runs under, as
                            `rmlx claim run`, so it holds the Metal claim, and
                            that records the run (default target/release-perf/rmlx)
-  --record-args STR        identity flags for ingest/llama_ab_ingest.py, which
+  --record-args STR        identity flags for ingest/ingest.py, which
                            records both arms as ab_arm rows at the end of a real
                            run: --model, --weight-quant, --arm-a-backend,
                            --arm-b-backend, --arm-a-kv-quant, --arm-b-kv-quant,
@@ -175,9 +175,9 @@ RECORD_ARGV=()
 if [ -n "$RECORD_ARGS" ]; then
 	read -ra RECORD_ARGV <<<"$RECORD_ARGS"
 fi
-INGEST="${REPO_ROOT}/scripts/ingest/llama_ab_ingest.py"
+INGEST="${REPO_ROOT}/scripts/ingest/ingest.py"
 ingest() { # <ingest args...> -- the arguments every recording run of the ingest takes
-	python3 "$INGEST" "$@" --prompt-file "$PROMPT_FILE" --accept-tainted --record \
+	python3 "$INGEST" ab --harness llama "$@" --prompt-file "$PROMPT_FILE" --accept-tainted --record \
 		--rmlx-bin "$CLAIM_RMLX" ${RECORD_ARGV[@]+"${RECORD_ARGV[@]}"}
 }
 [ -x "$CLAIM_RMLX" ] || { echo "no rmlx binary at $CLAIM_RMLX (make build-perf, or --claim-rmlx)" >&2; exit 125; }

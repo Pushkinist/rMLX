@@ -70,8 +70,8 @@ error; a space inside a label is kept. `rmlx baseline`, `rmlx eval` and
 (`model_namespace`, `model` and the §5.2 `weight_quant`) before loading the
 model, so a refusal costs seconds and not the run.
 
-The Python ingesters (`scripts/ingest/llama_bench_ingest.py`,
-`codec_inertness_ingest.py`) split with `split_model_dir` in
+The Python ingest modes (`scripts/ingest/ingest.py llama-bench` and
+`codec-inertness`) split with `split_model_dir` in
 `scripts/lib/snapshot_identity.py`, reading only the snapshot directory name
 and never an ancestor. Before this rule they filed an unlisted namespace as
 `local/<name>`; new rows file as `<namespace>/<model>`, a separate `bests`

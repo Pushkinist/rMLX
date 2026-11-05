@@ -228,7 +228,7 @@ fi
 check "synthetic arms do not waive an arm guard" "${WORK}/quiet" 125 "indistinguishable" \
 	-- --synthetic-arms --binary-a "${SLOW}" --binary-b "${SLOW}"
 
-# 7 — the result file says so. `ingest/perf_ab_ingest.py` refuses to promote a
+# 7 — the result file says so. `ingest/ingest.py ab` refuses to promote a
 # run carrying this flag; that refusal is only enforceable if the flag is
 # recorded.
 if [ -n "${HOSTILE_JSON}" ] && [ -r "${HOSTILE_JSON}" ] &&

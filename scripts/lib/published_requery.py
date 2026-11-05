@@ -1,6 +1,6 @@
 """Re-query a recorded published-protocol run from `runs.db` and compare.
 
-`ingest/published_ingest.py` records the measured things and deliberately not
+`ingest/ingest.py published` records the measured things and deliberately not
 their means: the per-dataset and macro averages are derived, and a stored
 derivation can disagree with what it was derived from. So the headline of a run
 lives in its result file, and the rows live in the database. This reads the rows

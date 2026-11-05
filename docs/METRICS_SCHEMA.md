@@ -244,7 +244,7 @@ block, so its arm is always `dflash/block=<n>,dflash/depth=accept_rate`.
 Migration 008 rewrites a stored `dflash/block=<n>` to that form.
 
 `scripts/spec_bench.sh` records the string the engine logged.
-`scripts/ingest/published_ingest.py` carries the string its result file
+`scripts/ingest/ingest.py published` carries the string its result file
 recorded from the `done` line. Neither composes a drafter term.
 
 The `kv_boundary/*` pair is always written together, `head` before `tail`.
@@ -262,8 +262,8 @@ carries one.
 
 **Producers of the column.** `rmlx_metrics::cell::decode_config` is the one
 producer of drafter terms. The other composers are `rmlx_models::kv_cache`
-(the boundary terms), `scripts/ingest/perf_ab_ingest.py`,
-`scripts/ingest/codec_inertness_ingest.py` and
+(the boundary terms), `scripts/ingest/ingest.py`
+(modes `ab` and `codec-inertness`) and
 `scripts/prefill_chunk_sweep.sh`. `check-kv-boundary-default-parity` holds
 their default values together; only `validate` holds their format.
 

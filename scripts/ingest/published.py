@@ -1,5 +1,6 @@
-#!/usr/bin/env python3
 """Promote a `scripts/spec_bench_published.sh` result into `runs.db`.
+
+Module of: ingest/ingest.py
 
 The harness deliberately writes no DB row — a measurement and a record are
 separate acts, and the store is append-only, so a row written by the thing that
@@ -72,9 +73,9 @@ WHAT IS REFUSED
                        saying so — which is exactly the failure `prompt_id`
                        exists to prevent.
 
-Usage:
-    python3 scripts/ingest/published_ingest.py --dry-run RESULT.json
-    python3 scripts/ingest/published_ingest.py --record RESULT.json --git-sha <sha>
+Examples:
+    python3 scripts/ingest/ingest.py published --dry-run RESULT.json
+    python3 scripts/ingest/ingest.py published --record RESULT.json --git-sha <sha>
 """
 
 from __future__ import annotations
@@ -82,32 +83,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import statistics
 import subprocess
 import sys
-import uuid
 from pathlib import Path
 from typing import Any
 
-_SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(_SCRIPT_DIR.parent))
-sys.path.insert(0, str(_SCRIPT_DIR.parent / "lib"))
-from published_requery import LABEL_PATTERN, Unreadable, check  # noqa: E402
-from published_samples import body_sha256  # noqa: E402
-from recorder_check import require_run_class_recorder  # noqa: E402
-from rmlx_home import rmlx_home  # noqa: E402
+from published_requery import LABEL_PATTERN, Unreadable, check
+from published_samples import body_sha256
 
-RMLX_REPO_ROOT = Path(os.environ.get("RMLX_REPO_ROOT", str(_SCRIPT_DIR.parents[1])))
-# Runtime state lives under a single root (CLAUDE.md). `RMLX_HOME` wins; the
-# in-repo `.rmlx/` is the dev default.
-RMLX_HOME = rmlx_home(RMLX_REPO_ROOT)
-BUFFER_PENDING = RMLX_HOME / "metrics" / "buffer" / "pending"
-# Records are assembled in `records/` beside the result and only moved into
-# `pending/` for the moment the recorder claims one: anything sitting in
-# `pending/` is, by contract, work the next `--replay-pending` sweep will take,
-# and that sweep quarantines what it cannot ingest.
-STAGING_DIR = "records"
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 SCHEMA_VERSION = 1
 # The identity fields the run stamped at emit time. §8.5.1: they are never
@@ -581,8 +566,8 @@ def gate(result: dict[str, Any], args: argparse.Namespace) -> None:
         )
 
 
-def main() -> int:
-    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="ingest.py published", description=__doc__.splitlines()[0])
     p.add_argument("result", help="JSON emitted by spec_bench_published.sh")
     p.add_argument(
         "--git-sha",
@@ -596,94 +581,35 @@ def main() -> int:
         "--record", action="store_true", help="ingest via `rmlx metrics record --file`"
     )
     p.add_argument(
-        "--rmlx-bin", default=str(RMLX_REPO_ROOT / "target" / "release" / "rmlx")
+        "--rmlx-bin", default=str(REPO_ROOT / "target" / "release" / "rmlx")
     )
-    args = p.parse_args()
+    return p.parse_args(argv)
 
-    result = json.loads(Path(args.result).read_text(encoding="utf-8"))
+
+def build_records(result: dict[str, Any], args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Every record the result describes; `Refused` when it must not become rows."""
     try:
         gate(result, args)
         binary_sha = check_binary(result)
-        check_samples_root(result, RMLX_REPO_ROOT)
+        check_samples_root(result, REPO_ROOT)
         bodies = manifest_bodies(result)
         notes = run_notes(result, binary_sha)
         records = sample_records(result, args, bodies, notes)
         fixed = fixed_record(result, args, notes)
-        longctx = longctx_records(result, args, notes, RMLX_REPO_ROOT)
+        longctx = longctx_records(result, args, notes, REPO_ROOT)
         greedy = greedy_records(result, args, notes)
-    except Refused as exc:
-        print(f"refusing: {exc}", file=sys.stderr)
-        return 2
     except (KeyError, OSError, ValueError) as exc:
-        print(
-            f"refusing: {args.result} is missing something every record needs "
-            f"({exc!r}); it was not written by this harness",
-            file=sys.stderr,
-        )
-        return 2
+        raise Refused(
+            f"{args.result} is missing something every record needs "
+            f"({exc!r}); it was not written by this harness"
+        ) from None
     if fixed:
         records.append(fixed)
-    records += longctx + greedy
+    return records + longctx + greedy
 
-    if args.dry_run:
-        for rec in records:
-            trimmed = dict(rec)
-            trimmed["prompt"] = dict(
-                rec["prompt"], body=f"<{len(json.dumps(rec['prompt']['body']))} chars>"
-            )
-            print(json.dumps(trimmed, indent=2))
-        print(f"{len(records)} records", file=sys.stderr)
-        return 0
 
-    if args.record:
-        require_run_class_recorder(args.rmlx_bin)
-
-    stamp = result["ts_utc"].replace("-", "").replace(":", "")
-    staging = Path(args.result).resolve().parent / STAGING_DIR
-    staging.mkdir(parents=True, exist_ok=True)
-    staged: list[Path] = []
-    for rec in records:
-        path = staging / f"{stamp}-{uuid.uuid4().hex[:8]}.json"
-        path.write_text(json.dumps(rec, ensure_ascii=False), encoding="utf-8")
-        staged.append(path)
-    print(f"staged {len(staged)} records under {staging}")
-
-    if not args.record:
-        print(
-            "not ingested (pass --record). The files above are OUTSIDE\n"
-            f"  {BUFFER_PENDING},\n"
-            "  so no --replay-pending sweep can claim them. Inspect, then re-run\n"
-            "  with --record."
-        )
-        return 0
-
-    BUFFER_PENDING.mkdir(parents=True, exist_ok=True)
-    failed = 0
-    for path in staged:
-        queued = BUFFER_PENDING / path.name
-        path.rename(queued)
-        try:
-            proc = subprocess.run(
-                [args.rmlx_bin, "metrics", "record", "--file", str(queued)],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-        finally:
-            if queued.exists():
-                queued.rename(path)
-        if proc.returncode != 0:
-            print(
-                f"ingest FAILED for {path} (exit {proc.returncode}): "
-                f"{proc.stderr.strip()}; record kept in staging, not in the "
-                "pending queue",
-                file=sys.stderr,
-            )
-            failed += 1
-    print(f"ingested {len(staged) - failed}/{len(staged)} records")
-    if failed:
-        return 1
-
+def requery(args: argparse.Namespace) -> int:
+    """Re-query the rows just recorded and compare them with the result; 1 when they differ."""
     summary = Path(args.result).resolve().parent / "db_summary.json"
     try:
         problems = check(Path(args.result), args.rmlx_bin, None, summary)
@@ -696,7 +622,3 @@ def main() -> int:
         return 1
     print(f"re-queried from runs.db: the rows reproduce the result ({summary})")
     return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
