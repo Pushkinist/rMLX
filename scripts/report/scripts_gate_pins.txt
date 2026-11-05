@@ -183,6 +183,7 @@ env-knob lib/cpu_snapshot.sh CPU_SNAPSHOT_MIN_ROWS,SYNTHETIC_ARMS
 env-knob lib/identity.sh RMLX_IDENTITY_JSON
 env-knob lib/kv_boundary_default.py RMLX_REPO_ROOT
 env-knob lib/selftest_support.sh TOOL
+env-knob host/gc.sh RMLX_HOME
 env-knob host/mlx_restore_pin.sh HOMEBREW_PREFIX
 env-knob profile/capture.sh RMLX_HOME
 env-knob bench/ab.sh RMLX_HOME,RMLX_O_MODELS_ROOT

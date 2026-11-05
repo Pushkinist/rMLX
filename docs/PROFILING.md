@@ -184,7 +184,7 @@ bash scripts/profile/capture.sh gputrace --kv-quant iso3_sym --model /path/to/sn
   --prompt-tokens 4096 --skip 4 --steps 8
 ```
 
-Traces land in `.rmlx/traces/` as
+Traces land in `<RMLX_HOME>/traces/` (`.rmlx/traces/` when `RMLX_HOME` is unset) as
 `<model>-<codec>-<prompt>tok-<timestamp>.gputrace`. The script runs the MLX
 preflight and refuses a binary without the feature. It refuses a host the
 tools cannot attach to before it writes anything. It sizes `--max-ctx` for the
@@ -309,6 +309,8 @@ answerable offline, how many times is not.
   each capture. Eviction is oldest-first, never the bundle just written, and
   each removal is printed.
 - `--keep-all` (`make profile-gputrace … KEEP_ALL=1`) skips the cap.
+- `make traces-gc` bounds the same directory: `<RMLX_HOME>/traces`, else
+  `.rmlx/traces`; `--dir` names another.
 
 ```sh
 make traces-gc                                   # report what is over the caps

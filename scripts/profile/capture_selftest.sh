@@ -7,7 +7,9 @@
 # under a PATH of shims for `xcrun`, `xcode-select`, `DevToolsSecurity`, `codesign`, `plutil` and
 # `cargo`, so no GPU, no Xcode and no model is touched. The cases assert the argv the engine and
 # the instrument are handed, the bundle directory and its retention, every refusal's exit code and
-# reason, and, for the preflight, a host that passes and one case per missing prerequisite.
+# reason, and, for the preflight, a host that passes and one case per missing prerequisite. Every
+# shim logs its argv one element per line, so a quoting slip shows, and the capture variable it
+# was started with, so a launch that should not carry it shows.
 #
 # Usage:  bash scripts/profile/capture_selftest.sh
 # Exit:   0 every case held; 1 a case did not, or none ran; 2 a fixture could not be built
@@ -32,14 +34,35 @@ for tool in awk basename bash cat cut date dirname du env find grep head ls mkdi
 	ln -s "$path" "$SYSBIN/$tool"
 done
 
+# `logcall <name> [argv...]` — what every shim runs first: argv one element per line and a `----` line
+# to $CAP_CTL/<name>.argv, and the capture variable to $CAP_CTL/env.log.
+cat >"$SHIMS/logcall" <<'SHIM'
+#!/usr/bin/env bash
+name="$1"
+shift
+{
+	[ "$#" -eq 0 ] || printf '%s\n' "$@"
+	echo ----
+} >>"$CAP_CTL/$name.argv"
+echo "$name MTL_CAPTURE_ENABLED=${MTL_CAPTURE_ENABLED-unset}" >>"$CAP_CTL/env.log"
+SHIM
+
+# `du` is what the bundle cap runs after a capture: it logs, then measures.
+cat >"$SHIMS/du" <<'SHIM'
+#!/usr/bin/env bash
+logcall du "$@"
+exec /usr/bin/du "$@"
+SHIM
+
 # The stub engine. Controls are files under $CAP_CTL: no_feature_flag, no_trace, baseline_rc,
-# pending, claim_held. It logs "<profile directory> <argv>" and the capture variable it was handed.
+# pending, claim_held. A baseline run is logged as "<profile directory> <argv>".
 cat >"$ST_WORK/rmlx_stub" <<'STUB'
 #!/usr/bin/env bash
 set -u
 profile="$(basename "$(dirname "$0")")"
 case "$1" in
 claim)
+	logcall rmlx-claim "$@"
 	if [ -e "$CAP_CTL/claim_held" ]; then
 		echo "error: the Metal claim is held by pid 1" >&2
 		exit 11
@@ -49,12 +72,12 @@ claim)
 	;;
 baseline)
 	if [ "${2:-}" = --help ]; then
+		logcall rmlx-probe "$@"
 		[ -e "$CAP_CTL/no_feature_flag" ] || echo "      --gpu-capture <PATH>"
 		echo "      --record"
 		exit 0
 	fi
-	echo "$profile $*" >>"$CAP_CTL/rmlx.argv"
-	echo "MTL_CAPTURE_ENABLED=${MTL_CAPTURE_ENABLED-unset}" >>"$CAP_CTL/rmlx.env"
+	logcall rmlx "$profile" "$@"
 	prev=""
 	for a in "$@"; do
 		if [ "$prev" = --gpu-capture ] && [ ! -e "$CAP_CTL/no_trace" ]; then mkdir -p "$a"; fi
@@ -79,6 +102,7 @@ STUB
 # process's record did not).
 cat >"$SHIMS/xcrun" <<'SHIM'
 #!/usr/bin/env bash
+logcall xcrun "$@"
 case "$1" in
 -f) [ ! -e "$CAP_CTL/no_xctrace" ]; exit ;;
 -sdk)
@@ -98,7 +122,7 @@ if [ "$2" = export ]; then
 	[ -e "$CAP_CTL/no_export" ] || printf '<trace/>\n' >"$out"
 	exit "$(cat "$CAP_CTL/export_rc" 2>/dev/null || echo 0)"
 fi
-printf '%s\n' "$*" >>"$CAP_CTL/xctrace.argv"
+logcall xctrace "$@"
 shift 2
 out="" home=""
 while [ $# -gt 0 ] && [ "$1" != -- ]; do
@@ -109,7 +133,7 @@ while [ $# -gt 0 ] && [ "$1" != -- ]; do
 	shift
 done
 shift
-printf '%s\n' "$*" >>"$CAP_CTL/launched.argv"
+logcall launched "$@"
 [ -n "$home" ] || { echo "shim: the child was not handed RMLX_HOME" >&2; exit 9; }
 label="" prev=""
 for a in "$@"; do
@@ -132,7 +156,7 @@ SHIM
 
 cat >"$SHIMS/cargo" <<'SHIM'
 #!/usr/bin/env bash
-printf '%s\n' "$*" >>"$CAP_CTL/cargo.argv"
+logcall cargo "$@"
 if [ -e "$CAP_CTL/cargo_rc" ]; then
 	echo "error: parser refused the table" >&2
 	exit "$(cat "$CAP_CTL/cargo_rc")"
@@ -141,9 +165,11 @@ echo "stub summary"
 SHIM
 
 # The host probes of the preflight. Controls: xcode_dir (empty: none selected), dts, codesign_rc,
-# entitlements (the blob codesign prints).
+# entitlements (the blob codesign prints). `plutil` reads a dotted key as a key path, as the real
+# one does, so it answers only a key whose dots are escaped.
 cat >"$SHIMS/xcode-select" <<'SHIM'
 #!/usr/bin/env bash
+logcall xcode-select "$@"
 [ -e "$CAP_CTL/xcode_dir" ] || { echo /Applications/Xcode.app/Contents/Developer; exit 0; }
 dir="$(cat "$CAP_CTL/xcode_dir")"
 [ -n "$dir" ] || exit 2
@@ -151,10 +177,12 @@ echo "$dir"
 SHIM
 cat >"$SHIMS/DevToolsSecurity" <<'SHIM'
 #!/usr/bin/env bash
+logcall DevToolsSecurity "$@"
 cat "$CAP_CTL/dts" 2>/dev/null || echo "Developer mode is currently enabled."
 SHIM
 cat >"$SHIMS/codesign" <<'SHIM'
 #!/usr/bin/env bash
+logcall codesign "$@"
 if [ -e "$CAP_CTL/codesign_rc" ]; then
 	echo "codesign: not signed" >&2
 	exit "$(cat "$CAP_CTL/codesign_rc")"
@@ -167,10 +195,12 @@ fi
 SHIM
 cat >"$SHIMS/plutil" <<'SHIM'
 #!/usr/bin/env bash
+logcall plutil "$@"
 body="$(cat)"
 case "$1" in
 -lint) printf '%s' "$body" | grep -q '<plist' ;;
 -extract)
+	case "$2" in *[!\\].*) echo "plutil: no value at key path $2" >&2; exit 1 ;; esac
 	key="${2//\\/}"
 	value="$(printf '%s' "$body" | sed -n "s|.*<key>$key</key><\([a-z]*\)/>.*|\1|p")"
 	[ -n "$value" ] || exit 1
@@ -197,7 +227,20 @@ make_root() {
 # norm — the checkout's and the scratch directory's paths and the run's timestamps made fixed.
 norm() { sed -e "s|$ROOT/||g" -e "s|$ST_WORK/|WORK/|g" -e 's/[0-9]\{8\}-[0-9]\{6\}/STAMP/g'; }
 settle() { ST_OUT="$(printf '%s\n' "$ST_OUT" | norm)"; }
-logged() { if [ -e "$CTL/$1" ]; then norm <"$CTL/$1"; fi; }
+# logged <file> — one line for each call the shim logged, its elements joined by a space.
+logged() {
+	if [ -e "$CTL/$1" ]; then
+		awk '$0 == "----" { print line; line = ""; n = 0; next } { line = line (n++ ? " " : "") $0 }' "$CTL/$1" | norm
+	fi
+}
+# arg_after <file> <flag> — the element that follows <flag> in each call, whole.
+arg_after() {
+	if [ -e "$CTL/$1" ]; then awk -v flag="$2" 'prev == flag { print } { prev = $0 }' "$CTL/$1" | norm; fi
+}
+# env_set — the shims that were started with the capture variable set.
+env_set() {
+	if [ -e "$CTL/env.log" ]; then grep -v 'MTL_CAPTURE_ENABLED=unset$' "$CTL/env.log" || true; fi
+}
 listing() { { ls -1 "$1" 2>/dev/null || true; } | norm | tr '\n' ' '; }
 
 run_gputrace() {
@@ -247,9 +290,26 @@ run_gputrace --kv-quant none --model "$MODEL"
 why="$(st_check 0 --has "capturing: codec=none prompt=4096 skip=4 steps=8 gen=18" --has "trace:     $GP_TRACE" \
 	--has "done: $GP_TRACE" --has "— newest bundle (use --all to override)" --has "Offline, no Xcode:")"
 want "engine argv" "$(logged rmlx.argv)" "$GP_RUN --kv-quant none --prompt-tokens 4096 --max-tokens 18 --max-ctx 4626 --max-prompt-tokens 4160 --gpu-capture $GP_TRACE --gpu-capture-skip 4 --gpu-capture-steps 8"
-want "capture variable" "$(logged rmlx.env)" "MTL_CAPTURE_ENABLED=1"
+want "started with the capture variable" "$(env_set)" "rmlx MTL_CAPTURE_ENABLED=1"
 want "bundles" "$(listing "$ROOT/.rmlx/traces")" "host__m-none-4096tok-STAMP.gputrace "
 st_verdict gpu_capture_default_run "$why" "the engine runs the release-debug build with the capture variable, the window defaults and a bundle under .rmlx/traces"
+
+make_root gp_home
+CAP_HOME="$ST_WORK/gp_home_dir"
+run_gputrace --kv-quant none --model "$MODEL"
+why="$(st_check 0)"
+want "bundles" "$(listing "$ST_WORK/gp_home_dir/traces")" "host__m-none-4096tok-STAMP.gputrace "
+want "default directory" "$(listing "$ROOT/.rmlx")" ""
+st_verdict gpu_capture_default_directory_is_under_rmlx_home "$why" "the bundle is filed under <RMLX_HOME>/traces, not under the checkout"
+
+make_root gp_whole_args
+MODEL_SP="$ST_WORK/models/host m"
+mkdir -p "$MODEL_SP"
+run_gputrace --kv-quant none --model "$MODEL_SP" --keep-all
+why="$(st_check 0)"
+want "model" "$(arg_after rmlx.argv --model)" "WORK/models/host m"
+want "trace" "$(arg_after rmlx.argv --gpu-capture)" ".rmlx/traces/host m-none-4096tok-STAMP.gputrace"
+st_verdict gpu_capture_hands_a_path_with_a_space_to_the_engine_whole "$why" "a model path with a space reaches the engine as one argument, and so does the bundle path"
 
 make_root gp_records
 run_gputrace --kv-quant none --model "$MODEL" --keep-all
@@ -295,6 +355,7 @@ plant "$ROOT/.rmlx/traces" gputrace 8
 run_gputrace --kv-quant none --model "$MODEL"
 why="$(st_check 0 --has "prune   old1.gputrace" --has "prune   old3.gputrace" --lacks "prune   old4.gputrace")"
 want "bundles left" "$(ls -d "$ROOT"/.rmlx/traces/*.gputrace | wc -l | tr -d ' ')" 6
+want "started with the capture variable" "$(env_set)" "rmlx MTL_CAPTURE_ENABLED=1"
 want "newest old bundle" "$(ls -d "$ROOT/.rmlx/traces/old8.gputrace" | norm)" ".rmlx/traces/old8.gputrace"
 st_verdict gpu_capture_retention_prunes_the_oldest "$why" "nine bundles are cut to the newest six, the new one among them"
 
@@ -378,7 +439,21 @@ want "instrument argv" "$(logged xctrace.argv)" "xctrace record --template Metal
 want "summaries" "$(logged cargo.argv)" "run -q --release -p rmlx-mlx --features metal-capture --example gpu_timeline -- --input $MST_DIR/$MST_BASE.gpu-intervals.xml --process rmlx --skip-ms 0
 run -q --release -p rmlx-mlx --features metal-capture --example gpu_timeline -- --input $MST_DIR/$MST_BASE.gpu-intervals.xml --process rmlx --skip-ms 123 --csv $MST_DIR/$MST_BASE.channels.csv"
 want "files" "$(listing "$ROOT/$MST_DIR")" "$MST_BASE.gpu-intervals.xml $MST_BASE.trace "
-st_verdict mst_capture_default_run "$why" "the release build is launched under xctrace with the window defaults, exported and summarised twice"
+want "started with the capture variable" "$(env_set)" ""
+st_verdict mst_capture_default_run "$why" "the release build is launched under xctrace with the window defaults, exported and summarised twice, nothing started with the capture variable"
+
+make_root mst_whole_args
+MODEL_SP="$ST_WORK/models/host m"
+mkdir -p "$MODEL_SP"
+run_mst --model "$MODEL_SP"
+why="$(st_check 0)"
+SP_BASE="host m-none-4096tok-STAMP"
+want "template" "$(arg_after xctrace.argv --template)" "Metal System Trace"
+want "bundle" "$(arg_after xctrace.argv --output)" "$MST_DIR/$SP_BASE.trace"
+want "model" "$(arg_after launched.argv --model)" "WORK/models/host m"
+want "summary input" "$(arg_after cargo.argv --input)" "$MST_DIR/$SP_BASE.gpu-intervals.xml
+$MST_DIR/$SP_BASE.gpu-intervals.xml"
+st_verdict mst_capture_hands_each_argument_to_the_instrument_whole "$why" "the template name, a model path with a space and the bundle and table paths each reach the instrument and the summariser as one argument"
 
 make_root mst_records
 run_mst --model "$MODEL"
@@ -589,11 +664,30 @@ why="$(st_check 0 --has "gputrace preflight (binary: target/release-debug/rmlx)"
 	--has "preflight ok — Apple's GPU tools can attach to this binary on this host" --lacks "FAIL")"
 st_verdict preflight_passes_on_a_ready_host "$why" "a host with Xcode, developer mode and an entitled binary ends 0"
 
+make_root pf_probes
+run_preflight
+why="$(st_check 0)"
+want "xcode-select" "$(logged xcode-select.argv)" "-p"
+want "DevToolsSecurity" "$(logged DevToolsSecurity.argv)" "-status"
+want "codesign" "$(logged codesign.argv)" "-d --entitlements - --xml target/release-debug/rmlx"
+want "plutil key" "$(arg_after plutil.argv -extract)" 'com\.apple\.security\.get-task-allow'
+want "started with the capture variable" "$(env_set)" ""
+st_verdict preflight_points_each_probe_at_what_it_checks "$why" "each host probe is given the arguments that read what the preflight reports, the entitlement key with its dots escaped"
+
 make_root pf_binary
 cp "$ST_WORK/rmlx_stub" "$ST_WORK/other_rmlx"
 run_preflight --binary "$ST_WORK/other_rmlx"
 why="$(st_check 0 --has "gputrace preflight (binary: WORK/other_rmlx)")"
-st_verdict preflight_binary "$why" "--binary names the binary that is checked"
+want "codesign" "$(logged codesign.argv)" "-d --entitlements - --xml WORK/other_rmlx"
+st_verdict preflight_binary "$why" "--binary names the binary that is checked, and codesign reads that one"
+
+make_root pf_binary_space
+mkdir -p "$ST_WORK/bin dir"
+cp "$ST_WORK/rmlx_stub" "$ST_WORK/bin dir/rmlx"
+run_preflight --binary "$ST_WORK/bin dir/rmlx"
+why="$(st_check 0)"
+want "codesign target" "$(arg_after codesign.argv --xml)" "WORK/bin dir/rmlx"
+st_verdict preflight_hands_a_binary_path_with_a_space_to_codesign_whole "$why" "a binary path with a space reaches codesign as one argument"
 
 make_root pf_no_metal
 : >"$CTL/no_metal"
@@ -684,6 +778,32 @@ make_root pf_help
 run_preflight --help
 why="$(st_check 0 --has "usage:" --has "--binary")"
 st_verdict preflight_help "$why" "--help prints the usage and ends 0"
+
+# ===== a flag given an empty value =====
+
+for flag in --kv-quant --model --prompt-tokens --skip --steps --gen --out-dir; do
+	make_root "gp_empty${flag#--}"
+	run_gputrace --kv-quant none --model "$MODEL" "$flag" ""
+	why="$(st_check 2 --has "ERROR: $flag needs a value")"
+	want "engine runs" "$(logged rmlx.argv)" ""
+	want "directory" "$(listing "$ROOT/.rmlx")" ""
+	st_verdict "gpu_capture_refuses_an_empty_${flag#--}" "$why" "$flag \"\" ends 2 before anything runs"
+done
+
+for flag in --model --kv-quant --prompt-tokens --max-tokens --time-limit --skip-ms --binary --keep --out-dir; do
+	make_root "mst_empty${flag#--}"
+	run_mst --model "$MODEL" "$flag" ""
+	why="$(st_check 2 --has "ERROR: $flag needs a value")"
+	want "instrument runs" "$(logged xctrace.argv)" ""
+	want "directory" "$(listing "$ROOT/.rmlx")" ""
+	st_verdict "mst_capture_refuses_an_empty_${flag#--}" "$why" "$flag \"\" ends 2 before anything runs"
+done
+
+make_root pf_empty_binary
+run_preflight --binary ""
+why="$(st_check 2 --has "ERROR: --binary needs a value")"
+want "probes run" "$(logged codesign.argv)" ""
+st_verdict preflight_refuses_an_empty_binary "$why" "--binary \"\" ends 2 before anything is probed"
 
 make_root dispatch_none
 run_raw() {

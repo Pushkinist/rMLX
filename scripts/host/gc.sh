@@ -17,9 +17,10 @@
 # traces: a trace is not cheap to regenerate (a model load plus a capture run), so the collection is
 # bounded instead of expired. In the order applied, the newest bundle never being a candidate unless
 # --all is given:
-#   1. --max-count N     keep the N newest bundles           (default 6)
+#   1. --max-count N    keep the N newest bundles           (default 6)
 #   2. --max-total-gb N  then evict oldest-first until the directory fits (default 40)
 #   3. --max-age-days N  optional extra rule; off unless the flag is given
+# The directory is --dir, else <RMLX_HOME>/traces, else .rmlx/traces.
 # Every eviction is printed with its reason: a capture that vanishes silently costs a re-run.
 
 set -uo pipefail
@@ -33,7 +34,7 @@ MAX_AGE_DAYS=""
 MAX_COUNT=6
 MAX_TOTAL_GB=40
 WARN_GB=""
-DIR=".rmlx/traces"
+DIR="${RMLX_HOME:-.rmlx}/traces"
 
 usage_text() {
 	echo "usage: $0 {target|traces} [--apply] [--all] [--max-age-days N] [--max-count N] [--max-total-gb N] [--warn-gb N] [--dir DIR]"

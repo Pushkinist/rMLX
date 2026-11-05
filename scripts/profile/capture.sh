@@ -7,8 +7,9 @@
 #             [--prompt-tokens N] [--max-tokens N] [--time-limit S] [--skip-ms N] [--binary PATH]
 #             [--keep N] [--out-dir DIR]
 #         bash scripts/profile/capture.sh preflight [--binary PATH]
-# Exit:   0 done; 1 refused or failed; 2 usage error; 75 the run is kept and its diagnostic record
-#         did not land; passthrough of rmlx (gputrace) and of the summariser (mst)
+# Exit:   0 done; 1 refused or failed; 2 usage error (an unknown argument, a flag with no value or
+#         with an empty one); 75 the run is kept and its diagnostic record did not land;
+#         passthrough of rmlx (gputrace) and of the summariser (mst)
 # Set:    -uo — a failed engine run, export or summary is a status the code reads and reports
 # Not a mode of: profile/gputrace.sh — that one reads a finished .gputrace bundle; this one launches the engine
 #
@@ -124,7 +125,7 @@ while [ $# -gt 0 ]; do
 		shift
 		continue
 	fi
-	if [ $# -lt 2 ]; then
+	if [ $# -lt 2 ] || [ -z "$2" ]; then
 		echo "ERROR: $1 needs a value" >&2
 		exit 2
 	fi

@@ -21,6 +21,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=scripts/lib/selftest_support.sh
 . "$REPO_ROOT/scripts/lib/selftest_support.sh"
 st_init gc-selftest
+# The default directory of the traces mode follows RMLX_HOME, so a case that does not name it runs without.
+unset RMLX_HOME
 
 SCRATCH_REPO="$ST_WORK/repo"
 GIB_KB=1048576
@@ -62,6 +64,9 @@ tool_traces() {
 # tool_env_age: tool_target with a non-numeric MAX_AGE_DAYS in the environment.
 tool_env_age() { MAX_AGE_DAYS=abc tool_target "$@"; }
 
+# env_home <cmd...>: the command with RMLX_HOME naming a directory of its own, apart from the scratch repo.
+env_home() { RMLX_HOME="$ST_WORK/home" "$@"; }
+
 # tool_mode <arg>: the tool with a first argument that is no mode.
 tool_mode() {
     place_tool
@@ -102,6 +107,8 @@ bundle() {
 
 left_target() { ls "$SCRATCH_REPO/target" | tr '\n' ' ' | sed 's/ $//'; }
 left_traces() { ls "$SCRATCH_REPO/.rmlx/traces" | sed 's/\.gputrace$//' | tr '\n' ' ' | sed 's/ $//'; }
+left_home() { ls "$ST_WORK/home/traces" | sed 's/\.gputrace$//' | tr '\n' ' ' | sed 's/ $//'; }
+left_both() { echo "home=$(left_home) repo=$(left_traces)"; }
 left_other() { ls "$ST_WORK/other" | tr '\n' ' ' | sed 's/ $//'; }
 
 # disk_case <name> <want-exit> <lister> <entries-left> [--has S]... [--lacks S]... -- <cmd...>:
@@ -328,6 +335,17 @@ disk_case "traces --dir: the directory named is the one bounded" 0 left_other ""
     --has "prune   b1.gputrace" --has "prune   b2.gputrace" -- tool_traces --apply --max-count 0 --all --dir "$ST_WORK/other"
 disk_case "traces --dir: the default directory is left alone" 0 left_traces "bystander" \
     --has "nothing to do" -- tool_traces --apply --dir "$ST_WORK/none"
+
+fresh
+bundle bystander 5
+mkdir -p "$ST_WORK/home/traces/h1.gputrace" "$ST_WORK/home/traces/h2.gputrace"
+disk_case "traces RMLX_HOME: <RMLX_HOME>/traces is the directory bounded, not the repo's" 0 left_both "home= repo=bystander" \
+    --has "prune   h1.gputrace" --has "prune   h2.gputrace" --lacks "bystander" -- env_home tool_traces --apply --max-count 0 --all
+mkdir -p "$ST_WORK/home/traces/h1.gputrace" "$ST_WORK/other/o1.gputrace"
+disk_case "traces RMLX_HOME: --dir wins over it" 0 left_both "home=h1 repo=bystander" \
+    --has "prune   o1.gputrace" --lacks "h1.gputrace" -- env_home tool_traces --apply --max-count 0 --all --dir "$ST_WORK/other"
+rm -rf "$ST_WORK/home"
+st_case "traces RMLX_HOME: no <RMLX_HOME>/traces is a no-op that names it" 0 --has "no $ST_WORK/home/traces — nothing to do" -- env_home tool_traces --apply
 
 plant_traces
 disk_case "traces: an unknown argument is a usage error and deletes nothing" 2 left_traces "$ALL_BUNDLES" \
