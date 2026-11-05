@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Recall test for the baseline cells tool: canary rows, argv, records and exit codes under a stub rmlx
 #
-# Recall test for: bench/baseline_cells.sh --include-26b --measure inertness
+# Recall test for: bench/baseline_cells.sh --include-26b --measure inertness --arch-class
 #
 # Each case drives the tool against a stub `rmlx` that logs the argv of every `baseline` call and
 # answers each call with the reading its call number names, then asserts the argv, the CSV rows,
 # the summary lines and the exit code: median and stddev of known readings, the gate record, a
 # record that did not land, a run that failed, a claim another process holds, a missing binary,
-# and, for the inertness sweep, the columns of each row, the default codec list and the record argv.
+# for the inertness sweep the columns of each row, the default codec list and the record argv, and
+# for the cache-types matrix the argv of every smoke and measured run, each cell's record, the
+# summary rows, every smoke rejection, the resolver skip and the pending smoke record.
 #
 # Usage:  bash scripts/bench/baseline_cells_selftest.sh
 # Exit:   0 every case held; 1 a case did not, or none ran; 2 a fixture could not be built
@@ -32,6 +34,9 @@ GEMMA26=mlx-community__gemma-4-26b-a4b-it-mxfp8
 #   claim_held   `claim run` exits 11
 #   inertness    lines `<call number> <kv_cache_bytes> <token ids> <store skipped 0|1>`: the residency the
 #                run prints, its `token_ids=` line and, for 1, the packed-store-skipped line on stderr
+#   outputs      lines `<call number> <printf text>`: the `output:` line that run prints
+#   fail_on      the first line is an exit code; the run whose argv holds every later line exits with it
+#   record_fails `metrics record` exits 1; otherwise it keeps a copy of the file under $RMLX_HOME/records
 make_stub() {
 	cat >"$1" <<'STUB'
 #!/usr/bin/env bash
@@ -52,6 +57,11 @@ metrics)
 	case "$2" in
 	path) echo "$RMLX_HOME" ;;
 	identity) cat "$RMLX_HOME/identity.json" ;;
+	record)
+		[ ! -e "$RMLX_HOME/record_fails" ] || exit 1
+		mkdir -p "$RMLX_HOME/records"
+		cp "$4" "$RMLX_HOME/records/$(($(ls "$RMLX_HOME/records" | wc -l) + 1))"
+		;;
 	esac
 	exit 0
 	;;
@@ -68,12 +78,21 @@ baseline)
 	printf '%s\n' "{\"timestamp\":\"2026-09-03T00:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"cache-type resolved\",\"arch\":\"Stub\",\"kv_quant\":\"stubq\"}}" >>"$log"
 	if holds crash_on; then exit 1; fi
 	if holds silent_on; then exit 0; fi
+	if [ -e "$RMLX_HOME/fail_on" ]; then
+		hit=1
+		while IFS= read -r pattern || [ -n "$pattern" ]; do
+			case "$args" in *"$pattern"*) ;; *) hit=0 ;; esac
+		done < <(sed 1d "$RMLX_HOME/fail_on")
+		[ "$hit" = 0 ] || exit "$(sed -n 1p "$RMLX_HOME/fail_on")"
+	fi
 	row="$(awk -v n="$n" '$1 == n { print $2, $3 }' "$RMLX_HOME/readings" 2>/dev/null || true)"
 	set -- ${row:-10.0 1.0}
 	bytes=1000 ids="" skipped=0
 	irow="$(awk -v n="$n" '$1 == n { print $2, $3, $4 }' "$RMLX_HOME/inertness" 2>/dev/null || true)"
 	[ -z "$irow" ] || read -r bytes ids skipped <<<"$irow"
-	echo "baseline: model=stub  ttft_ms=1  decode_tps=$1  prefill_tps=$2  prompt_tokens=4200  kv_cache_bytes=$bytes"
+	echo "baseline: model=stub  load=250ms  ttft_ms=1  decode_tps=$1  prefill_tps=$2  prompt_tokens=4200  peak_rss=2048.5MB  kv_cache_bytes=$bytes"
+	text="$(awk -v n="$n" '$1 == n { sub(/^[^ ]+ /, ""); print }' "$RMLX_HOME/outputs" 2>/dev/null || true)"
+	[ -z "$text" ] || printf "output: $text\n"
 	[ -z "$ids" ] || echo "baseline: token_ids=$ids"
 	[ "$skipped" = 0 ] || echo "exit_prefill: packed store skipped - decode reads the bf16 mirror only" >&2
 	case "$args" in *" --record "*)
@@ -92,12 +111,16 @@ STUB
 # fake_root <name> <profile>... — a git repo whose scripts are the real ones and whose
 # target/<profile>/rmlx is the stub.
 fake_root() {
-	local root name="$1" profile
+	local root name="$1" profile size
 	shift
 	root="$(st_git_root "$name")"
 	git -C "$root" -c user.name=selftest -c user.email=selftest@example.invalid \
 		commit -q --allow-empty -m stub
 	ln -s "$REPO_ROOT/scripts" "$root/scripts"
+	mkdir -p "$root/prompts"
+	for size in 4k 8k 16k 32k; do
+		printf '{"messages":[{"role":"user","content":"hi"}]}' >"$root/prompts/longctx_$size.json"
+	done
 	for profile in "$@"; do
 		mkdir -p "$root/target/$profile"
 		make_stub "$root/target/$profile/rmlx"
@@ -515,6 +538,308 @@ want "rows in the named file" "$(sed 1d "$ST_WORK/named.csv" | wc -l | tr -d ' '
 want "files under the data root" "$(ls "$home/bench" 2>/dev/null || true)" ""
 st_verdict inertness_csv_and_binary_flags "$why" "--csv names the file the rows go to and --binary the rmlx that runs"
 
+# ── the cache-types preset ────────────────────────────────────────────────────
+
+# label|flags of its runs|kv_quant of its record|kv_quant of a row that filed no record
+CT_COMBOS=(
+	"auto||k8v8|auto"
+	"bf16|--cache-type-k bf16 --cache-type-v bf16|none|ct_bf16_bf16"
+	"k8v4|--kv-quant k8v4|k8v4|k8v4"
+	"k8v8|--kv-quant k8v8|k8v8|k8v8"
+	"planar|--kv-quant planar|planar|planar"
+	"q8g128_q4g64|--cache-type-k q8_g128 --cache-type-v q4_g64|mixed_k8g128_v4g64|mixed_k8g128_v4g64"
+	"q8g128_q8g64|--cache-type-k q8_g128 --cache-type-v q8_g64|mixed_k8g128_v8g64|mixed_k8g128_v8g64"
+	"q8g128_q4g128|--cache-type-k q8_g128 --cache-type-v q4_g128|mixed_k8g128_v4g128|mixed_k8g128_v4g128"
+	"q8g128_q6g64|--cache-type-k q8_g128 --cache-type-v q6_g64|mixed_k8g128_v6g64|mixed_k8g128_v6g64"
+	"q8g128_q8g32|--cache-type-k q8_g128 --cache-type-v q8_g32|mixed_k8g128_v8g32|mixed_k8g128_v8g32"
+	"q4g64_q4g64|--cache-type-k q4_g64 --cache-type-v q4_g64|mixed_k4g64_v4g64|mixed_k4g64_v4g64"
+	"q8g128_tq4|--cache-type-k q8_g128 --cache-type-v tq4|k8v4|k8v4"
+	"q8g128_planar4|--cache-type-k q8_g128 --cache-type-v planar4|planar|planar"
+)
+
+ct_run() { # <home> [tool args...] — the matrix over the cell model
+	local home="$1"
+	shift
+	run_tool "$home" "$FAKE" --preset cache-types --model "$CELL_MODEL" --arch-class Stub "$@"
+}
+
+# ct_field <n> — field <n> of every combo, space separated
+ct_field() {
+	local entry out="" f1 f2 f3 f4
+	for entry in "${CT_COMBOS[@]}"; do
+		IFS='|' read -r f1 f2 f3 f4 <<<"$entry"
+		case "$1" in 1) out="$out $f1" ;; 3) out="$out $f3" ;; esac
+	done
+	printf '%s' "${out# }"
+}
+
+# run_facts <argv-file> — per logged run: prompt tokens, generated tokens, context, record class, cache flags.
+# `--gen-tokens` and `--ctx-max` are the visible aliases of `--max-tokens` and `--max-ctx`.
+run_facts() {
+	awk '{
+		p = n = c = ""; rec = "-"; flags = ""
+		for (i = 1; i <= NF; i++) {
+			if ($i == "--prompt-tokens") p = $(i + 1)
+			else if ($i == "--max-tokens" || $i == "--gen-tokens") n = $(i + 1)
+			else if ($i == "--max-ctx" || $i == "--ctx-max") c = $(i + 1)
+			else if ($i == "--run-class") rec = $(i + 1)
+			else if ($i == "--cache-type-k" || $i == "--cache-type-v" || $i == "--kv-quant") flags = flags (flags == "" ? "" : " ") $i " " $(i + 1)
+		}
+		print "p=" p " n=" n " c=" c " rec=" rec " flags=" flags
+	}' "$1"
+}
+
+# ct_expected_runs <prompt> <context> — the runs of a matrix in which every smoke probe and cell passes
+ct_expected_runs() {
+	local entry flags rest i
+	for entry in "${CT_COMBOS[@]}"; do
+		IFS='|' read -r rest flags rest <<<"$entry"
+		echo "p=4096 n=16 c=8192 rec=diagnostic flags=$flags"
+		for i in 1 2 3 4 5; do
+			echo "p=$1 n=32 c=$2 rec=- flags=$flags"
+		done
+	done
+}
+
+# ct_rows <output> — the summary table, its numbers read as numbers (12.0 and 12 are one reading)
+ct_rows() {
+	grep -A13 '^label  *kv_quant' <<<"$1" | awk '{ $1 = $1; for (i = 1; i <= NF; i++) if ($i ~ /^[0-9.]+$/) $i = $i + 0; print }'
+}
+
+# ct_expected_rows [<label>=<row>]... — the summary of a matrix whose rows all passed, bar the rows given
+ct_expected_rows() {
+	local entry label kv arg row rest
+	echo "label kv_quant decode_tps decode_stddev status"
+	for entry in "${CT_COMBOS[@]}"; do
+		IFS='|' read -r label rest kv rest <<<"$entry"
+		row="$label $kv 10 0 ok"
+		for arg in "$@"; do
+			case "$arg" in "$label="*) row="${arg#*=}" ;; esac
+		done
+		echo "$row"
+	done
+}
+
+# ct_expected_failed <status> — a matrix in which no combo filed a record: every row has this status
+ct_expected_failed() {
+	local entry label kv rest
+	echo "label kv_quant decode_tps decode_stddev status"
+	for entry in "${CT_COMBOS[@]}"; do
+		IFS='|' read -r label rest rest kv <<<"$entry"
+		echo "$label $kv $1"
+	done
+}
+
+ct_records() { # <home> — how many records `metrics record` was handed
+	ls "$1/records" 2>/dev/null | wc -l | tr -d ' '
+}
+
+ct_record_field() { # <record file> <python expression over r>
+	python3 -c 'import json, sys; r = json.load(open(sys.argv[1])); print(eval(sys.argv[2]))' "$1" "$2"
+}
+
+# Call numbers of a matrix in which every probe and cell passes: combo i (from 0) makes
+# 6i+1 the smoke probe, 6i+2 and 6i+3 the warmups, 6i+4 to 6i+6 the measured runs.
+home="$(new_home cache_types_default)"
+control "$home" readings "$(printf '%s\n' '4 10.0 1.0' '5 14.0 2.0' '6 12.0 3.0')"
+ct_run "$home"
+CT_OUT="$ST_OUT"
+why="$(st_check 0 --has "MATRIX SUMMARY  model=host__m arch=Stub weight=fp16" --has "prompt_id=longctx_4k prompt_tokens=4096 ctx_max=8192")"
+want "runs" "$(run_facts "$home/baseline_argv")" "$(ct_expected_runs 4096 8192)"
+want "smoke labels" "$(sed -n 's/.* --label \(ctype-smoke-[^ ]*\).*/\1/p' "$home/baseline_argv" | tr '\n' ' ')" \
+	"$(for l in $(ct_field 1); do printf 'ctype-smoke-%s ' "$l"; done)"
+st_verdict cache_types_argv_per_combo "$why" "per combo: one smoke probe (16 tokens, recorded diagnostic) and 2 + 3 unrecorded runs (32 tokens) with the combo's cache flags"
+
+why=""
+want "records filed" "$(ct_records "$home")" 13
+want "record kv_quant" "$(for n in $(seq 1 13); do ct_record_field "$home/records/$n" 'r["kv_quant"]'; done | tr '\n' ' ' | sed 's/ $//')" "$(ct_field 3)"
+want "record ctk ctv in notes" "$(for n in 2 6 12; do ct_record_field "$home/records/$n" 'r["notes"]'; done | tr '\n' '|')" \
+	"label=ctype-bf16 ctk=bf16 ctv=bf16 warmup=2 measured=3|label=ctype-q8g128_q4g64 ctk=q8_g128 ctv=q4_g64 warmup=2 measured=3|label=ctype-q8g128_tq4 ctk=q8_g128 ctv=tq4 warmup=2 measured=3|"
+st_verdict cache_types_record_kv_quant "$why" "a cell's record names the pair as mixed_k<bits>g<group>_v<bits>g<group>, none for bf16, k8v4 for tq4, planar for planar4"
+
+why=""
+rec1="$(sed 's/"ts_utc": "[^"]*"/"ts_utc": "MASKED"/; /"description"/d' "$home/records/1")"
+want "first record" "$rec1" "$(cat <<EOF
+{
+  "backend": "rmlx",
+  "backend_version": "9.9.9",
+  "build_profile": "release-perf",
+  "hardware_tag": "m5_max_128gb",
+  "git_sha": "$HEAD_SHA",
+  "model_namespace": "host",
+  "model": "m",
+  "weight_quant": "fp16",
+  "kv_quant": "k8v8",
+  "ctx_max": 8192,
+  "prompt": {
+    "name": "longctx_4k",
+    "body": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "hi"
+        }
+      ]
+    }
+  },
+  "ts_utc": "MASKED",
+  "prompt_tokens": 4096,
+  "max_tokens": 32,
+  "temperature": 0.0,
+  "n_warmups": 2,
+  "n_measure": 3,
+  "notes": "label=ctype-auto ctk=auto ctv=auto warmup=2 measured=3",
+  "run_class": "gate",
+  "metrics": [
+    {
+      "name": "decode_tps_warm",
+      "value": 12.0,
+      "stddev": 2.0
+    },
+    {
+      "name": "ttft_warm_ms",
+      "value": 1.0
+    },
+    {
+      "name": "model_load_ms",
+      "value": 250.0
+    },
+    {
+      "name": "peak_rss_mb",
+      "value": 2048.5
+    }
+  ]
+}
+EOF
+)"
+want "description" "$(ct_record_field "$home/records/1" 'r["description"].split(" ", 2)[2]')" "m ctype-auto"
+want "ts_utc" "$(ct_record_field "$home/records/1" 'r["ts_utc"]' | grep -cE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' || true)" 1
+st_verdict cache_types_record_fields "$why" "the cell's one record: identity, the combo's kv_quant, the prompt, the sizes, class gate, and the median decode rate with its stddev, ttft, load time and peak RSS"
+
+why=""
+want "summary" "$(ct_rows "$CT_OUT")" "$(ct_expected_rows "auto=auto k8v8 12 2 ok")"
+st_verdict cache_types_summary_rows "$why" "one row per combo: label, kv_quant, median decode rate, stddev, status"
+
+home="$(new_home cache_types_prompt_16k)"
+ct_run "$home" --prompt-tokens 16384
+why="$(st_check 0 --has "prompt_id=longctx_16k prompt_tokens=16384 ctx_max=32768")"
+want "runs" "$(run_facts "$home/baseline_argv")" "$(ct_expected_runs 16384 32768)"
+want "prompt in the record" "$(ct_record_field "$home/records/1" '"%s %s %s" % (r["prompt"]["name"], r["prompt_tokens"], r["ctx_max"])')" "longctx_16k 16384 32768"
+st_verdict cache_types_prompt_tokens_sets_context "$why" "--prompt-tokens picks the prompt file and the cell context; the smoke probe stays at 4096 / 8192"
+
+home="$(new_home cache_types_prompt_32k)"
+ct_run "$home" --prompt-tokens 32768
+why="$(st_check 0 --has "prompt_id=longctx_32k prompt_tokens=32768 ctx_max=65536")"
+st_verdict cache_types_context_doubles_above_16k "$why" "above 16384 prompt tokens the context is twice the prompt"
+
+home="$(new_home cache_types_prompt_fixture_missing)"
+ct_run "$home" --prompt-tokens 12288
+why="$(st_check 0 --has "longctx_12k.json")"
+want "summary" "$(ct_rows "$ST_OUT")" "$(ct_expected_failed fail_rc8)"
+want "records filed" "$(ct_records "$home")" 0
+st_verdict cache_types_prompt_fixture_missing "$why" "a prompt with no fixture file files no record and the row says fail_rc8"
+
+home="$(new_home cache_types_resolver_skip)"
+control "$home" fail_on "$(printf '%s\n' 78 ' --cache-type-v tq4 ' ' --record ')"
+ct_run "$home"
+why="$(st_check 0 --has "CELL SKIP (resolver) label=q8g128_tq4")"
+want "summary" "$(ct_rows "$ST_OUT")" "$(ct_expected_rows "q8g128_tq4=q8g128_tq4 k8v4 skip")"
+want "records filed" "$(ct_records "$home")" 12
+want "runs" "$(wc -l <"$home/baseline_argv" | tr -d ' ')" 73
+st_verdict cache_types_resolver_skip_in_smoke "$why" "a smoke probe that exits 78 skips its cell: a skip row, no cell runs, no record"
+
+home="$(new_home cache_types_resolver_skip_in_cell)"
+control "$home" fail_on "$(printf '%s\n' 78 ' --cache-type-v planar4 ' ' --max-tokens 32 ')"
+ct_run "$home"
+why="$(st_check 0)"
+want "summary" "$(ct_rows "$ST_OUT")" "$(ct_expected_rows "q8g128_planar4=q8g128_planar4 planar skip")"
+want "records filed" "$(ct_records "$home")" 12
+want "runs" "$(wc -l <"$home/baseline_argv" | tr -d ' ')" 74
+st_verdict cache_types_resolver_skip_in_cell "$why" "a cell run that exits 78 ends the cell at that run: a skip row and no record"
+
+home="$(new_home cache_types_low_median)"
+control "$home" readings "$(printf '%s\n' '4 0.3 1.0' '5 0.3 1.0' '6 0.3 1.0' '10 0.0 1.0' '11 0.0 1.0' '12 0.0 1.0' '16 0.5 1.0' '17 0.5 1.0' '18 0.5 1.0')"
+ct_run "$home"
+why="$(st_check 0 --has "CELL RUNTIME_FAIL")"
+want "summary" "$(ct_rows "$ST_OUT")" "$(ct_expected_rows "auto=auto auto 0 runtime_fail" "bf16=bf16 ct_bf16_bf16 0 runtime_fail" "k8v4=k8v4 k8v4 0.5 0 ok")"
+want "records filed" "$(ct_records "$home")" 11
+st_verdict cache_types_median_below_half_files_no_record "$why" "a median below 0.5 is a runtime_fail row with no record; a median of exactly 0.5 is a result"
+
+smoke_case() { # <name> <what> <status> <reason> — combo 2 (bf16) fails its probe, which is run 7; the control files are set by the caller
+	why="$(st_check 0 --has "CELL SMOKE_FAIL label=bf16 reason=$4 status=$3")"
+	want "summary" "$(ct_rows "$ST_OUT")" "$(ct_expected_rows "bf16=bf16 ct_bf16_bf16 $3")"
+	want "records filed" "$(ct_records "$home")" 12
+	st_verdict "$1" "$why" "$2"
+}
+
+home="$(new_home cache_types_smoke_run_fails)"
+control "$home" fail_on "$(printf '%s\n' 1 ' --cache-type-k bf16 ' ' --record ')"
+ct_run "$home"
+smoke_case cache_types_smoke_run_fails "a smoke run that fails is a smoke_fail row with no cell" smoke_fail baseline_exit_1
+
+home="$(new_home cache_types_smoke_low_rate)"
+control "$home" readings "7 0.2 1.0"
+ct_run "$home"
+smoke_case cache_types_smoke_low_rate "a smoke decode rate below 0.5 is a runtime_fail row" runtime_fail tps_zero=0.2
+
+home="$(new_home cache_types_smoke_no_output)"
+control "$home" silent_on " --label ctype-smoke-bf16 "
+ct_run "$home"
+smoke_case cache_types_smoke_no_output "a smoke run that prints no summary line is a smoke_fail row" smoke_fail no_output
+
+home="$(new_home cache_types_smoke_not_utf8)"
+control "$home" outputs '7 \377\376 broken'
+ct_run "$home"
+smoke_case cache_types_smoke_not_utf8 "a smoke text that is not UTF-8 is a smoke_fail row" smoke_fail non_utf8
+
+home="$(new_home cache_types_smoke_repeats)"
+control "$home" outputs "$(printf '%s\n' '7 a b c d a b c d a b c d a b c d' '8 a b c d a b c d a b c d')"
+ct_run "$home"
+smoke_case cache_types_smoke_repeats "a smoke text repeating one four-word sequence 4 times is a smoke_fail row; 3 times passes" smoke_fail 4gram_repeat=4
+
+home="$(new_home cache_types_smoke_pending_record)"
+control "$home" pending_on "--record"
+ct_run "$home"
+why="$(st_check 75 \
+	--has "record pending: $home/metrics/buffer/pending/stub.json" \
+	--has "CELL OK" \
+	--has "INCOMPLETE: 13 " \
+	--lacks "baseline_exit_75")"
+want "summary" "$(ct_rows "$ST_OUT")" "$(ct_expected_rows)"
+want "records filed" "$(ct_records "$home")" 13
+st_verdict cache_types_smoke_with_a_pending_record_is_measured "$why" "a smoke probe whose record did not land still lets its cell run; the run ends 75"
+
+home="$(new_home cache_types_smoke_records_diagnostic)"
+control "$home" fail_on "78"
+ct_run "$home"
+why="$(st_check 0)"
+want "smoke probes recording as diagnostic" "$(argv_lines_with "$home/baseline_argv" "--record --run-class diagnostic" "--label ctype-smoke-")" 13
+want "runs" "$(wc -l <"$home/baseline_argv" | tr -d ' ')" 13
+st_verdict cache_types_smoke_records_diagnostic "$why" "every smoke probe records as diagnostic"
+
+home="$(new_home cache_types_run_fails)"
+control "$home" crash_on " --max-tokens 32 "
+ct_run "$home"
+why="$(st_check 0)"
+want "summary" "$(ct_rows "$ST_OUT")" "$(ct_expected_failed fail_rc1)"
+want "records filed" "$(ct_records "$home")" 0
+st_verdict cache_types_run_fails "$why" "a cell run that fails ends its cell: a fail_rc<N> row and no record"
+
+home="$(new_home cache_types_record_not_filed)"
+control "$home" record_fails 1
+ct_run "$home"
+why="$(st_check 0 --has "CELL FAIL label=auto")"
+want "failed rows" "$(ct_rows "$ST_OUT" | grep -c ' fail_rc9$' || true)" 13
+st_verdict cache_types_record_not_filed "$why" "a record that does not land is a fail_rc9 row"
+
+home="$(new_home cache_types_unlabelled_snapshot)"
+mkdir -p "$ST_WORK/models_unlabelled/host__m"
+printf '{}\n' >"$ST_WORK/models_unlabelled/host__m/config.json"
+run_tool "$home" "$FAKE" --preset cache-types --model "$ST_WORK/models_unlabelled/host__m" --arch-class Stub
+why="$(st_check 2 --has "cannot label the snapshot's weights")"
+want "runs" "$(cat "$home/baseline_argv" 2>/dev/null || true)" ""
+st_verdict cache_types_unlabelled_snapshot "$why" "a snapshot whose weights have no label ends 2 before any run"
+
 usage_case() { # <name> <needle> <args...>
 	local name="$1" needle="$2"
 	shift 2
@@ -539,5 +864,56 @@ usage_case usage_inertness_with_rate_option "--measure inertness takes none of: 
 usage_case usage_rate_with_inertness_option "--csv belong to --measure inertness" --model "$CELL_MODEL" --kv-quant k8v8 --csv "$ST_WORK/x.csv"
 usage_case usage_rate_with_two_codecs "--kv-quant takes one codec without --measure inertness" --model "$CELL_MODEL" --kv-quant k8v8 --kv-quant iso3
 usage_case usage_inertness_missing_model "model path not found: $ST_WORK/no_such_model" --measure inertness --model "$ST_WORK/no_such_model"
+
+# ── the cache-types preset: what only this tool does ──────────────────────────
+
+home="$(new_home cache_types_zero_reading)"
+control "$home" readings "$(printf '%s\n' '4 10.0 1.0' '5 0.0 1.0' '6 14.0 1.0')"
+ct_run "$home"
+why="$(st_check 0 --has "run 2 failed to parse decode_tps")"
+want "summary" "$(ct_rows "$ST_OUT")" "$(ct_expected_rows "auto=auto k8v8 12 2.8284 ok")"
+want "record median and stddev" "$(ct_record_field "$home/records/1" 'r["metrics"][0]["value"], r["metrics"][0]["stddev"]')" "(12.0, 2.8284)"
+st_verdict cache_types_zero_reading_is_not_a_measurement "$why" "a measured run that reads zero is left out of the median and the stddev"
+
+home="$(new_home cache_types_claim_held)"
+control "$home" claim_held 1
+ct_run "$home"
+why="$(st_check 11)"
+want "runs while the claim is held" "$(cat "$home/baseline_argv" 2>/dev/null || true)" ""
+st_verdict cache_types_claim_held "$why" "a Metal claim another process holds ends the matrix with exit 11, before any run"
+
+home="$(new_home cache_types_binary_flag)"
+make_stub "$ST_WORK/rmlx_named"
+ct_run "$home" --binary "$ST_WORK/rmlx_named"
+why="$(st_check 0)"
+want "binary that ran" "$(sort -u "$home/ran")" "$ST_WORK/rmlx_named"
+st_verdict cache_types_binary_flag "$why" "--binary names the rmlx that runs and files the records"
+
+home="$(new_home cache_types_default_binary_is_release_perf)"
+ct_run "$home"
+why="$(st_check 0)"
+want "binary that ran" "$(sort -u "$home/ran")" "$FAKE/target/release-perf/rmlx"
+want "BENCH_PROGRESS.md" "$(ls "$FAKE/BENCH_PROGRESS.md" 2>/dev/null || true)" ""
+st_verdict cache_types_default_binary_is_release_perf "$why" "with no --binary the matrix runs the checkout's release-perf build; it writes no progress file"
+
+home="$(new_home cache_types_default_binary_falls_back_to_release)"
+run_tool "$home" "$FAKE_RELEASE" --preset cache-types --model "$CELL_MODEL" --arch-class Stub
+why="$(st_check 0)"
+want "binary that ran" "$(sort -u "$home/ran")" "$FAKE_RELEASE/target/release/rmlx"
+st_verdict cache_types_default_binary_falls_back_to_release "$why" "with no release-perf build the matrix runs the release build"
+
+home="$(new_home cache_types_binary_missing)"
+run_tool "$home" "$FAKE_NOBIN" --preset cache-types --model "$CELL_MODEL" --arch-class Stub
+why="$(st_check 125 --has "ERROR: binary not found at $FAKE_NOBIN/target/release/rmlx")"
+st_verdict cache_types_binary_missing "$why" "a matrix with no build ends 125"
+
+usage_case usage_cache_types_without_model "--preset cache-types needs --model" --preset cache-types --arch-class Stub
+usage_case usage_cache_types_without_arch_class "--preset cache-types needs --arch-class" --preset cache-types --model "$CELL_MODEL"
+usage_case usage_cache_types_with_cell_option "--preset cache-types takes none of: --kv-quant" --preset cache-types --model "$CELL_MODEL" --arch-class Stub --kv-quant k8v8
+usage_case usage_cache_types_with_canary_option "belong to --preset canary" --preset cache-types --model "$CELL_MODEL" --arch-class Stub --include-26b
+usage_case usage_cache_types_prompt_not_a_multiple "--prompt-tokens takes a multiple of 1024" --preset cache-types --model "$CELL_MODEL" --arch-class Stub --prompt-tokens 5000
+usage_case usage_cache_types_missing_model "model path not found: $ST_WORK/no_such_model" --preset cache-types --model "$ST_WORK/no_such_model" --arch-class Stub
+usage_case usage_arch_class_without_preset "--arch-class belongs to --preset cache-types" --model "$CELL_MODEL" --kv-quant k8v8 --arch-class Stub
+usage_case usage_canary_with_arch_class "--preset canary takes none of: --arch-class" --preset canary --models-root "$MODELS" --arch-class Stub
 
 st_done

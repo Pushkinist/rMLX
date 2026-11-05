@@ -9,8 +9,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
 | `aggregate_decode_profile.py` | none | Aggregate per-model decode_profile lines from profile_<MODEL>.txt into one CSV row per model. |
-| `bench_cache_types.sh` | run_class_selftest.sh | bench_cache_types.sh — drive the cache-type combo matrix for a single model. |
-| `bench_cell.sh` | bench_cache_types.sh | Per-cell driver for cross-backend bench. |
+| `bench_cell.sh` | by hand | Per-cell driver for cross-backend bench. |
 | `bench_identity_selftest.sh` | make bench-identity-selftest | bench_identity_selftest.sh — mutation check for the commit and run-log sources |
 | `bench_llama_ab.sh` | bench_llama_ab_selftest.sh | bench_llama_ab.sh — ABBA-interleaved A/B comparison of two `llama-server` arms. |
 | `bench_llama_ab_selftest.sh` | make llama-ab-selftest | bench_llama_ab_selftest.sh — mutation check for `scripts/bench_llama_ab.sh`. |
@@ -38,8 +37,9 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
-| `bench/baseline_cells.sh` | make bench-codec-cell, make canary, bench/baseline_cells_selftest.sh, run_class_selftest.sh | baseline_cells.sh — cells through `rmlx baseline`: the canary, one codec, or the inertness sweep |
+| `bench/baseline_cells.sh` | make bench-codec-cell, make canary, bench/baseline_cells_selftest.sh, run_class_selftest.sh | baseline_cells.sh — `rmlx baseline` cells: canary, one codec, inertness sweep, cache-type matrix |
 | `bench/baseline_cells_selftest.sh` | make baseline-cells-selftest | Recall test for the baseline cells tool: canary rows, argv, records and exit codes under a stub rmlx |
+| `bench/cache_types.py` | bench/baseline_cells.sh | Python half of baseline_cells.sh --preset cache-types: a cell's run record and a smoke text check. |
 
 ## scripts/check/
 
@@ -107,7 +107,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/mlx_pin.sh` | crates/rmlx-mlx/src/pin_tests.rs, host/mlx_restore_pin.sh | Read the validated MLX / mlx-c pair from its one declaration. |
 | `lib/prefill_ms.py` | mst_capture.sh | Read the prefill time of an rmlx run out of its log: `generate: prefill{prefill_ms}`. |
 | `lib/published_run_log.py` | lib/prefill_ms.py, published/bench.sh, published/binary_identity.py, +1 more scripts | Read one rmlx run log back as a per-request table. |
-| `lib/record_pending.sh` | crates/rmlx-cli/src/exit_tests.rs, bench/baseline_cells.sh, bench_cache_types.sh, gpu_capture.sh, +2 more scripts | The exit code `rmlx baseline --record` and `rmlx eval ppl --corpus` give a |
+| `lib/record_pending.sh` | crates/rmlx-cli/src/exit_tests.rs, bench/baseline_cells.sh, gpu_capture.sh, perf_ab.sh, +1 more scripts | The exit code `rmlx baseline --record` and `rmlx eval ppl --corpus` give a |
 | `lib/recorder_check.py` | ingest/ingest.py, ingest/llama_bench.py | Refuse a recorder that cannot state a run class. |
 | `lib/rmlx_home.py` | ingest/ingest.py, ingest/llama_bench.py | Resolve the runtime home the way the binary does. |
 | `lib/run_log_for_pid.py` | lib/bench_server.sh | Pick the run log a given process wrote, out of the candidates on stdin. |
@@ -116,7 +116,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/server_kv_quant.py` | lib/bench_server.sh, published/binary_identity.py, ssd_canary.sh | Read the KV codec a run resolved out of its rmlx run log. |
 | `lib/server_sampling.py` | crates/rmlx-server/src/engine/sampler_event_tests.rs, lib/published_run_log.py, spec_bench.sh | Read whether a run's requests were sampled, out of its rmlx run log. |
 | `lib/skip_notice_patterns.sh` | check/gpu_tests.sh, suite/run_gpu_tests.sh | The SKIP and WAIVED stand-down notice patterns, defined once for the runner and the gate. |
-| `lib/snapshot_identity.py` | bench_cache_types.sh, ingest/ingest.py, ingest/llama_bench.py, +4 more scripts | Read a model snapshot's identity columns out of the snapshot itself. |
+| `lib/snapshot_identity.py` | ingest/ingest.py, ingest/llama_bench.py, perf-iter/bench_decode_tps.sh, +3 more scripts | Read a model snapshot's identity columns out of the snapshot itself. |
 | `lib/spec_round_log.py` | lib/published_run_log.py, published/binary_identity.py, spec_bench.sh | Read a speculative round loop's own numbers back out of an rmlx run log. |
 | `lib/sse_decode_window.py` | published/bench.sh, spec_bench.sh, spec_bench_selftest.sh | Time a streamed chat-completions response over its decode window. |
 | `lib/workspace_members.sh` | check/gpu_tests.sh, suite/gpu_test_classes.sh | The workspace members of a Cargo.toml, parsed and normalised once for the tools that read them. |

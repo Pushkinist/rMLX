@@ -500,8 +500,8 @@ supplies:
   (`rmlx_git_sha` in `scripts/lib/identity.sh`). A hex sha that resolves in
   that repo is filed in the short form HEAD is filed in; any other value is
   filed as given, and an `unknown...` value counts as none. This covers
-  `spec_bench.sh`, `ssd_canary.sh`, `bench/baseline_cells.sh`, `bench_cell.sh`,
-  `bench_cache_types.sh` and `perf-iter/bench_decode_tps.sh`.
+  `spec_bench.sh`, `ssd_canary.sh`, `bench/baseline_cells.sh` and
+  `perf-iter/bench_decode_tps.sh`.
 - `rmlx baseline --git-sha <sha>` and `rmlx eval ppl --git-sha <sha>` stamp
   it. Without the flag it is `NULL`.
 
@@ -753,9 +753,10 @@ change to what `bests` publishes, such as a `METRICS_SCHEMA.md` §4.1 bounds cha
     - A run that measured nothing: the canary's one-token codec probe, a
       failed or skipped bench cell. The recorder refuses a record with no
       measurement.
-    - The `rmlx baseline` runs of a `scripts/bench_cell.sh` cache-type cell,
-      and the `rmlx bench` slots of `scripts/prefill_chunk_sweep.sh`: each
-      set is recorded once, as the aggregate the script computes.
+    - The `rmlx baseline` runs of a `bench/baseline_cells.sh --preset
+      cache-types` cell, and the `rmlx bench` slots of
+      `scripts/prefill_chunk_sweep.sh`: each set is recorded once, as the
+      aggregate the script computes.
     - `scripts/schema_constraint_canary.sh`: a correctness proof run under
       `--log verbose` in a hermetic `RMLX_HOME` per probe, so that probe's
       log holds its own records only. It measures no rate.
