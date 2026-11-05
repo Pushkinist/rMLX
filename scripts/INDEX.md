@@ -9,7 +9,6 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
 | `aggregate_decode_profile.py` | none | Aggregate per-model decode_profile lines from profile_<MODEL>.txt into one CSV row per model. |
-| `bench_cell.sh` | by hand | Per-cell driver for cross-backend bench. |
 | `bench_identity_selftest.sh` | make bench-identity-selftest | bench_identity_selftest.sh — mutation check for the commit and run-log sources |
 | `bench_llama_ab.sh` | bench_llama_ab_selftest.sh | bench_llama_ab.sh — ABBA-interleaved A/B comparison of two `llama-server` arms. |
 | `bench_llama_ab_selftest.sh` | make llama-ab-selftest | bench_llama_ab_selftest.sh — mutation check for `scripts/bench_llama_ab.sh`. |
@@ -38,6 +37,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `bench/baseline_cells.sh` | make bench-codec-cell, make canary, bench/baseline_cells_selftest.sh, run_class_selftest.sh | baseline_cells.sh — `rmlx baseline` cells: canary, one codec, inertness sweep, cache-type matrix |
 | `bench/baseline_cells_selftest.sh` | make baseline-cells-selftest | Recall test for the baseline cells tool: canary rows, argv, records and exit codes under a stub rmlx |
 | `bench/cache_types.py` | bench/baseline_cells.sh | Python half of baseline_cells.sh --preset cache-types: a cell's run record and a smoke text check. |
+| `bench/cross_backend.sh` | by hand | Drive one cross-backend bench cell through the Cross-Backend-Bench harness |
 | `bench/serve_bench.sh` | make perf-iter, make spec-canary, bench/serve_bench_selftest.sh | serve_bench.sh — bench one model through rmlx serve, alone or against a drafter |
 | `bench/serve_bench_selftest.sh` | make spec-bench-selftest | Mutation check for serve_bench.sh: a stub rmlx server, asserting recorded values and refusals. |
 | `bench/server_decode_tps.py` | bench/serve_bench.sh | Read one request's decode rate off a running rmlx server. |
@@ -102,7 +102,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/bench_server.sh` | bench/baseline_cells.sh, bench/serve_bench.sh, published/bench.sh | Start, wait for and identify one rmlx server, for bench harnesses; source it. |
 | `lib/busiest_between.awk` | bench_llama_ab.sh, perf_ab.sh, perf_ab_selftest.sh, +2 more scripts | Which process burned the most CPU between two cpu_snapshot files. |
 | `lib/cpu_snapshot.sh` | bench_llama_ab.sh, perf_ab.sh, perf_ab_selftest.sh, +2 more scripts | Per-process cumulative CPU seconds, for interference gates; source it. |
-| `lib/identity.sh` | bench/baseline_cells.sh, bench/serve_bench.sh, bench_cell.sh, +3 more scripts | Shared §8.5 run-identity for rMLX bench scripts. |
+| `lib/identity.sh` | bench/baseline_cells.sh, bench/cross_backend.sh, bench/serve_bench.sh, +3 more scripts | Shared §8.5 run-identity for rMLX bench scripts. |
 | `lib/kv_boundary_default.py` | ingest/ingest.py | The engine's default KV boundary-layer counts, read from the engine. |
 | `lib/metal_dirs.sh` | check/kernel_dispatch.sh, check/metal_kernels.sh, check/metal_kernels_selftest.sh, +1 more scripts | The directories holding gated .metal kernels; sourced by the metal gates. |
 | `lib/mlx_pin.sh` | crates/rmlx-mlx/src/pin_tests.rs, host/mlx_restore_pin.sh | Read the validated MLX / mlx-c pair from its one declaration. |

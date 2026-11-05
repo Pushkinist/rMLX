@@ -431,7 +431,7 @@ rules: `RunRecord::validate` refuses it, and a row written around the
 recorder stores `NULL`, which is not `gate` (`METRICS_SCHEMA.md` §3.2).
 Producers outside this repo state it too: the Cross-Backend-Bench runner
 (`../Cross-Backend-Bench/runners/_common.py`, `_build_metrics_record`), which
-`scripts/bench_cell.sh` hands its non-rMLX cells to, writes `gate`.
+`scripts/bench/cross_backend.sh` hands its non-rMLX cells to, writes `gate`.
 
 **Optional keys**: `schema_version` (default `1`), `backend_version`,
 `git_sha`, `build_profile`, `prompt_tokens`, `max_tokens`, `temperature`,

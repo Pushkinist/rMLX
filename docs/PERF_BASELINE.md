@@ -286,7 +286,7 @@ decode step streams.
 
 ## Cross-backend cells
 
-`scripts/bench_cell.sh` drives one bench cell on one backend: `rmlx`,
+`scripts/bench/cross_backend.sh` drives one bench cell on one backend: `rmlx`,
 `mlx-lm`, `omlx`, `paroquant` or llama.cpp. Its llama.cpp arms load GGUF
 files. No file loads in both families: the MLX backends read MLX safetensors,
 llama.cpp reads GGUF. A llama.cpp cell set against an MLX backend compares

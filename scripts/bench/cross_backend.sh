@@ -1,48 +1,59 @@
 #!/usr/bin/env bash
-# Per-cell driver for cross-backend bench.
+# Drive one cross-backend bench cell through the Cross-Backend-Bench harness
 #
+# Usage:  bash scripts/bench/cross_backend.sh TAG MODEL_PATH BACKEND KV_QUANT BUDGET_MIN
+#             MODEL_DISK_GB WEIGHT_QUANT
+#         TAG            cell label filed in the progress line (e2b, e4b, 26b, 31b, 31b-paro)
+#         MODEL_PATH     absolute path of the snapshot directory; the .gguf file for the llama.cpp arms
+#         BACKEND        rmlx | mlx-lm | mlx-lm-turboquant | omlx | paroquant | llama.cpp
+#                        | llama-cpp-turboquant
+#         KV_QUANT       rmlx: any `rmlx serve --kv-quant` value; mlx-lm: none | auto | bf16 | f16;
+#                        llama.cpp arms: a ggml cache type (none and auto mean f16); the other arms
+#                        serve their own codec (mlx-lm-turboquant 8,4) and only file this name.
+#                        Filed as: mixed -> k8v4, turboquant -> turbo4, native -> none, else as given
+#         BUDGET_MIN     whole minutes for the server to come up and the harness to finish
+#         MODEL_DISK_GB  model size on disk in GB, for the harness's tps-per-gb
+#         WEIGHT_QUANT   weight format label filed with the cell (mxfp8, paro, ...)
+# Exit:   0 the cell ran (its success and coherence are in the progress line); 1 unknown backend or
+#         a missing argument; 2 the server did not become ready; 3 the budget ran out before the
+#         harness started; 5 no llama-server binary; 6 bare mlx-lm given a quantised KV_QUANT
+# Not a mode of: bench/baseline_cells.sh — that one runs `rmlx baseline` in process; this one starts
+#         a backend's own server and hands it to the Cross-Backend-Bench harness
 # Caller: by hand
 #
-# ---------------------------------------------------------------------------
-# Positional interface (unchanged, backward compatible):
-#
-#   .bench_cell.sh TAG MODEL_PATH BACKEND KV_QUANT BUDGET_MIN MODEL_DISK_GB QUANT_SIG
-#
-# Drives the Python CBB harness against an HTTP backend, parses one cold +
-# one warm run, appends a single line to BENCH_PROGRESS.md, and (for rmlx)
-# routes records into the canonical metrics DB via RMLX_METRICS_DB.
-#
-# ---------------------------------------------------------------------------
+# One line per cell is appended to <RMLX_HOME>/bench/cross_backend_progress.md. The harness
+# checkout is $CROSS_BENCH_ROOT, default ../Cross-Backend-Bench. An rmlx cell's records go into
+# <RMLX_HOME>/metrics/runs.db through RMLX_METRICS_DB.
 set -uo pipefail
 
-TAG="$1"            # e2b/e4b/26b/31b/31b-paro
-MODEL_PATH="$2"     # abs path to snapshot
-BACKEND="$3"        # rmlx | mlx-lm | mlx-lm-turboquant | omlx | paroquant
-                    #   | llama.cpp | llama-cpp-turboquant
-KV_QUANT="$4"       # k8v4|k8v8|planar|mixed | turboquant | native
-BUDGET_MIN="$5"     # int minutes
-MODEL_DISK_GB="$6"  # for harness tps-per-gb
-WEIGHT_QUANT="$7"   # mxfp8 | paro | ... (whitelist)
+TAG="$1"
+MODEL_PATH="$2"
+BACKEND="$3"
+KV_QUANT="$4"
+BUDGET_MIN="$5"
+MODEL_DISK_GB="$6"
+WEIGHT_QUANT="$7"
 
-PROGRESS=${RMLX_ROOT}/BENCH_PROGRESS.md
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 CBB=${CROSS_BENCH_ROOT:-../Cross-Backend-Bench}
-RMLX_DIR=${RMLX_ROOT}
 # Read by the cross-backend harness to find this checkout's binary and metrics buffer.
-export RMLX_REPO_ROOT="${RMLX_DIR}"
+export RMLX_REPO_ROOT="${REPO_ROOT}"
 
 # Run identity (backend / version / git sha / build profile / hardware tag)
 # comes from the measured binary — never hard-coded here.
-source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
-rmlx_export_identity "$RMLX_DIR/target/release/rmlx"
+source "${REPO_ROOT}/scripts/lib/identity.sh"
+rmlx_export_identity "$REPO_ROOT/target/release/rmlx"
 PORT=62265
-RMLX_BIN="$RMLX_DIR/target/release/rmlx"
+RMLX_BIN="$REPO_ROOT/target/release/rmlx"
 BUDGET_S=$((BUDGET_MIN * 60))
 
 # Runtime state lives under one root (CLAUDE.md): `RMLX_HOME`, else the
 # checkout's `.rmlx/`. The CBB harness reads the DB path from RMLX_METRICS_DB.
-RMLX_HOME="${RMLX_HOME:-${RMLX_DIR}/.rmlx}"
+RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
 export RMLX_HOME
 export RMLX_METRICS_DB="${RMLX_HOME}/metrics/runs.db"
+PROGRESS="${RMLX_HOME}/bench/cross_backend_progress.md"
+mkdir -p "$(dirname "$PROGRESS")"
 
   _PROMPT_ID_EFF="longctx_8k"
   _CTX_MAX_EFF=16384
@@ -79,7 +90,7 @@ WARMUP_MODEL=""
 
 case "$BACKEND" in
   rmlx)
-    ( cd "$RMLX_DIR" && exec ./target/release/rmlx serve \
+    ( cd "$REPO_ROOT" && exec ./target/release/rmlx serve \
         --model "$MODEL_PATH" \
         --port "$PORT" \
         --device gpu \
@@ -294,7 +305,7 @@ HARNESS_ARGS=(
   --runs 2
   --backend-pid "$BACKEND_PID"
   --model-disk-gb "$MODEL_DISK_GB"
-  --prompt-file "$RMLX_DIR/prompts/longctx_8k.json"
+  --prompt-file "$REPO_ROOT/prompts/longctx_8k.json"
   --request-timeout 1800
 )
 if [ -n "$API_KEY" ]; then
