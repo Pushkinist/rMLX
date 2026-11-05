@@ -37,7 +37,8 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `bench/baseline_cells.sh` | make bench-codec-cell, make canary, bench/baseline_cells_selftest.sh, run_class_selftest.sh | baseline_cells.sh — `rmlx baseline` cells: canary, one codec, inertness sweep, cache-type matrix |
 | `bench/baseline_cells_selftest.sh` | make baseline-cells-selftest | Recall test for the baseline cells tool: canary rows, argv, records and exit codes under a stub rmlx |
 | `bench/cache_types.py` | bench/baseline_cells.sh | Python half of baseline_cells.sh --preset cache-types: a cell's run record and a smoke text check. |
-| `bench/cross_backend.sh` | by hand | Drive one cross-backend bench cell through the Cross-Backend-Bench harness |
+| `bench/cross_backend.sh` | bench/cross_backend_selftest.sh | Drive one cross-backend bench cell through the Cross-Backend-Bench harness |
+| `bench/cross_backend_selftest.sh` | make cross-backend-selftest | Recall test for the cross-backend cell tool: the codec name it files, where its files go, its exits |
 | `bench/serve_bench.sh` | make perf-iter, make spec-canary, bench/serve_bench_selftest.sh | serve_bench.sh — bench one model through rmlx serve, alone or against a drafter |
 | `bench/serve_bench_selftest.sh` | make spec-bench-selftest | Mutation check for serve_bench.sh: a stub rmlx server, asserting recorded values and refusals. |
 | `bench/server_decode_tps.py` | bench/serve_bench.sh | Read one request's decode rate off a running rmlx server. |
@@ -99,7 +100,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
 | `lib/awk_text.sh` | crates/rmlx-models/tests/common/stop_scan.rs, check/gpu_device_census.sh, check/gpu_tests.sh, check/kernel_dispatch.sh, +2 more scripts | Line readers for Rust-scanning gates: code without comments, without string bodies, bodiless fns. |
-| `lib/bench_server.sh` | bench/baseline_cells.sh, bench/serve_bench.sh, published/bench.sh | Start, wait for and identify one rmlx server, for bench harnesses; source it. |
+| `lib/bench_server.sh` | bench/baseline_cells.sh, bench/cross_backend.sh, bench/serve_bench.sh, +1 more scripts | Start, wait for and identify one rmlx server, for bench harnesses; source it. |
 | `lib/busiest_between.awk` | bench_llama_ab.sh, perf_ab.sh, perf_ab_selftest.sh, +2 more scripts | Which process burned the most CPU between two cpu_snapshot files. |
 | `lib/cpu_snapshot.sh` | bench_llama_ab.sh, perf_ab.sh, perf_ab_selftest.sh, +2 more scripts | Per-process cumulative CPU seconds, for interference gates; source it. |
 | `lib/identity.sh` | bench/baseline_cells.sh, bench/cross_backend.sh, bench/serve_bench.sh, +3 more scripts | Shared §8.5 run-identity for rMLX bench scripts. |
@@ -112,7 +113,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/recorder_check.py` | ingest/ingest.py, ingest/llama_bench.py | Refuse a recorder that cannot state a run class. |
 | `lib/rmlx_home.py` | ingest/ingest.py, ingest/llama_bench.py | Resolve the runtime home the way the binary does. |
 | `lib/run_log_for_pid.py` | lib/bench_server.sh | Pick the run log a given process wrote, out of the candidates on stdin. |
-| `lib/selftest_support.sh` | bench/baseline_cells_selftest.sh, bench/serve_bench_selftest.sh, bench_llama_ab_selftest.sh, +19 more scripts | The case runner and shims the self-tests share; source it. |
+| `lib/selftest_support.sh` | bench/baseline_cells_selftest.sh, bench/cross_backend_selftest.sh, bench/serve_bench_selftest.sh, +20 more scripts | The case runner and shims the self-tests share; source it. |
 | `lib/server_kv_quant.py` | lib/bench_server.sh, published/binary_identity.py, ssd_canary.sh | Read the KV codec a run resolved out of its rmlx run log. |
 | `lib/server_sampling.py` | crates/rmlx-server/src/engine/sampler_event_tests.rs, bench/serve_bench.sh, lib/published_run_log.py | Read whether a run's requests were sampled, out of its rmlx run log. |
 | `lib/skip_notice_patterns.sh` | check/gpu_tests.sh, suite/run_gpu_tests.sh | The SKIP and WAIVED stand-down notice patterns, defined once for the runner and the gate. |

@@ -10,20 +10,22 @@
 #         KV_QUANT       rmlx: any `rmlx serve --kv-quant` value; mlx-lm: none | auto | bf16 | f16;
 #                        llama.cpp arms: a ggml cache type (none and auto mean f16); the other arms
 #                        serve their own codec (mlx-lm-turboquant 8,4) and only file this name.
-#                        Filed as: mixed -> k8v4, turboquant -> turbo4, native -> none, else as given
+#                        Filed as: rmlx: the codec its server's run log states; the other arms: mixed ->
+#                        k8v4, turboquant -> turbo4, native -> none, else as given
 #         BUDGET_MIN     whole minutes for the server to come up and the harness to finish
 #         MODEL_DISK_GB  model size on disk in GB, for the harness's tps-per-gb
 #         WEIGHT_QUANT   weight format label filed with the cell (mxfp8, paro, ...)
 # Exit:   0 the cell ran (its success and coherence are in the progress line); 1 unknown backend or
 #         a missing argument; 2 the server did not become ready; 3 the budget ran out before the
-#         harness started; 5 no llama-server binary; 6 bare mlx-lm given a quantised KV_QUANT
+#         harness started; 4 no codec name to file (an rmlx server's run log states none); 5 no
+#         llama-server binary; 6 bare mlx-lm given a quantised KV_QUANT
 # Not a mode of: bench/baseline_cells.sh — that one runs `rmlx baseline` in process; this one starts
 #         a backend's own server and hands it to the Cross-Backend-Bench harness
-# Caller: by hand
 #
-# One line per cell is appended to <RMLX_HOME>/bench/cross_backend_progress.md. The harness
-# checkout is $CROSS_BENCH_ROOT, default ../Cross-Backend-Bench. An rmlx cell's records go into
-# <RMLX_HOME>/metrics/runs.db through RMLX_METRICS_DB.
+# One line per cell is appended to <RMLX_HOME>/bench/cross_backend_progress.md. The server and
+# harness logs and the oMLX models directory are in <RMLX_HOME>/tmp, where the transient files are.
+# The harness checkout is $CROSS_BENCH_ROOT, default ../Cross-Backend-Bench. An rmlx cell's records
+# go into <RMLX_HOME>/metrics/runs.db through RMLX_METRICS_DB.
 set -uo pipefail
 
 TAG="$1"
@@ -42,6 +44,7 @@ export RMLX_REPO_ROOT="${REPO_ROOT}"
 # Run identity (backend / version / git sha / build profile / hardware tag)
 # comes from the measured binary — never hard-coded here.
 source "${REPO_ROOT}/scripts/lib/identity.sh"
+source "${REPO_ROOT}/scripts/lib/bench_server.sh"
 rmlx_export_identity "$REPO_ROOT/target/release/rmlx"
 PORT=62265
 RMLX_BIN="$REPO_ROOT/target/release/rmlx"
@@ -53,7 +56,9 @@ RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
 export RMLX_HOME
 export RMLX_METRICS_DB="${RMLX_HOME}/metrics/runs.db"
 PROGRESS="${RMLX_HOME}/bench/cross_backend_progress.md"
-mkdir -p "$(dirname "$PROGRESS")"
+LOG_DIR="${RMLX_HOME}/logs"
+SCRATCH_DIR="${RMLX_HOME}/tmp"
+mkdir -p "$(dirname "$PROGRESS")" "$LOG_DIR" "$SCRATCH_DIR"
 
   _PROMPT_ID_EFF="longctx_8k"
   _CTX_MAX_EFF=16384
@@ -61,35 +66,25 @@ mkdir -p "$(dirname "$PROGRESS")"
 export CBB_CTX_MAX="${_CTX_MAX_EFF}"
 export CBB_PROMPT_NAME="${_PROMPT_ID_EFF}"
 
-# Map KV alias → whitelist value used in §8.5 record / DB (legacy path).
-case "$KV_QUANT" in
-  mixed)      KV_FOR_DB=k8v4 ;;   # rMLX Mixed{K=8,V=4} → catalog k8v4
-  turboquant) KV_FOR_DB=turbo4 ;; # mlx-lm-tq 8,4
-  native)     KV_FOR_DB=none ;;   # paroquant native (no extra KV quant)
-  *)          KV_FOR_DB="$KV_QUANT" ;;
-esac
-
-QUANT_SIG="${WEIGHT_QUANT} / ${KV_FOR_DB}"
-
 MODEL_ID=$(basename "$MODEL_PATH")
 TS_START=$(date +%s)
 TS_HMS=$(date +%H:%M:%S)
-LOG=/tmp/bench_${TAG}_${BACKEND}_${KV_QUANT}.log
-HARNESS_LOG=/tmp/bench_harness_${TAG}_${BACKEND}_${KV_QUANT}.log
+LOG="${SCRATCH_DIR}/bench_${TAG}_${BACKEND}_${KV_QUANT}.log"
+HARNESS_LOG="${SCRATCH_DIR}/bench_harness_${TAG}_${BACKEND}_${KV_QUANT}.log"
 
 echo "[$(date +%T)] CELL START tag=$TAG backend=$BACKEND kv=$KV_QUANT model_id=$MODEL_ID" >&2
 
 # The Metal claim is the one gate on the GPU: an rmlx arm takes it itself, and
 # every other backend runs under `rmlx claim run`. A claim another process
-# holds stops the cell with exit 11 and names the holder; this script stops only
-# the server it started.
+# holds ends the cell with exit 2 and the server's 11 in the message; this script
+# stops only the server it started.
 
 # --- Launch backend ---
 SERVER_PID=0
-WARMUP_MODEL=""
 
 case "$BACKEND" in
   rmlx)
+    snapshot_logs
     ( cd "$REPO_ROOT" && exec ./target/release/rmlx serve \
         --model "$MODEL_PATH" \
         --port "$PORT" \
@@ -97,7 +92,6 @@ case "$BACKEND" in
         --max-ctx 16384 \
         --kv-quant "$KV_QUANT" ) >"$LOG" 2>&1 &
     SERVER_PID=$!
-    WARMUP_MODEL="$MODEL_ID"
     BASE_URL="http://127.0.0.1:$PORT"
     API_KEY=""
     HARNESS_MODEL="$MODEL_ID"
@@ -116,12 +110,13 @@ case "$BACKEND" in
     HARNESS_MODEL="$MODEL_PATH"
     ;;
   omlx)
-    mkdir -p /tmp/omlx_models
-    find /tmp/omlx_models -mindepth 1 -maxdepth 1 -delete 2>/dev/null
+    OMLX_MODELS="${SCRATCH_DIR}/omlx_models"
+    mkdir -p "$OMLX_MODELS"
+    find "$OMLX_MODELS" -mindepth 1 -maxdepth 1 -delete 2>/dev/null
     OMLX_MODEL_NAME="gemma4-${TAG}"
-    ln -sfn "$MODEL_PATH" "/tmp/omlx_models/$OMLX_MODEL_NAME"
+    ln -sfn "$MODEL_PATH" "$OMLX_MODELS/$OMLX_MODEL_NAME"
     "$RMLX_BIN" claim run -- "${OMLX_ROOT:-../oMLX}/.venv/bin/omlx" serve \
-        --model-dir /tmp/omlx_models \
+        --model-dir "$OMLX_MODELS" \
         --port "$PORT" \
         --api-key 1234 >"$LOG" 2>&1 &
     SERVER_PID=$!
@@ -269,6 +264,27 @@ if [ "$READY" -ne 1 ] || [ -z "$BACKEND_PID" ]; then
   echo "[$(date +%T)] $TAG | $BACKEND | $KV_QUANT | success=false | coh=false | SERVER_NOT_READY" >>"$PROGRESS"
   exit 2
 fi
+
+# --- Name the codec the cell is filed under ---
+KV_FILED=""
+if [ "$BACKEND" = rmlx ]; then
+  RUN_LOG="$(phase_log "$SERVER_PID")" || RUN_LOG=""
+  [ -z "$RUN_LOG" ] || KV_FILED="$(log_kv_quant "$RUN_LOG")"
+else
+  case "$KV_QUANT" in
+    mixed)      KV_FILED=k8v4 ;;
+    turboquant) KV_FILED=turbo4 ;;
+    native)     KV_FILED=none ;;
+    *)          KV_FILED="$KV_QUANT" ;;
+  esac
+fi
+if [ -z "$KV_FILED" ]; then
+  stop_server
+  echo "ERROR: cell $TAG $BACKEND $KV_QUANT: no KV codec name to file it under (an rmlx server's run log states none)" >&2
+  echo "[$(date +%T)] $TAG | $BACKEND | $KV_QUANT | success=false | coh=false | NO_KV_NAME" >>"$PROGRESS"
+  exit 4
+fi
+QUANT_SIG="${WEIGHT_QUANT} / ${KV_FILED}"
 
 # --- Warmup (1 token) ---
 if [ -n "$API_KEY" ]; then

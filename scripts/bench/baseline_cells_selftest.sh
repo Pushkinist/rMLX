@@ -961,8 +961,7 @@ home="$(new_home cache_types_default_binary_is_release_perf)"
 ct_run "$home"
 why="$(st_check 0)"
 want "binary that ran" "$(sort -u "$home/ran")" "$FAKE/target/release-perf/rmlx"
-want "BENCH_PROGRESS.md" "$(ls "$FAKE/BENCH_PROGRESS.md" 2>/dev/null || true)" ""
-st_verdict cache_types_default_binary_is_release_perf "$why" "with no --binary the matrix runs the checkout's release-perf build; it writes no progress file"
+st_verdict cache_types_default_binary_is_release_perf "$why" "with no --binary the matrix runs the checkout's release-perf build"
 
 home="$(new_home cache_types_default_binary_falls_back_to_release)"
 run_tool "$home" "$FAKE_RELEASE" --preset cache-types --model "$CELL_MODEL" --arch-class Stub

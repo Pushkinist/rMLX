@@ -95,7 +95,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         build-perf build-debug test-perf ci-perf gpu-test claim-rmlx model-check model-check-full \
         profile-samply profile-samply-debug profile-instruments bench asm perf-iter \
         canary canary-gate canary-ab canary-ab-selftest canary-ab-ingest-selftest ingest-selftest \
-        canary-ab-host-gate-fixtures codec-smoke-runner-selftest llama-ab-selftest spec-bench-selftest bench-identity-selftest baseline-cells-selftest run-class-selftest \
+        canary-ab-host-gate-fixtures codec-smoke-runner-selftest llama-ab-selftest spec-bench-selftest bench-identity-selftest baseline-cells-selftest cross-backend-selftest run-class-selftest \
         spec-bench-published-selftest published-ingest-selftest \
         published-table check-published-table published-table-selftest \
         check-spec-metric-parity check-spec-metric-parity-fixtures \
@@ -800,6 +800,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@$(MAKE) --no-print-directory spec-bench-selftest
 	@$(MAKE) --no-print-directory bench-identity-selftest
 	@$(MAKE) --no-print-directory baseline-cells-selftest
+	@$(MAKE) --no-print-directory cross-backend-selftest
 	@$(MAKE) --no-print-directory run-class-selftest
 	@$(MAKE) --no-print-directory spec-bench-published-selftest
 	@$(MAKE) --no-print-directory published-ingest-selftest
@@ -1016,6 +1017,9 @@ bench-identity-selftest: ## mutation-check the commit and run-log sources of the
 
 baseline-cells-selftest: ## recall-check the canary preset, the single codec cell and the inertness sweep: argv, CSV rows, median and stddev, digests, records, exit codes (stub binary; no GPU, no model, no DB write)
 	bash scripts/bench/baseline_cells_selftest.sh
+
+cross-backend-selftest: ## recall-check the cross-backend cell tool: the codec name an rmlx cell is filed under, the files it keeps under RMLX_HOME, its exit codes (stub rmlx, curl and harness; no backend, no GPU, no model)
+	bash scripts/bench/cross_backend_selftest.sh
 
 run-class-selftest: ## check that the capture scripts, the inertness sweep and its ingest record under a stated run class, and record a run once (stub binaries; no GPU, no model, no DB write)
 	bash scripts/run_class_selftest.sh
