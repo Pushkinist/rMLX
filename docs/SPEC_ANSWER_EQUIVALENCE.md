@@ -16,7 +16,7 @@ the same function as decode steps, and no correct speculative arm is
 byte-identical to plain greedy in general. That is why the gate judges a first
 difference by the divergence-confidence oracle and not by equality.
 
-**This is not the bench's answer check.** `scripts/spec_bench.sh` digests each
+**This is not the bench's answer check.** `scripts/bench/serve_bench.sh` digests each
 measured completion. Equal digests file a speculative row as `matches_plain`.
 A difference goes to `rmlx eval spec-answer`, which applies the oracle below
 to one unstreamed logprob pass of each arm at 128 tokens, with the length

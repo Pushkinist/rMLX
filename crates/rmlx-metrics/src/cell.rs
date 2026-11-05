@@ -217,7 +217,7 @@ pub fn decode_config_with_inherent_depth(value: &str) -> Option<String> {
 /// Rows for every other drafter keep the cell they have always been in.
 ///
 /// This is the only place the **drafter** terms are written: the engine composes
-/// the string here and logs it on its `done` line, and `scripts/spec_bench.sh`
+/// the string here and logs it on its `done` line, and `scripts/bench/serve_bench.sh`
 /// records what the engine said rather than spelling it a second time. It is not
 /// the only composer of the *column* — `rmlx_models::kv_cache`'s boundary terms,
 /// `scripts/ingest/ingest.py` (`ab`, `codec-inertness`) and

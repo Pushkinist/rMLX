@@ -37,7 +37,7 @@ The opposite hazard, a server batching several tokens into one chunk, makes the
 window read low by the batching factor and is **not** detectable from these
 counts — a batched stream looks exactly like one with uncounted stop tokens.
 What catches it is the caller comparing this rate against the engine's own
-reading of the same window; see `scripts/spec_bench.sh`.
+reading of the same window; see `scripts/bench/serve_bench.sh`.
 
 Usage: `sse_decode_window.py --url URL --body-file FILE [--raw FILE]`. The file
 holds the JSON request body, which is POSTed with `Content-Type:

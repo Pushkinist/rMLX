@@ -1014,7 +1014,7 @@ llama-ab-selftest: ## mutation-check the llama-server A/B harness against a stub
 	bash scripts/bench_llama_ab_selftest.sh
 
 spec-bench-selftest: ## mutation-check the spec-decode bench against a stub server (no GPU, no model, no DB write; builds the dev rmlx, which judges a near-tie flip)
-	bash scripts/spec_bench_selftest.sh
+	bash scripts/bench/serve_bench_selftest.sh
 
 bench-identity-selftest: ## mutation-check the commit and run-log sources of the canary, bench_decode_tps.sh and lib/identity.sh against stub binaries (no GPU, no model, no DB write)
 	bash scripts/bench_identity_selftest.sh
@@ -1055,7 +1055,7 @@ canary-gate:        ## gate TPS regressions via runs.db (SHA= required; e.g. mak
 
 # ---- Spec-decode canary (MTP / DFlash / Eagle3 accept_rate gate) -------------
 #
-# `make spec-canary` — runs scripts/spec_bench.sh for gemma-4-e2b normal + MTP
+# `make spec-canary` — runs scripts/bench/serve_bench.sh for gemma-4-e2b normal + MTP
 #                      across the three canonical prompt classes (prose,
 #                      structured, code). Ingests decode_tps_warm + spec-decode
 #                      metrics (accept_rate, accepted_per_step, *_total counters)
@@ -1076,14 +1076,14 @@ spec-canary: build-perf  ## run spec-decode canary (normal+MTP × 3 prompt class
 	@test -n "$$VERIFIER_MODEL" || { echo "ERROR: VERIFIER_MODEL= required (resolve via LOCAL.md)"; exit 125; }
 	@test -n "$$DRAFTER_MODEL"  || { echo "ERROR: DRAFTER_MODEL= required (resolve via LOCAL.md)";  exit 125; }
 	@echo "==> spec-canary: prose"
-	BENCH_PROMPT_FILE=prompts/spec_bench/prose.json \
-		bash scripts/spec_bench.sh --tag canary-prose
+	bash scripts/bench/serve_bench.sh --model "$$VERIFIER_MODEL" --draft-model "$$DRAFTER_MODEL" \
+		--prompt-file prompts/spec_bench/prose.json --tag canary-prose
 	@echo "==> spec-canary: structured (fibonacci)"
-	BENCH_PROMPT_FILE=prompts/spec_bench/structured.json \
-		bash scripts/spec_bench.sh --tag canary-structured
+	bash scripts/bench/serve_bench.sh --model "$$VERIFIER_MODEL" --draft-model "$$DRAFTER_MODEL" \
+		--prompt-file prompts/spec_bench/structured.json --tag canary-structured
 	@echo "==> spec-canary: code (fizzbuzz Rust)"
-	BENCH_PROMPT_FILE=prompts/spec_bench/code.json \
-		bash scripts/spec_bench.sh --tag canary-code
+	bash scripts/bench/serve_bench.sh --model "$$VERIFIER_MODEL" --draft-model "$$DRAFTER_MODEL" \
+		--prompt-file prompts/spec_bench/code.json --tag canary-code
 
 spec-canary-gate:   ## gate spec-decode regressions (decode_tps_warm + accept_rate); SHA= required
 	$(call canary_deltas,spec-canary-gate,spec-canary)

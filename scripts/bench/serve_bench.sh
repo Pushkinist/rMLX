@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# spec_bench.sh — bench one model in normal vs MTP speculative-decode mode.
+# serve_bench.sh — bench one model through rmlx serve, no drafter against a drafter
 #
-# Usage:
-#   bash scripts/spec_bench.sh [--port N] [--dry-run]
-#       [--draft-kind KIND] [--draft-block-size N]
-#       [--kv-quant Q] [--max-ctx N] [--tag T] [--server-stamps]
+# Usage:  bash scripts/bench/serve_bench.sh --model DIR --draft-model DIR [--prompt-file F]
+#             [--port N] [--dry-run] [--draft-kind KIND] [--draft-block-size N]
+#             [--kv-quant Q] [--max-ctx N] [--tag T] [--server-stamps]
+# Exit:   0 both arms measured and filed; 1 a usage error, a missing model or prompt file, or a
+#         run the checks refused; 125 the release-perf binary is missing; passthrough of rmlx
+#         serve (11: another process holds the Metal claim)
 #
-# `--server-stamps` is for a self-test. The client rate is then read from the
-# stub server's own stamps, which makes the cross-check compare the stub with
-# itself, so the rows are written under `stamped_records/` in the scratch
-# directory and are never passed to `rmlx metrics record`.
+# --model is the verifier snapshot dir (mxfp8), --draft-model the assistant drafter snapshot dir
+# (bf16); both are required. --prompt-file is a canonical JSON prompt (prompts/spec_bench/*.json)
+# whose `messages[0].content` is sent and whose `name` is the registered prompt row name; without
+# it a short prose prompt is sent. The binary is target/release-perf/rmlx (make build-perf).
 #
-# Requires:
-#   - Built binary at target/release-perf/rmlx  (run: make build-perf)
-#   - Model paths set via env or hard-coded below:
-#       VERIFIER_MODEL  — mxfp8 verifier snapshot dir
-#       DRAFTER_MODEL   — bf16 assistant drafter snapshot dir
+# `--server-stamps` is for a self-test. The client rate is then read from the stub server's own
+# stamps, which makes the cross-check compare the stub with itself, so the rows are written under
+# `stamped_records/` in the scratch directory and are never passed to `rmlx metrics record`.
 #
 # Output:
 #   - Two RunRecord JSON files written + ingested into runs.db
@@ -74,12 +74,12 @@ trap stop_live_server EXIT
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BINARY="${REPO_ROOT}/target/release-perf/rmlx"
 
 # Run identity (backend / version / git sha / build profile / hardware tag)
 # comes from the measured binary — never hard-coded here.
-source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
+source "${REPO_ROOT}/scripts/lib/identity.sh"
 rmlx_export_identity "${BINARY}"
 RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
 LOG_DIR="${RMLX_HOME}/logs"
@@ -87,25 +87,6 @@ BUFFER_DIR="${RMLX_HOME}/metrics/buffer/pending"
 DB_PATH="${RMLX_HOME}/metrics/runs.db"
 SCRATCH_DIR="${RMLX_HOME}/tmp"
 GIT_SHA="$(rmlx_git_sha "${REPO_ROOT}")"
-
-# Model paths — must be set via env. Concrete absolute paths live in LOCAL.md
-# (gitignored, never committed). See LOCAL.md §"Test-target model snapshots".
-VERIFIER_MODEL="${VERIFIER_MODEL:-}"
-DRAFTER_MODEL="${DRAFTER_MODEL:-}"
-
-if [[ -z "${VERIFIER_MODEL}" || -z "${DRAFTER_MODEL}" ]]; then
-    cat >&2 <<USAGE
-ERROR: VERIFIER_MODEL and DRAFTER_MODEL env vars are required.
-
-Resolve concrete absolute paths from LOCAL.md (gitignored). Example:
-
-  VERIFIER_MODEL=\$O_MODELS/mlx-community__gemma-4-e2b-it-mxfp8 \\
-  DRAFTER_MODEL=\$O_MODELS/mlx-community__gemma-4-E2B-it-assistant-bf16 \\
-    bash scripts/spec_bench.sh
-
-USAGE
-    exit 1
-fi
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -145,6 +126,9 @@ HARDWARE_TAG="${RMLX_HARDWARE_TAG:-m5_max_128gb}"
 # loopback, not a measurement difference.
 CROSS_CHECK_BAND_PCT=10
 
+VERIFIER_MODEL=""
+DRAFTER_MODEL=""
+PROMPT_FILE=""
 DRY_RUN=false
 SERVER_STAMPS_ARG=()
 CLIENT_CLOCK=client
@@ -155,6 +139,12 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run) DRY_RUN=true; shift ;;
         --server-stamps) SERVER_STAMPS_ARG=(--server-stamps); CLIENT_CLOCK=server_stamps; shift ;;
+        --model=*) VERIFIER_MODEL="${1#--model=}"; shift ;;
+        --model) shift; VERIFIER_MODEL="${1:?--model requires a value}"; shift ;;
+        --draft-model=*) DRAFTER_MODEL="${1#--draft-model=}"; shift ;;
+        --draft-model) shift; DRAFTER_MODEL="${1:?--draft-model requires a value}"; shift ;;
+        --prompt-file=*) PROMPT_FILE="${1#--prompt-file=}"; shift ;;
+        --prompt-file) shift; PROMPT_FILE="${1:?--prompt-file requires a value}"; shift ;;
         --port=*) PORT="${1#--port=}"; shift ;;
         --port) shift; PORT="${1:?--port requires a value}"; shift ;;
         --tag=*) BENCH_TAG="${1#--tag=}"; shift ;;
@@ -185,6 +175,20 @@ if ! [[ "${DRAFT_KIND}" =~ ^[a-z0-9_]+$ ]]; then
     exit 1
 fi
 
+if [[ -z "${VERIFIER_MODEL}" || -z "${DRAFTER_MODEL}" ]]; then
+    cat >&2 <<USAGE
+ERROR: --model and --draft-model are required.
+
+Resolve concrete absolute paths from LOCAL.md (gitignored). Example:
+
+  bash scripts/bench/serve_bench.sh \\
+    --model \$O_MODELS/mlx-community__gemma-4-e2b-it-mxfp8 \\
+    --draft-model \$O_MODELS/mlx-community__gemma-4-E2B-it-assistant-bf16
+
+USAGE
+    exit 1
+fi
+
 if [[ -n "${DRAFT_BLOCK_SIZE}" ]]; then
     if ! [[ "${DRAFT_BLOCK_SIZE}" =~ ^[0-9]+$ ]] || (( DRAFT_BLOCK_SIZE < 2 )); then
         echo "ERROR: --draft-block-size '${DRAFT_BLOCK_SIZE}' must be an integer >= 2:" \
@@ -200,22 +204,18 @@ fi
 
 # ── Prompt body ───────────────────────────────────────────────────────────────
 #
-# Priority: BENCH_PROMPT_FILE (canonical JSON) > BENCH_PROMPT (inline string) >
-# default prose prompt. Canonical JSON files in prompts/spec_bench/ carry
-# `name` + `messages[0].content` and are the preferred source.
-# BENCH_PROMPT_NAME overrides the registered prompt row name; if unset and
-# BENCH_PROMPT_FILE is used, the JSON's `name` field is honoured.
+# A canonical JSON file in prompts/spec_bench/ carries `name` + `messages[0].content`.
 
-if [[ -n "${BENCH_PROMPT_FILE:-}" ]]; then
-    if [[ ! -f "${BENCH_PROMPT_FILE}" ]]; then
-        echo "ERROR: BENCH_PROMPT_FILE not found: ${BENCH_PROMPT_FILE}" >&2
+if [[ -n "${PROMPT_FILE}" ]]; then
+    if [[ ! -f "${PROMPT_FILE}" ]]; then
+        echo "ERROR: --prompt-file not found: ${PROMPT_FILE}" >&2
         exit 1
     fi
-    PROMPT_CONTENT="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['messages'][0]['content'])" "${BENCH_PROMPT_FILE}")"
-    PROMPT_NAME="${BENCH_PROMPT_NAME:-$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['name'])" "${BENCH_PROMPT_FILE}")}"
+    PROMPT_CONTENT="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['messages'][0]['content'])" "${PROMPT_FILE}")"
+    PROMPT_NAME="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['name'])" "${PROMPT_FILE}")"
 else
-    PROMPT_CONTENT="${BENCH_PROMPT:-List 5 important features of the Rust programming language.}"
-    PROMPT_NAME="${BENCH_PROMPT_NAME:-spec-bench-rust-5-features}"
+    PROMPT_CONTENT="List 5 important features of the Rust programming language."
+    PROMPT_NAME="spec-bench-rust-5-features"
 fi
 
 # The server registers models by their full snapshot directory basename
@@ -291,7 +291,7 @@ body.update({"stream": False, "logprobs": True, "top_logprobs": 2})
 print(json.dumps(body))
 ' > "${LOGPROB_BODY_FILE}"
 
-echo "==> spec_bench.sh"
+echo "==> serve_bench.sh"
 echo "    verifier : ${VERIFIER_MODEL}"
 echo "    drafter  : ${DRAFTER_MODEL}"
 echo "    port     : ${PORT}"
@@ -566,7 +566,7 @@ else:
     missing = [key for _, key, _ in SPEC_METRICS if key not in spec]
     if missing:
         raise SystemExit(
-            "spec_bench: the round-loop reader reported no "
+            "serve_bench: the round-loop reader reported no "
             + ", ".join(missing)
             + " — refusing to file a speculative row without them"
         )
@@ -584,7 +584,7 @@ else:
     charged = spec["charged"]
     if charged != "false":
         raise SystemExit(
-            "spec_bench: the round loop reported charged=" + charged + " — this run "
+            "serve_bench: the round loop reported charged=" + charged + " — this run "
             "forced an evaluation at every phase boundary and its decode rate "
             "describes a slower, differently scheduled engine. Unset RUST_LOG "
             "(it overrides the --log info this script passes) and re-run; refusing "

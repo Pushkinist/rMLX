@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Mutation check for spec_bench.sh: a stub rmlx server, asserting recorded values and refusals.
+# Mutation check for serve_bench.sh: a stub rmlx server, asserting recorded values and refusals.
 #
-# Recall test for: spec_bench.sh
+# Recall test for: bench/serve_bench.sh
 #
 # WHY THIS EXISTS
 #
-# spec_bench.sh writes permanent rows into the append-only metrics store, and
+# serve_bench.sh writes permanent rows into the append-only metrics store, and
 # the number it puts in `decode_tps_warm` is a throughput nothing downstream can
 # sanity-check: 91 and 208 tok/s are both inside that metric's plausible-value
 # bound, so a wrong-but-plausible value wins a `bests` cell and stays there. The
@@ -29,8 +29,8 @@
 
 set -eu
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/rmlx_spec_bench_selftest.XXXXXX")"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/rmlx_serve_bench_selftest.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
 PASSED=0
@@ -38,7 +38,7 @@ FAILED=0
 
 # ── Fake repo root ────────────────────────────────────────────────────────────
 #
-# spec_bench.sh resolves both its binary and its lib/ helpers from `$0/..`, so a
+# serve_bench.sh resolves both its binary and its lib/ helpers from `$0/../..`, so a
 # root holding the real scripts/ and a stub binary is how the stub gets used.
 FAKE_ROOT="$WORK/repo"
 mkdir -p "$FAKE_ROOT/target/release-perf"
@@ -67,7 +67,7 @@ chmod +x "$SHIM_DIR/sleep"
 SERVER_PY="$WORK/stub_server.py"
 st_stub_http "$WORK"
 cat >"$SERVER_PY" <<'PYEOF'
-"""Canned OpenAI-compatible server for the spec_bench selftest.
+"""Canned OpenAI-compatible server for the serve_bench selftest.
 
 Streams STUB_TOKENS content chunks STUB_GAP_S apart, starting STUB_PREFILL_S
 after the role chunk, then a usage block. It does not wait between chunks: each
@@ -428,7 +428,7 @@ stop_stubs() {
 # serves. In `make ci` the build is already done by `test`.
 DEV_RMLX="$REPO_ROOT/target/debug/rmlx"
 if ! (cd "$REPO_ROOT" && cargo build -q -p rmlx-cli --bin rmlx) || [ ! -x "$DEV_RMLX" ]; then
-	echo "spec_bench_selftest: cannot build the dev rmlx at $DEV_RMLX" >&2
+	echo "serve_bench_selftest: cannot build the dev rmlx at $DEV_RMLX" >&2
 	exit 2
 fi
 
@@ -553,7 +553,7 @@ sys.exit("no free port in 18000-19999")
 # ── Case driver ───────────────────────────────────────────────────────────────
 
 # run_case <name> <want-exit> <what-it-proves> [KEY=VALUE ...] [ARGS:flag ...]
-#          [CLIENT_SHIM:N] [NO_STAMPS:1] [READER_CLOCK:<step>]
+#          [BASE:<replacement --model / --draft-model flags>] [CLIENT_SHIM:N] [NO_STAMPS:1] [READER_CLOCK:<step>]
 #          [STUB:<stub server arguments>] [PRELOG:<run log name>]
 #          [STALE:<run log name>]
 #          [GREP:pat ...]
@@ -572,10 +572,12 @@ run_case() {
 	mkdir -p "$CASE_HOME/logs" "$CASE_HOME/metrics/buffer/pending"
 
 	local env_pairs=() greps=() extra_args=() a delayed=0 stamps=true stub_args="" step="" prelog="" stale=""
+	local base_args=(--model "$VERIFIER_DIR" --draft-model "$WORK/drafter")
 	for a in "$@"; do
 		case "$a" in
 		GREP:*) greps+=("${a#GREP:}") ;;
 		ARGS:*) extra_args+=("${a#ARGS:}") ;;
+		BASE:*) read -r -a base_args <<<"${a#BASE:}" ;;
 		CLIENT_SHIM:*) delayed="${a#CLIENT_SHIM:}" ;;
 		NO_STAMPS:*) stamps=false ;;
 		READER_CLOCK:*) step="${a#READER_CLOCK:}" ;;
@@ -616,8 +618,6 @@ LOGEOF
 		HOME="$WORK" \
 		RMLX_HOME="$CASE_HOME" \
 		SLEEP_LOG="$CASE_HOME/sleeps" \
-		VERIFIER_MODEL="$VERIFIER_DIR" \
-		DRAFTER_MODEL="$WORK/drafter" \
 		STUB_TOKENS=8 \
 		STUB_GAP_S=0.05 \
 		STUB_PREFILL_S=0.05 \
@@ -628,7 +628,8 @@ LOGEOF
 		STUB_BOUND_FLAG="$CASE_HOME/stub_bound" \
 		STUB_ARGV="$CASE_HOME/serve_argv" \
 		${env_pairs[@]+"${env_pairs[@]}"} \
-		bash "$FAKE_ROOT/scripts/spec_bench.sh" --port "$PORT" \
+		bash "$FAKE_ROOT/scripts/bench/serve_bench.sh" \
+		${base_args[@]+"${base_args[@]}"} --port "$PORT" \
 		${extra_args[@]+"${extra_args[@]}"} >"$CASE_OUT" 2>&1
 	got=$?
 	set -e
@@ -744,10 +745,18 @@ no_judge() {
 	return 0
 }
 
-echo "spec_bench_selftest: stub server on 127.0.0.1:$PORT"
+echo "serve_bench_selftest: stub server on 127.0.0.1:$PORT"
 echo
 
 # ── Cases ─────────────────────────────────────────────────────────────────────
+
+# refused <name> <what-it-proves> [run_case token ...] — exit 1 and no row filed.
+refused() {
+	run_case "$1" 1 "${@:2}"
+	no_row normal
+	no_row mtp
+	verdict
+}
 
 # The engine measured 20 tok/s over its decode window; emitted / elapsed_ms on
 # the same line is 50. Ingesting 50 is the defect.
@@ -948,13 +957,10 @@ run_case kv_quant_is_the_resolved_codec 0 \
 	note_bad "normal kv_quant=$(field_of_record normal kv_quant)"
 verdict
 
-run_case unreported_kv_quant_refused 1 \
+refused unreported_kv_quant_refused \
 	"a run that never said which codec it used is not recorded" \
 	'STUB_KV_QUANT_SUPPRESS=1' \
 	'GREP:no .cache-type resolved. event'
-no_row normal
-no_row mtp
-verdict
 
 # Namespace, model and weight quant describe the checkpoint being served, and
 # the caller chooses that. A constant here files every run under whatever the
@@ -969,13 +975,29 @@ for f in model_namespace:stub-ns model:stub-model weight_quant:mxfp8; do
 done
 verdict
 
-run_case unreadable_snapshot_refused 1 \
+refused unreadable_snapshot_refused \
 	"a snapshot whose identity cannot be read is not benched" \
-	"VERIFIER_MODEL=$BARE_DIR" \
+	"BASE:--model $BARE_DIR --draft-model $WORK/drafter" \
 	'GREP:cannot read the identity'
-no_row normal
-no_row mtp
+
+# A prompt file supplies the text that is sent and the name the row is filed under.
+PROMPT_JSON="$WORK/prompt.json"
+printf '%s\n' '{"name": "selftest-prompt", "messages": [{"role": "user", "content": "Say hello."}]}' >"$PROMPT_JSON"
+run_case prompt_file_is_read 0 \
+	"a prompt file supplies the sent text and the row's prompt name; the = forms of the model flags parse" \
+	"BASE:--model=$VERIFIER_DIR --draft-model=$WORK/drafter" ARGS:--prompt-file "ARGS:$PROMPT_JSON"
+grep -q '"name": "selftest-prompt"' "$(record_of mtp)" || note_bad "the mtp row does not carry the prompt name"
+grep -q 'Say hello.' "$CASE_HOME/tmp/request_body.json" || note_bad "the request does not carry the prompt text"
 verdict
+
+refused missing_model_refused "a run with no --model is refused" \
+	"BASE:--draft-model $WORK/drafter" 'GREP:ERROR: --model and --draft-model are required'
+refused missing_draft_model_refused "a run with no --draft-model is refused" \
+	"BASE:--model $VERIFIER_DIR" 'GREP:ERROR: --model and --draft-model are required'
+refused missing_prompt_file_refused "a prompt file that is not there is refused" \
+	"ARGS:--prompt-file=$WORK/none.json" 'GREP:ERROR: --prompt-file not found'
+refused unknown_flag_refused "a flag the tool does not have is refused by name" \
+	ARGS:--no-such-flag 'GREP:Unknown flag: --no-such-flag'
 
 # ctx_max is what the server was started with, so the script passes it rather
 # than recording the value it was written against.
@@ -987,13 +1009,10 @@ run_case ctx_max_is_the_served_value 0 \
 verdict
 
 # A log the phase cannot attribute to its own server is not this run's log.
-run_case unattributable_log_refused 1 \
+refused unattributable_log_refused \
 	"a run log with no pid is not read as this server's" \
 	'STUB_PID_SUPPRESS=1' \
 	"GREP:no run log in .* is attributable"
-no_row normal
-no_row mtp
-verdict
 
 # Another rmlx process writing to the same directory supplies a candidate that
 # sorts last. Selection is by pid, so it is not the one that gets read.
@@ -1043,37 +1062,28 @@ verdict
 
 # A log that existed before the snapshot and did not grow is nobody's phase,
 # even when the pid in it is the server's: it is the earlier process's file.
-run_case unchanged_log_is_not_a_candidate 1 \
+refused unchanged_log_is_not_a_candidate \
 	"a pre-existing log that did not grow is not read as this server's" \
 	'STUB_PID_SUPPRESS=1' \
 	'STALE:20260903-000001-9.9.9.jsonl' \
 	"GREP:no run log in .* is attributable"
-no_row normal
-no_row mtp
-verdict
 
 # Two processes started in one second and both wrote to the phase: their
 # lines cannot be told apart, so the phase is refused rather than guessed at.
-run_case shared_phase_log_refused 1 \
+refused shared_phase_log_refused \
 	"a grown log whose phase carries another pid's start is refused" \
 	'PRELOG:20260903-000002-9.9.9.jsonl' \
 	'STUB_FOREIGN_START=1' \
 	"GREP:cannot be told apart"
-no_row normal
-no_row mtp
-verdict
 
 # `KvQuant` renders `None` / `K8V8` / `Mixed { .. }` under Debug and
 # `none` / `k8v8` / `mixed_...` under Display. Only the second is a name the
 # flag accepts and the DB records, so a log written the other way is refused
 # rather than filed under a cell nothing else reaches.
-run_case debug_spelled_kv_quant_refused 1 \
+refused debug_spelled_kv_quant_refused \
 	"a Debug-rendered codec name is refused" \
 	'STUB_KV_QUANT=K8V8' \
 	'GREP:Debug rendering'
-no_row normal
-no_row mtp
-verdict
 
 # The prompt length is what the server counted, not a constant in the script:
 # the same script runs three different prompt files.
@@ -1086,13 +1096,10 @@ run_case prompt_tokens_is_measured 0 \
 	note_bad "normal prompt_tokens=$(field_of_record normal prompt_tokens)"
 verdict
 
-run_case missing_prompt_tokens_refused 1 \
+refused missing_prompt_tokens_refused \
 	"a response with no usage.prompt_tokens is not recorded" \
 	'STUB_PROMPT_TOKENS=-1' \
 	'GREP:no usage.prompt_tokens'
-no_row normal
-no_row mtp
-verdict
 
 # The bests cell key partitions on this, so the speculative arm has to say it
 # is one and the plain arm has to say it is not.
@@ -1561,13 +1568,10 @@ verdict
 
 # A server that does not answer the pass leaves nothing to bind or judge by, and
 # the run stops before it files the plain row.
-run_case unanswered_pass_refused 1 \
+refused unanswered_pass_refused \
 	"a server that does not answer the logprob pass stops the run" \
 	'STUB_UNSTREAMED_STATUS=500' \
 	'GREP:normal: the server did not answer the logprob pass'
-no_row normal
-no_row mtp
-verdict
 
 # The speculative arm wrote the whole reference answer and went on. Nothing
 # differs before the reference ends, so no rank can excuse it.
@@ -1622,25 +1626,19 @@ verdict
 # The plain arm is the reference. One that answered three different things
 # without a sampler to explain it has none to offer, and the run stops before
 # either row.
-run_case unrepeatable_plain_arm_refused 1 \
+refused unrepeatable_plain_arm_refused \
 	"a no-drafter arm that did not repeat itself is not a reference" \
 	'STUB_VARY_PER_REQUEST=1' \
 	'GREP:answered differently from each other'
-no_row normal
-no_row mtp
-verdict
 
 # Sampler events covering three of five requests: some ran sampled and some did
 # not, so the run has no one disposition and neither answer_check would be true
 # of it.
-run_case partial_sampler_events_refused 1 \
+refused partial_sampler_events_refused \
 	"a run whose requests did not share one sampling setup is refused" \
 	'STUB_SAMPLER=1' 'STUB_SAMPLER_AFTER=2' \
 	'GREP:covered some of them and not the others' \
 	'GREP:does not say whether the engine ran a sampler'
-no_row normal
-no_row mtp
-verdict
 
 # A run stopped from outside while its server is up — a CI timeout, an operator
 # — stops that server on the way out rather than leaving it on the claim.
@@ -1657,8 +1655,6 @@ sigterm_case() {
 		PATH="$SHIM_DIR:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
 		HOME="$WORK" \
 		RMLX_HOME="$CASE_HOME" \
-		VERIFIER_MODEL="$VERIFIER_DIR" \
-		DRAFTER_MODEL="$WORK/drafter" \
 		STUB_TOKENS=8 \
 		STUB_GAP_S=0.05 \
 		STUB_PREFILL_S=0.05 \
@@ -1667,7 +1663,8 @@ sigterm_case() {
 		STUB_DECODE_TPS_SEQ='"Some(20.0)"' \
 		STUB_PROMPT_TOKENS=1234 \
 		STUB_BOUND_FLAG="$CASE_HOME/stub_bound" \
-		bash "$FAKE_ROOT/scripts/spec_bench.sh" --port "$PORT" --server-stamps >"$CASE_OUT" 2>&1 &
+		bash "$FAKE_ROOT/scripts/bench/serve_bench.sh" --model "$VERIFIER_DIR" \
+			--draft-model "$WORK/drafter" --port "$PORT" --server-stamps >"$CASE_OUT" 2>&1 &
 	local harness=$!
 
 	request_held_or_harness_gone() {

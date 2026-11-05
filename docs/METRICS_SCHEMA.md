@@ -243,7 +243,7 @@ round. `cell::ADAPTIVE_DRAFTERS` lists the drafters that always resize: today
 block, so its arm is always `dflash/block=<n>,dflash/depth=accept_rate`.
 Migration 008 rewrites a stored `dflash/block=<n>` to that form.
 
-`scripts/spec_bench.sh` records the string the engine logged.
+`scripts/bench/serve_bench.sh` records the string the engine logged.
 `scripts/ingest/ingest.py published` carries the string its result file
 recorded from the `done` line. Neither composes a drafter term.
 

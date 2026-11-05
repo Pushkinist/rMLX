@@ -474,9 +474,9 @@ boundary_default_cases() {
 # sm_root <name>: a scan root holding both files the spec-metric gate reads, unedited.
 sm_root() {
     local dir="$ST_WORK/spec/$1"
-    mkdir -p "$dir/scripts" "$dir/crates/rmlx-metrics/src"
+    mkdir -p "$dir/scripts/bench" "$dir/crates/rmlx-metrics/src"
     cp -f "$REPO_ROOT/crates/rmlx-metrics/src/registry.rs" "$dir/crates/rmlx-metrics/src/"
-    cp -f "$REPO_ROOT/scripts/spec_bench.sh" "$dir/scripts/"
+    cp -f "$REPO_ROOT/scripts/bench/serve_bench.sh" "$dir/scripts/bench/"
     printf '%s' "$dir"
 }
 
@@ -498,21 +498,21 @@ spec_metrics_cases() {
     replace_once "$d/crates/rmlx-metrics/src/registry.rs" \
         $'    ("loop_ms_per_round", SpecRole::Derived),\n];' \
         $'    ("loop_ms_per_round", SpecRole::Derived),\n    ("resteer_ms_per_round", SpecRole::Derived),\n];'
-    sm_judge declared_only 1 "a metric declared and never recorded is named" "never recorded by spec_bench.sh"
+    sm_judge declared_only 1 "a metric declared and never recorded is named" "never recorded by serve_bench.sh"
 
     d="$(sm_root recorded_only)"
-    replace_once "$d/scripts/spec_bench.sh" \
+    replace_once "$d/scripts/bench/serve_bench.sh" \
         $'    ("loop_ms_per_round", "loop_ms_per_round", float),\n)' \
         $'    ("loop_ms_per_round", "loop_ms_per_round", float),\n    ("resteer_ms_per_round", "resteer_ms_per_round", float),\n)'
     sm_judge recorded_only 1 "a metric recorded and never declared is named" "not declared in registry::SPEC_METRICS"
 
     d="$(sm_root dropped_from_bench)"
-    replace_once "$d/scripts/spec_bench.sh" $'    ("tokens_per_round", "tokens_per_round", float),\n' ''
-    sm_judge dropped_from_bench 1 "a name deleted from the bench is the parity branch, and in the right direction" "never recorded by spec_bench.sh" "tokens_per_round"
+    replace_once "$d/scripts/bench/serve_bench.sh" $'    ("tokens_per_round", "tokens_per_round", float),\n' ''
+    sm_judge dropped_from_bench 1 "a name deleted from the bench is the parity branch, and in the right direction" "never recorded by serve_bench.sh" "tokens_per_round"
 
     d="$(sm_root indented_python)"
-    replace_once "$d/scripts/spec_bench.sh" 'SPEC_METRICS = (' '    SPEC_METRICS = ('
-    sm_judge indented_python 2 "a reformat that moves the marker off column 0 fails closed, naming the bench" "no SPEC_METRICS entries found in scripts/spec_bench.sh"
+    replace_once "$d/scripts/bench/serve_bench.sh" 'SPEC_METRICS = (' '    SPEC_METRICS = ('
+    sm_judge indented_python 2 "a reformat that moves the marker off column 0 fails closed, naming the bench" "no SPEC_METRICS entries found in scripts/bench/serve_bench.sh"
 
     d="$(sm_root renamed_registry_const)"
     replace_once "$d/crates/rmlx-metrics/src/registry.rs" \

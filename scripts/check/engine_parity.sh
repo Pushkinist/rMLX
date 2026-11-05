@@ -59,9 +59,9 @@
 #   `decode_config` NULL means "the engine at its defaults", so cell identity is downstream of it.
 #
 # spec-metrics
-#   `rmlx_metrics::registry::SPEC_METRICS` declares each speculative metric; `spec_bench.sh` holds a
-#   verbatim second copy of the names. A name declared and never recorded renders `-` in the
-#   markdown export on every row for ever; a name recorded and never declared has no unit,
+#   `rmlx_metrics::registry::SPEC_METRICS` declares each speculative metric; `bench/serve_bench.sh`
+#   holds a verbatim second copy of the names. A name declared and never recorded renders `-` in
+#   the markdown export on every row for ever; a name recorded and never declared has no unit,
 #   direction or bounds.
 
 set -uo pipefail
@@ -672,7 +672,7 @@ print('%d,%d' % kv_boundary_default())
 
 mode_spec_metrics() {
     local registry="${REPO_ROOT}/crates/rmlx-metrics/src/registry.rs"
-    local bench="${REPO_ROOT}/scripts/spec_bench.sh"
+    local bench="${REPO_ROOT}/scripts/bench/serve_bench.sh"
     local want got missing extra status
 
     # The `SPEC_METRICS` array literal in the registry: every `("name", SpecRole::_)`.
@@ -707,13 +707,13 @@ mode_spec_metrics() {
 
     status=0
     if [[ -n "${missing}" ]]; then
-        echo "ERROR: declared in registry::SPEC_METRICS and never recorded by spec_bench.sh:" >&2
+        echo "ERROR: declared in registry::SPEC_METRICS and never recorded by serve_bench.sh:" >&2
         echo "${missing}" | sed 's/^/  /' >&2
         echo "  Its column in the markdown export renders '-' on every row." >&2
         status=1
     fi
     if [[ -n "${extra}" ]]; then
-        echo "ERROR: recorded by spec_bench.sh and not declared in registry::SPEC_METRICS:" >&2
+        echo "ERROR: recorded by serve_bench.sh and not declared in registry::SPEC_METRICS:" >&2
         echo "${extra}" | sed 's/^/  /' >&2
         echo "  Nothing gives it a unit, a direction or plausible bounds." >&2
         status=1

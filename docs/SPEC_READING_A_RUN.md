@@ -4,7 +4,7 @@ How to read what a speculative run reports, and what a round costs. Split out of
 [`SPECULATIVE.md`](SPECULATIVE.md) to keep that doc under the size cap.
 
 Accept rate and decode rate depend on the pair and on the prompt.
-`scripts/spec_bench.sh` measures them and files rows in `runs.db`. This doc
+`scripts/bench/serve_bench.sh` measures them and files rows in `runs.db`. This doc
 records only the figures that explain a result, in "What a round costs".
 
 ## The request record
@@ -104,13 +104,13 @@ forced evaluations drain the pipeline.
   are still unevaluated"). After a change to a drafter's forcing, a charged run
   with no such line is the check.
 
-`scripts/spec_bench.sh` refuses to file a charged row, because `observations`
+`scripts/bench/serve_bench.sh` refuses to file a charged row, because `observations`
 is append-only. `RUST_LOG` takes precedence over `--log`, so unset it before a
 bench.
 
 ## Benching an arm
 
-`scripts/spec_bench.sh` measures a speculative arm and a no-drafter arm on one
+`scripts/bench/serve_bench.sh` measures a speculative arm and a no-drafter arm on one
 prompt:
 
 - The speculative arm's decode rate is the `decode_tps` of the `done` line,
@@ -172,7 +172,7 @@ holds to `f` = 5 only.
 **A speed-up is `tokens_per_round` over the round's cost in plain steps.** The
 round cost covers the verify, the draft and the rollback. A bench row gives it
 as `tokens_per_round ÷ speed-up`. `Qwen3.8-27B` with its MTP sidecar at block 2,
-on the two prompts of `scripts/spec_bench.sh` (128 tokens, greedy):
+on the two prompts of `scripts/bench/serve_bench.sh` (128 tokens, greedy):
 
 | Weights | Prompt | Accept rate | Tokens per round | Speed-up | Round cost |
 |---|---|---|---|---|---|

@@ -41,7 +41,7 @@ fn the_partition_list_is_the_cell_key_plus_metric() {
 // ── Deriving `decode_config` from notes ───────────────────────────────────────
 
 /// The one place the format is written, pinned against the string the engine
-/// logs and `scripts/spec_bench.sh` records for the same run.
+/// logs and `scripts/bench/serve_bench.sh` records for the same run.
 #[test]
 fn decode_config_format_is_stable() {
     assert_eq!(decode_config("mtp", 5, None), "mtp/block=5");

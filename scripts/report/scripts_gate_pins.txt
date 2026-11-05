@@ -36,8 +36,6 @@ class release_e2e/stage6_perf/smoke_prompts.toml
 class rmlx-capture.entitlements
 class schema_constraint_canary.sh
 class sdpa_headdim_bench.py
-class spec_bench.sh
-class spec_bench_selftest.sh
 class ssd_canary.sh
 class ssd_canary_selftest.sh
 class run_class_selftest.sh
@@ -75,7 +73,7 @@ usage release/release_cpu_selftest.sh
 usage suite/run_gpu_tests.sh
 usage suite/run_gpu_tests_selftest.sh
 usage schema_constraint_canary.sh
-usage spec_bench_selftest.sh
+usage bench/serve_bench_selftest.sh
 usage spec/broken_engine.sh
 usage spec/round_stream_compare.py
 usage spec/round_stream_compare_selftest.sh
@@ -102,8 +100,7 @@ exit-undeclared release_e2e/stage6_perf/codec_smoke_runner.sh 0,1,2,3
 exit-undeclared release_e2e/stage6_perf/niah_long_context.sh 1,2
 exit-undeclared suite/run_gpu_tests.sh 0,1
 exit-undeclared schema_constraint_canary.sh 0,2
-exit-undeclared spec_bench.sh 1,125
-exit-undeclared spec_bench_selftest.sh 1,2
+exit-undeclared bench/serve_bench_selftest.sh 1,2
 exit-undeclared spec/broken_engine.sh 2,3
 exit-undeclared spec/round_stream_compare.py 2
 exit-undeclared spec/round_stream_compare_selftest.sh 1
@@ -128,12 +125,12 @@ lib-consumers lib/run_log_for_pid.py
 lib-run lib/prefill_ms.py mst_capture.sh
 lib-run lib/published_run_log.py published/bench.sh
 lib-run lib/run_log_for_pid.py lib/bench_server.sh
-lib-run lib/server_decode_tps.py perf-iter/bench_decode_tps.sh,spec_bench.sh
+lib-run lib/server_decode_tps.py bench/serve_bench.sh,perf-iter/bench_decode_tps.sh
 lib-run lib/server_kv_quant.py lib/bench_server.sh,ssd_canary.sh
-lib-run lib/server_sampling.py spec_bench.sh
-lib-run lib/snapshot_identity.py perf-iter/bench_decode_tps.sh,published/bench.sh,spec_bench.sh
-lib-run lib/spec_round_log.py spec_bench.sh
-lib-run lib/sse_decode_window.py published/bench.sh,spec_bench.sh,spec_bench_selftest.sh
+lib-run lib/server_sampling.py bench/serve_bench.sh
+lib-run lib/snapshot_identity.py bench/serve_bench.sh,perf-iter/bench_decode_tps.sh,published/bench.sh
+lib-run lib/spec_round_log.py bench/serve_bench.sh
+lib-run lib/sse_decode_window.py bench/serve_bench.sh,bench/serve_bench_selftest.sh,published/bench.sh
 shebang lib/snapshot_identity.py
 shebang lib/record_pending.sh
 exec-bit bench_identity_selftest.sh
@@ -151,7 +148,7 @@ set-mode perf_ab.sh
 set-mode perf_ab_selftest.sh
 set-mode prefill_chunk_sweep.sh
 set-mode schema_constraint_canary.sh
-set-mode spec_bench_selftest.sh
+set-mode bench/serve_bench_selftest.sh
 set-mode spec/broken_engine.sh
 set-mode spec/round_stream_compare_selftest.sh
 set-mode run_class_selftest.sh
@@ -168,10 +165,10 @@ size perf_ceiling.py 1110
 size report/debt_report_selftest.sh 1598
 size report/kv_census_selftest.sh 1212
 size suite/run_gpu_tests.sh 1322
-size spec_bench.sh 1172
+size bench/serve_bench.sh 1172
 size published/bench.sh 1182
 size published/bench_selftest.sh 2788
-size spec_bench_selftest.sh 1875
+size bench/serve_bench_selftest.sh 1872
 size ssd_canary.sh 1284
 heredoc bench_llama_ab.sh 30,27
 heredoc published/samples_selftest.sh 23
@@ -182,19 +179,19 @@ heredoc ingest/published_selftest.sh 198
 heredoc published/table_selftest.sh 31
 heredoc report/debt_report_selftest.sh 26,24,24
 heredoc schema_constraint_canary.sh 140,27
-heredoc spec_bench.sh 141
+heredoc bench/serve_bench.sh 141
 heredoc published/bench.sh 56
 heredoc published/bench_selftest.sh 33,23
 heredoc ssd_canary.sh 65,50,38
 twin lib/published_run_log.py+lib/spec_round_log.py 42
 twin ingest/published_selftest.sh+published/table_selftest.sh 89
 twin ingest/published_selftest.sh+published/bench_selftest.sh 66
-twin ingest/published_selftest.sh+spec_bench_selftest.sh 68
+twin bench/serve_bench_selftest.sh+ingest/published_selftest.sh 68
 twin published/bench_selftest.sh+published/table_selftest.sh 82
-twin published/table_selftest.sh+spec_bench_selftest.sh 80
-twin published/bench.sh+spec_bench.sh 51
-twin spec_bench.sh+ssd_canary.sh 96
-twin published/bench_selftest.sh+spec_bench_selftest.sh 198
+twin bench/serve_bench_selftest.sh+published/table_selftest.sh 80
+twin bench/serve_bench.sh+published/bench.sh 51
+twin bench/serve_bench.sh+ssd_canary.sh 96
+twin bench/serve_bench_selftest.sh+published/bench_selftest.sh 198
 lib-shadow perf-iter/bench_decode_tps.sh field_of
 lib-shadow schema_constraint_canary.sh wait_for_server
 lib-shadow ssd_canary.sh wait_for_server
@@ -213,7 +210,7 @@ binary-literal release/release.sh 1
 binary-literal release_e2e/stage6_perf/codec_smoke_runner.sh 1
 binary-literal release_e2e/stage6_perf/niah_long_context.sh 1
 binary-literal schema_constraint_canary.sh 1
-binary-literal spec_bench.sh 1
+binary-literal bench/serve_bench.sh 1
 binary-literal published/bench.sh 1
 binary-literal ssd_canary.sh 1
 binary-literal run_class_selftest.sh 2
@@ -237,9 +234,9 @@ env-knob published/table_selftest.sh MAKE_ENV
 env-knob release_e2e/stage6_perf/codec_smoke_runner.sh RMLX_O_MODELS_ROOT
 env-knob suite/run_gpu_tests.sh RMLX_O_MODELS_ROOT,RMLX_SKIP_GPU
 env-knob schema_constraint_canary.sh BONSAI_MODEL,GEMMA_E2B_MODEL,PORT,RMLX_O_MODELS_ROOT
-env-knob spec_bench.sh BENCH_PROMPT,BENCH_PROMPT_FILE,BENCH_PROMPT_NAME,DRAFTER_MODEL,PORT,RMLX_HARDWARE_TAG,RMLX_HOME,VERIFIER_MODEL
+env-knob bench/serve_bench.sh PORT,RMLX_HARDWARE_TAG,RMLX_HOME
 env-knob published/bench.sh KV_QUANT_SEEN,MEMORY_PID,RMLX_HOME,SAMPLING_SEEN,SERVER_PID
-env-knob spec_bench_selftest.sh OUT_PATH
+env-knob bench/serve_bench_selftest.sh OUT_PATH
 env-knob ssd_canary.sh PORT,SSD_GB,VERIFIER_MODEL
 env-knob bench_identity_selftest.sh STUB_CRASH_MEASURED,STUB_FAIL_GATE,STUB_FAIL_MEASURED,STUB_TURBO_NO_TPS
 env-knob lib/rmlx_home.py RMLX_HOME
@@ -249,7 +246,7 @@ unguarded-array perf_ab.sh A_KV,A_MEM,A_TPS,B_KV,B_MEM,B_TPS,MODELS,record
 unguarded-array perf_ab_host_gate_fixtures.sh RESULT_PATHS
 unguarded-array perf_ab_selftest.sh COMMON
 unguarded-array published/table_selftest.sh inputs
-unguarded-array spec_bench.sh MTP_ANSWER_DIGESTS,MTP_CLIENT_TPS_VALUES,MTP_ENGINE_TPS_VALUES,NORMAL_ANSWER_DIGESTS,NORMAL_CLIENT_TPS_VALUES,NORMAL_ENGINE_TPS_VALUES
+unguarded-array bench/serve_bench.sh MTP_ANSWER_DIGESTS,MTP_CLIENT_TPS_VALUES,MTP_ENGINE_TPS_VALUES,NORMAL_ANSWER_DIGESTS,NORMAL_CLIENT_TPS_VALUES,NORMAL_ENGINE_TPS_VALUES
 unguarded-array published/bench.sh CELLS,CELL_ARGS,FIXED_FILES,GREEDY_CELL_ARGS,HOST_WINDOWS,LC_RUNS,PASS_FILES,THERMAL_READINGS,args
 unguarded-array published/bench_selftest.sh cell_args
 unguarded-array ssd_canary.sh ALL_PROMPTS

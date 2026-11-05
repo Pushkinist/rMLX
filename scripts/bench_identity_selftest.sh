@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # bench_identity_selftest.sh — mutation check for the commit and run-log sources
-# of the bench scripts that spec_bench_selftest.sh does not drive.
+# of the bench scripts that bench/serve_bench_selftest.sh does not drive.
 #
 # A bench row is filed under the commit its run identity names, and the run log
 # a phase reads is the one its own server wrote. Each case drives the real script

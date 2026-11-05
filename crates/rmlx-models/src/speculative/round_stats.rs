@@ -724,7 +724,7 @@ impl RoundStats {
     ///
     /// `scripts/lib/spec_round_log.py` parses it, and so does
     /// `crates/rmlx-cli/tests/e2e/runner.rs` (`scrape_spec_accept`), which reads
-    /// the same `loop_kind` and `accept_rate` fields. `scripts/spec_bench.sh`
+    /// the same `loop_kind` and `accept_rate` fields. `scripts/bench/serve_bench.sh`
     /// records what it finds here — including
     /// `decode_config`, so a new drafter or a new depth policy reaches the
     /// metrics store without a bench script learning about it.
