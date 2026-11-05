@@ -69,6 +69,7 @@ Environment, all optional:
   STUB_DOUBLE         file every record twice
   STUB_DROP           do not file rows of this metric
   STUB_SCALE          `<metric>:<factor>`, multiply that metric's value on filing
+  STUB_NO_RUN_CLASS   answer `metrics record --help` as a binary built before the run class
 """
 import json, os, sqlite3, sys
 
@@ -76,6 +77,12 @@ args = sys.argv[1:]
 if "--db" in args:
     i = args.index("--db")
     del args[i:i + 2]
+if args == ["metrics", "record", "--help"]:
+    print("      --file <FILE>")
+    if not os.environ.get("STUB_NO_RUN_CLASS"):
+        print("      --run-class <CLASS>")
+    sys.exit(0)
+
 store = os.path.join(os.environ["RMLX_HOME"], "stub_runs.db")
 conn = sqlite3.connect(store)
 conn.executescript("""
@@ -767,6 +774,13 @@ STUB_RECORD_EXIT=1 ingest_case a_failed_ingest_keeps_its_record 1 \
     note_bad "a rejected record was left in the pending queue"
 [ "$(recs_check "len(recs)")" = "8" ] ||
     note_bad "$(recs_check "len(recs)") records survived in staging"
+verdict
+
+STUB_NO_RUN_CLASS=1 ingest_case a_classless_recorder_is_refused 1 \
+    "a recorder built before the run class is refused by name, before anything is staged" \
+    "stub_rmlx has no .metrics record --run-class." ARGS:--record
+[ "$(recs_check "len(recs)")" = "0" ] || note_bad "$(recs_check "len(recs)") records were staged"
+[ ! -s "${WORK}/recorded.txt" ] || note_bad "the recorder was handed a record"
 verdict
 
 # ── The campaign label, and the check that the rows reproduce the result ──────

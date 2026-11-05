@@ -148,8 +148,9 @@ criterion = { version = "0.8", features = ["html_reports"] }
 
 [workspace.lints.rust]
 # Memory / safety. unsafe_code = "deny" + scoped #[allow(unsafe_code)] at
-# module level in rmlx-mlx (mlx-c FFI), rmlx-core::mach_mem, and the MSL
-# kernel files. forbid would block legitimate FFI; deny forces an audit.
+# module level in rmlx-mlx (mlx-c FFI), rmlx-core::mach_mem,
+# rmlx-core::mapped_pages, rmlx-loader::shards, and the MSL kernel files.
+# forbid would block legitimate FFI; deny forces an audit.
 unsafe_code                   = "deny"
 unsafe_op_in_unsafe_fn        = "deny"
 unreachable_pub               = "warn"

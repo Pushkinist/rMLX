@@ -30,8 +30,8 @@
 //! compares its restored layers first, so the flag is never the only thing
 //! read.
 //!
-//! `spill` restates the block-key derivation rather than driving `SsdSpiller`,
-//! whose hermetic constructor is `#[cfg(test)]` of `rmlx-kv-ssd`. A spill side
+//! `spill` restates the block-key derivation and writes the block at once
+//! rather than through `SsdSpiller`'s background drain thread. A spill side
 //! that changed its key formula would leave these fixtures green and the
 //! production tier cold. `crates/rmlx-kv-ssd/src/hydrate_tests.rs`
 //! (`lookup_seeded_matches_arch_recompute`) is what holds the two formulas
@@ -56,18 +56,10 @@
 //! the same device. No Metal context is taken, so none of these carries
 //! `#[ignore]`.
 //!
-//! The fixtures write under a unique namespace below
-//! `rmlx_core::paths::kv_cache_dir`, which is where the production hydrator
-//! resolves its `.kvb` directory and index from. `SsdHydrator::with_index` —
-//! the hermetic constructor the `rmlx-kv-ssd` unit tests use — is
-//! `#[cfg(test)]` of that crate and cannot be reached from here, and
-//! `rmlx_core::paths::home()` caches its resolution in a `OnceLock`, so an
-//! environment override set from a test would be both process-global and
-//! one-shot. A unique namespace is the hermetic unit that is actually
-//! available. `Namespace` removes its directory on drop.
+//! Each fixture opens the production constructors below a KV root of its own,
+//! a temp dir, so no test reads or writes the process home.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use rmlx_core::DispatchPolicy;
 use rmlx_mlx::{Array, Device};
@@ -123,41 +115,29 @@ const HEAD_DIM: i32 = 32;
 
 // ── namespace ───────────────────────────────────────────────────────────────
 
-/// A `.kvb` directory plus index DB under `paths::kv_cache_dir`, unique to one
-/// test and removed when the test ends.
-///
-/// The name is one path segment. `wipe_stale_schema_namespaces` and
-/// `evict_pool_lru_until` both read the KV root one level deep and treat every
-/// entry there as a namespace, so a two-segment name would leave its parent
-/// behind after `Drop` removed the leaf.
-///
-/// The name also carries a wall-clock term. A test binary that dies without
-/// unwinding runs no `Drop`, and a process id is reused, so a name built from
-/// the id and a counter alone would reopen that run's `index.db`.
+/// A `.kvb` directory plus index DB in a temp KV root of one test's own,
+/// removed when the test ends.
 struct Namespace {
+    root: tempfile::TempDir,
     name: String,
     dir: PathBuf,
 }
 
 impl Namespace {
+    #[allow(
+        clippy::expect_used,
+        reason = "test fixture: a temp KV root that cannot be created is a host failure and must abort the test loudly"
+    )]
     fn new(tag: &str) -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let name = format!(
-            "ssd-hydrate-oracle-{tag}-{}-{nanos}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        );
-        let dir = rmlx_core::paths::kv_cache_dir(&name);
-        Self { name, dir }
+        let root = tempfile::tempdir().expect("temp KV root");
+        let name = format!("ssd-hydrate-oracle-{tag}");
+        let dir = root.path().join(&name);
+        std::fs::create_dir_all(&dir).expect("namespace dir");
+        Self { root, name, dir }
     }
-}
 
-impl Drop for Namespace {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+    fn kv_root(&self) -> &std::path::Path {
+        self.root.path()
     }
 }
 
@@ -339,7 +319,7 @@ fn spill(
     write_caches(&path, device, &ns.name, QUANT, kv, lin).expect("spill block");
     let size = std::fs::metadata(&path).expect("block metadata").len();
 
-    let index = SsdKvIndex::open(&ns.name).expect("index open");
+    let index = SsdKvIndex::open(ns.kv_root(), &ns.name).expect("index open");
     index
         .record(&key, layout_key, &path, &ns.name, &QUANT.to_string(), size)
         .expect("index record");
@@ -358,7 +338,7 @@ fn hydrator(ns: &Namespace, layout_key: u64) -> SsdHydrator {
         clippy::expect_used,
         reason = "test fixture: a hydrator that cannot open the index the fixture just wrote is a fixture bug and must abort the test loudly"
     )]
-    SsdHydrator::open(&ns.name, layout_key, Device::Cpu).expect("hydrator open")
+    SsdHydrator::open(ns.kv_root(), &ns.name, layout_key, Device::Cpu).expect("hydrator open")
 }
 
 fn ids(n: usize) -> Vec<u32> {
@@ -1247,13 +1227,13 @@ fn an_entry_that_ends_inside_a_block_hydrates_at_its_anchor() {
         is_ssd_hydrated: false,
     };
 
-    let spiller = SsdSpiller::spawn(ns.name.clone(), LAYOUT_KEY, Device::Cpu);
+    let spiller = SsdSpiller::spawn(ns.kv_root(), ns.name.clone(), LAYOUT_KEY, Device::Cpu);
     SpillSink::spill(&spiller, &entry);
 
     // The drain thread opens the index and writes the block in the background.
     // The hydrator opens the same index here without the single-threaded open
     // `prepare_attach` does first, so the two first opens overlap.
-    let hydrator = SsdHydrator::open(&ns.name, LAYOUT_KEY, Device::Cpu)
+    let hydrator = SsdHydrator::open(ns.kv_root(), &ns.name, LAYOUT_KEY, Device::Cpu)
         .expect("the index must open beside the drain thread's open");
     let request = request_longer_than(&prompt);
     let hydrated: Qwen35MoeEntry = (0..200)

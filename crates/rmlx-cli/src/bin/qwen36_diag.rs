@@ -32,6 +32,7 @@ const CANONICAL_IDS: &[u32] = &[
     reason = "wildcard arm is the correct fallthrough for unsupported variants; exhaustive expansion would require updating on every new variant"
 )]
 fn main() -> anyhow::Result<()> {
+    rmlx_core::paths::check_env_home()?;
     let mut args = std::env::args().skip(1);
     let model_dir: PathBuf = args
         .next()

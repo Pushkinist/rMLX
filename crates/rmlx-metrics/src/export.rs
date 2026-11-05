@@ -1,4 +1,4 @@
-//! Export API per `docs/METRICS_DB.md` §9 and §8.2.
+//! Export API per `docs/METRICS_EXPORT.md` and `docs/METRICS_DB.md` §8.2.
 //!
 //! All functions take a `&Connection` and return a `String`; the caller
 //! decides where to write the output (file, stdout, etc.).
@@ -13,7 +13,7 @@
 //!
 //! # See also
 //!
-//! - `docs/METRICS_DB.md` §9 — export contract and `BENCHMARK_CHAMPIONS.md` format.
+//! - `docs/METRICS_EXPORT.md` — export contract and `BENCHMARK_CHAMPIONS.md` format.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;

@@ -19,7 +19,7 @@
 
 mod thread_boundary;
 
-use thread_boundary::{GEMMA4_E2B, GEMMA4_UNIFIED_12B, MEDGEMMA, QWEN3_VL};
+use thread_boundary::{GEMMA4_E2B, GEMMA4_UNIFIED_12B, QWEN3_VL};
 
 use std::path::Path;
 use std::sync::Arc;
@@ -64,17 +64,6 @@ fn gemma4_unified_vision_embedder_runs_on_a_thread_that_did_not_load_it() {
     assert_tower(
         "gemma4_unified_vision_embedder_runs_on_a_thread_that_did_not_load_it",
         GEMMA4_UNIFIED_12B,
-        Device::Gpu,
-        image_request,
-    );
-}
-
-#[test]
-#[ignore = "requires Metal GPU and the medgemma snapshot; run with `make gpu-test`"]
-fn gemma3_vision_tower_runs_on_a_thread_that_did_not_load_it() {
-    assert_tower(
-        "gemma3_vision_tower_runs_on_a_thread_that_did_not_load_it",
-        MEDGEMMA,
         Device::Gpu,
         image_request,
     );

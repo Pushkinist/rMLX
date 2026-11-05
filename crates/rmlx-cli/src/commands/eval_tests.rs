@@ -1,10 +1,13 @@
 use super::*;
 
+const BF16_CONFIG: &str = r#"{"torch_dtype": "bfloat16"}"#;
+
 #[test]
 fn build_record_includes_ppl_op_name() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let model_dir = tmp.path().join("fake-model");
     std::fs::create_dir_all(&model_dir).expect("mkdir fake-model");
+    std::fs::write(model_dir.join("config.json"), BF16_CONFIG).expect("write config.json");
     let report = ppl::PplReport {
         ppl: 12.34,
         mean_nll: 2.5,
@@ -22,6 +25,7 @@ fn build_record_includes_ppl_op_name() {
         123.4,
         7777.0,
         None,
+        RunClass::Gate,
         None,
         None,
     )
@@ -51,6 +55,7 @@ fn build_record_stamps_identity_from_the_single_source() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let model_dir = tmp.path().join("m");
     std::fs::create_dir_all(&model_dir).expect("mkdir m");
+    std::fs::write(model_dir.join("config.json"), BF16_CONFIG).expect("write config.json");
     let report = ppl::PplReport {
         ppl: 1.0,
         mean_nll: 0.0,
@@ -68,6 +73,7 @@ fn build_record_stamps_identity_from_the_single_source() {
         0.0,
         0.0,
         Some("cafebabe"),
+        RunClass::Gate,
         None,
         None,
     )
@@ -90,6 +96,7 @@ fn build_record_git_sha_absent_is_null() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let model_dir = tmp.path().join("m2");
     std::fs::create_dir_all(&model_dir).expect("mkdir m2");
+    std::fs::write(model_dir.join("config.json"), BF16_CONFIG).expect("write config.json");
     let report = ppl::PplReport {
         ppl: 1.0,
         mean_nll: 0.0,
@@ -107,6 +114,7 @@ fn build_record_git_sha_absent_is_null() {
         0.0,
         0.0,
         None,
+        RunClass::Gate,
         None,
         None,
     )
@@ -122,6 +130,7 @@ fn build_record_git_sha_blank_string_is_null() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let model_dir = tmp.path().join("m3");
     std::fs::create_dir_all(&model_dir).expect("mkdir m3");
+    std::fs::write(model_dir.join("config.json"), BF16_CONFIG).expect("write config.json");
     let report = ppl::PplReport {
         ppl: 1.0,
         mean_nll: 0.0,
@@ -139,6 +148,7 @@ fn build_record_git_sha_blank_string_is_null() {
         0.0,
         0.0,
         Some(""),
+        RunClass::Gate,
         None,
         None,
     )
@@ -156,6 +166,7 @@ fn build_record_reports_the_codec_and_boundary_it_scored_at() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let model_dir = tmp.path().join("m4");
     std::fs::create_dir_all(&model_dir).expect("mkdir m4");
+    std::fs::write(model_dir.join("config.json"), BF16_CONFIG).expect("write config.json");
     let report = ppl::PplReport {
         ppl: 1.0,
         mean_nll: 0.0,
@@ -174,6 +185,7 @@ fn build_record_reports_the_codec_and_boundary_it_scored_at() {
             0.0,
             0.0,
             None,
+            RunClass::Gate,
             kv,
             dc,
         )
@@ -224,6 +236,7 @@ fn the_scorer_mode_is_not_a_decode_config_term() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let model_dir = tmp.path().join("m5");
     std::fs::create_dir_all(&model_dir).expect("mkdir m5");
+    std::fs::write(model_dir.join("config.json"), BF16_CONFIG).expect("write config.json");
     let report = ppl::PplReport {
         ppl: 1.0,
         mean_nll: 0.0,
@@ -241,6 +254,7 @@ fn the_scorer_mode_is_not_a_decode_config_term() {
         0.0,
         0.0,
         None,
+        RunClass::Gate,
         Some(rmlx_kv_quant::KvQuant::Iso3Sym),
         None,
     )
@@ -270,7 +284,7 @@ fn ppl_refuses_an_unrecordable_identity_before_any_work() {
         &tmp.path().join("no-such-corpus.txt"),
         4096,
         2048,
-        "wikitext-2",
+        Some(("wikitext-2", RunClass::Gate)),
         &ClaimedDevice::cpu(),
         0,
         "20260526-120000-deadbeef",
@@ -305,7 +319,7 @@ fn ppl_refuses_an_unrecordable_weight_quant_before_any_work() {
         &tmp.path().join("no-such-corpus.txt"),
         4096,
         2048,
-        "wikitext-2",
+        Some(("wikitext-2", RunClass::Gate)),
         &ClaimedDevice::cpu(),
         0,
         "20260526-120000-deadbeef",
@@ -330,5 +344,81 @@ fn record_identity_carries_the_snapshot_weight_quant() {
             id.weight_quant.as_str()
         ),
         ("host", "m", "4bit")
+    );
+}
+
+#[test]
+fn record_identity_of_a_snapshot_with_no_config_is_refused() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model_dir = tmp.path().join("host__m");
+    std::fs::create_dir_all(&model_dir).expect("mkdir snapshot");
+    let err = resolve_record_identity(&model_dir)
+        .err()
+        .expect("a snapshot with no config.json has no weight_quant to record");
+    let msg = err.to_string();
+    assert!(msg.contains("no config.json"), "{msg}");
+}
+
+#[test]
+fn record_identity_of_a_snapshot_whose_config_does_not_parse_is_refused() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model_dir = tmp.path().join("host__m");
+    std::fs::create_dir_all(&model_dir).expect("mkdir snapshot");
+    std::fs::write(model_dir.join("config.json"), "{ not json").expect("write config.json");
+    let err = resolve_record_identity(&model_dir)
+        .err()
+        .expect("an unreadable config is not an unquantized snapshot");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("malformed config.json"), "{msg}");
+}
+
+/// The weight label a snapshot with this config is recorded under.
+fn weight_quant_of(config: &str) -> Result<String> {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model_dir = tmp.path().join("host__m");
+    std::fs::create_dir_all(&model_dir).expect("mkdir snapshot");
+    std::fs::write(model_dir.join("config.json"), config).expect("write config.json");
+    resolve_record_identity(&model_dir).map(|id| id.weight_quant)
+}
+
+#[test]
+fn record_identity_of_an_unquantized_snapshot_is_its_dtype() {
+    assert_eq!(weight_quant_of(BF16_CONFIG).expect("identity"), "bf16");
+    assert_eq!(
+        weight_quant_of(r#"{"torch_dtype": "float16"}"#).expect("identity"),
+        "fp16"
+    );
+    assert_eq!(
+        weight_quant_of(r#"{"dtype": "bfloat16"}"#).expect("identity"),
+        "bf16"
+    );
+}
+
+#[test]
+fn record_identity_of_a_paroquant_snapshot_is_paro() {
+    let config = r#"{"torch_dtype": "bfloat16",
+        "quantization_config": {"quant_method": "paroquant", "bits": 4, "group_size": 128}}"#;
+    assert_eq!(weight_quant_of(config).expect("identity"), "paro");
+}
+
+#[test]
+fn record_identity_of_a_config_naming_no_weight_format_is_refused() {
+    let msg = weight_quant_of("{}")
+        .expect_err("a config that names no weight format has no label to record")
+        .to_string();
+    assert!(msg.contains("names no weight format"), "{msg}");
+}
+
+/// A format mode no whitelist names passes through the label unchanged, so the
+/// recorder's whitelist is the one check, and it refuses the label by name.
+#[test]
+fn record_identity_refuses_a_mode_the_metrics_db_has_no_label_for() {
+    let config = r#"{"quantization": {"group_size": 32, "bits": 6, "mode": "mxfp6"}}"#;
+    let msg = weight_quant_of(config)
+        .expect_err("mxfp6 is not a recordable weight_quant")
+        .to_string();
+    assert!(
+        msg.contains("mxfp6") && msg.contains("weight_quant"),
+        "{msg}"
     );
 }

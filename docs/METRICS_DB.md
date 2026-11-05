@@ -87,10 +87,19 @@ renamed fine-tune still records.
 ### 5.2 `weight_quant` canonicalization
 
 Must be in `identity::WEIGHT_QUANT_WHITELIST`: `bf16`, `fp16`, `mxfp8`,
-`mxfp4`, `nvfp4`, `q8_0`, `q4_k_m`, `2bit`, `3bit`, `4bit`, `5bit`, `6bit`,
-`8bit`, `paro`. `bf16` means unquantized. `identity::infer_weight_quant`
-reads the value from a snapshot name for `RunRecordBuilder::rmlx` and falls
-back to `bf16`.
+`mxfp4`, `nvfp4`, `q8_0`, `q4_k_m`, `1bit`, `2bit`, `3bit`, `4bit`, `5bit`,
+`6bit`, `8bit`, `paro`. `bf16` means unquantized. An rMLX producer reads the
+label from the snapshot's `config.json`: ParoQuant is `paro`; else the
+`quantization` block's `mode` lowercased, or `<bits>bit` when the mode is
+absent or `affine`; else a `dtype` / `torch_dtype` of bfloat16 (`bf16`) or
+float16 (`fp16`). A mode this list does not name is refused, not mapped. Rust has one producer,
+`rmlx_loader::ModelConfig::weight_quant_label` (`baseline --record`,
+`eval ppl --corpus`, the server's drainer); the shell benches use
+`scripts/lib/snapshot_identity.py`. One table,
+`crates/rmlx-loader/tests/fixtures/weight_quant_labels.json`, holds both. A
+config that names none is refused by `baseline --record` and
+`eval ppl --corpus`, and the drainer warns once at start and records no row
+for that model.
 
 ### 5.3 `kv_quant` canonicalization
 
@@ -178,6 +187,8 @@ one-shot importer, not a recording path.
 
 It records through `Recorder::legacy_archive`, the one recorder that skips
 the `backend_version` check (§8.5.1). Archive rows have no version to state.
+Every archive row is `gate`, like every row written before the run class
+existed.
 
 It is idempotent. Each imported row carries `legacy_run_key=<hex>` at the
 start of `notes`, and a row whose key is already present is skipped.
@@ -241,6 +252,11 @@ Scripts in other languages shell out to it and never write the DB directly.
   It builds records with `RunRecordBuilder::rmlx` and inserts them directly,
   with no buffer file.
 - `rmlx metrics migrate`, for archives only (§ "Legacy import").
+- `rmlx metrics import`, from another metrics DB (§11).
+
+Every row carries a `run_class` (§8.5): `gate`, `ab_arm` or `diagnostic`. The
+drainer writes `diagnostic`, because live-request telemetry is not a
+controlled run. `migrate` writes `gate`.
 
 The `events` table is written only by `EventRecorder` in the running binary
 (`METRICS_SCHEMA.md` §3.6).
@@ -250,9 +266,8 @@ The `events` table is written only by `EventRecorder` in the running binary
 `rmlx bench` (see [`docs/CLI.md`](CLI.md#bench)) measures TTFT, ITL, decode
 TPS and `kv_cache_bytes` over repeated runs of one cell. It prints medians
 with the observed range and **writes nothing**: no buffer file and no row.
-`observations` is append-only, and `bench` exists to establish a number and
-its spread, including runs that the operator throws away. `rmlx baseline --record`
-writes a figure worth keeping.
+It establishes a number and its spread. To record a run, use
+`rmlx baseline --record --run-class <class>`.
 
 `bench` refuses a figure it cannot attribute to the measured run. Examples
 are a run served from the prompt cache or the SSD tier, a KV-byte count the
@@ -279,25 +294,26 @@ unless the table says otherwise.
 | `doctor [--fix]` | Checks the DB (§10.4) and applies pending migrations. |
 | `backup [--out <path>] [--keep N]` | `VACUUM INTO` copy (§10.1). |
 | `restore --from <path>` | Snapshots the current DB, then replaces it (§10.1). |
-| `record --inline <json> \| --file <path> \| --stdin [--dry-run]` | Ingests one §8.5 record and prints the outcome as JSON. `--dry-run` validates and writes nothing. |
-| `record --replay-pending [--dry-run]` | Ingests every `buffer/pending/*.json` (§8.4). Exits 2 when any file failed. |
+| `record --inline <json> \| --file <path> \| --stdin [--dry-run] [--run-class C]` | Ingests one §8.5 record and prints the outcome as JSON. `--dry-run` validates and writes nothing. `--run-class` fills a record that states no class and refuses one that states another. |
+| `record --replay-pending [--dry-run] [--run-class C]` | Ingests every `buffer/pending/*.json` (§8.4). Exits 2 when any file failed. |
 | `identity [--json]` | Prints this binary's run identity (§8.5.1). |
 | `validate --file <path> \| --stdin` | Runs the ingest validator and writes nothing (§8.5.2). |
 | `best` | The champion row of one cell and metric, as JSON. Exits 1 when there is none. |
 | `rank --metric M [--backend B] [--limit N]` | Top-N champions of one metric, default 20. |
 | `compare --backends a,b --metric M` | The champion of each listed backend, per cell. |
-| `history` | Every observation of one cell, oldest first; `--metric` and `--since <date>` filter. |
-| `timeseries --metric M [--bucket day\|week]` | Mean per day or week for one cell and metric. |
+| `history` | Every observation of one cell, oldest first, each with its `run_class`; `--metric` and `--since <date>` filter. |
+| `timeseries --metric M [--bucket day\|week]` | Mean per day or week and per run class for one cell and metric. |
 | `champions [--backend B] [--jsonl]` | One row per model, weight quant and KV quant, with one column per metric. |
 | `regress --model <substring> --metric M [--kv K] [--threshold-pct P]` | Latest observation against the champion. Exits 0 within `P` % (default 1.0), 1 on a regression, 125 with no champion or no observation. |
 | `path [--home]` | Prints the DB path this invocation resolves, or the data root. Opens no DB; like every `rmlx` command it creates the data root and `metrics/`, starts a run log and may rotate old logs. |
-| `deltas --since-sha <sha> [--threshold-pct P] [--exit-code false] [--prompt-prefix X]` | Per cell and metric, or with `X` only the cells whose prompt name starts with it (the SHA is then looked up among those cells, and an `X` naming no cell is an error): the best after the SHA's first row (else the champion) against the best up to it. Prints the moves beyond `P` % (default 5.0) and the cells with no value up to it. Exits 1 on a regression. Exits 125 when it prints cells and none has a value up to it, and 0 when it prints nothing. `--exit-code false` always exits 0. A SHA with no rows is an error. |
+| `deltas --since-sha <sha> [--threshold-pct P] [--exit-code false] [--prompt-prefix X]` | Per cell and metric, or with `X` only the cells whose prompt name starts with it (the SHA is then looked up among those cells, and an `X` naming no cell is an error): the best after the SHA's first row (else the champion) against the best up to it. Prints the moves beyond `P` % (default 5.0) and the cells with no value up to it. Exits 1 on a regression. Exits 125 when it prints cells and none has a value up to it, and 0 when it prints nothing. `--exit-code false` always exits 0. A SHA with no gate rows is an error. |
 | `describe --observation-id N \| --run-id R --text T` | Sets `description` (§6). |
 | `query "<SELECT …>"` | Runs one statement that starts with `SELECT` and prints TSV with a header. |
 | `open [--readonly]` | Starts `sqlite3` on the DB; `--readonly` passes `-readonly`. |
 | `export --markdown \| --json \| --csv \| --jsonl [--scope <toml>]` | Prints `bests` (§9). |
 | `prompts list \| get --name N \| add --file F \| sync` | The prompt registry (§8.7). |
 | `migrate` | Imports archives (§ "Legacy import"). |
+| `import --from <db> [--run-class C]` | Copies another metrics DB's observations (§11). |
 
 `best`, `history` and `timeseries` take the whole cell: `--backend`,
 `--namespace`, `--model`, `--weight-quant`, `--kv-quant`, `--ctx-max`
@@ -307,8 +323,9 @@ prompt carrying it.
 
 How each command opens the DB:
 
-- `record`, `prompts add` / `sync` and `champions` open with
-  `schema::open_migrated`, which applies pending migrations first.
+- `record`, `import`, `prompts add` / `sync` and `champions` open with
+  `schema::open_migrated`, which applies pending migrations first. So do the
+  inline ingests of `rmlx baseline --record` and `rmlx eval ppl`.
 - The other read commands, and `describe`, open with `schema::open_checked`.
   It refuses a path that does not exist and a stale `bests` view (`METRICS_SCHEMA.md` §3.3), and
   it never migrates.
@@ -333,13 +350,15 @@ locked or missing DB.
 
 - `rmlx metrics record --file <path>` deletes the file on success. On
   failure it exits 1 and leaves the file in place.
-- `rmlx baseline --record` and `rmlx eval ppl` ingest in-process, delete the
-  file on success, and leave it in `pending/` on failure.
+- `rmlx baseline --record` and `rmlx eval ppl` ingest in-process and delete
+  the file on success. On failure they leave it in `pending/` and exit
+  non-zero, naming the file, after printing the measurement.
 - A script that calls `record --file` moves a rejected file to
   `buffer/failed/` for triage (`scripts/perf-iter/bench_decode_tps.sh`).
 - `rmlx metrics record --replay-pending` walks `pending/` in name order. It
   deletes each file that ingests and moves each one that fails to
-  `buffer/failed/`. It then prints `ok` and `fail` counts and exits 2 if any
+  `buffer/failed/`. A file that states no class fails unless `--run-class`
+  states one. It then prints `ok` and `fail` counts and exits 2 if any
   failed. `--dry-run` moves and deletes nothing.
 
 Nothing expires `buffer/failed/`. Fix the cause, move the files back to
@@ -379,6 +398,7 @@ metric whose value is not `null`, in one transaction (§8.2.1).
   "output_first_64": null,
   "notes":           null,
   "description":     null,
+  "run_class":       "gate",
   "metrics": [
     { "name": "decode_tps_warm", "value": 119.14, "stddev": 0.64 },
     { "name": "ttft_warm_ms",    "value": null }
@@ -400,7 +420,20 @@ is ignored. **Required keys**, and what `RunRecord::validate` checks:
 | `prompt` | See below. |
 | `ts_utc` | Parses as ISO-8601. |
 | `hardware_tag` | Not empty. |
+| `run_class` | `gate`, `ab_arm` or `diagnostic`. Another spelling fails the parse. |
 | `metrics` | At least one entry with a non-null `value`. |
+
+**Run class.** `gate` is a canary, a release gate, or the surviving arm of an
+A/B recorded once. `ab_arm` is one A/B slot. `diagnostic` is a profiling,
+traced or investigation run. Only `gate` rows reach `bests` and every query
+that feeds a gate or a published figure: `deltas`, `regress`, `champions`,
+the exports, `make canary-gate`. `history` and `timeseries` read every class
+and show it. A record that states no class never reaches the gates, by two
+rules: `RunRecord::validate` refuses it, and a row written around the
+recorder stores `NULL`, which is not `gate` (`METRICS_SCHEMA.md` §3.2).
+Producers outside this repo state it too: the Cross-Backend-Bench runner
+(`../Cross-Backend-Bench/runners/_common.py`, `_build_metrics_record`), which
+`scripts/bench_cell.sh` hands its non-rMLX cells to, writes `gate`.
 
 **Optional keys**: `schema_version` (default `1`), `backend_version`,
 `git_sha`, `build_profile`, `prompt_tokens`, `max_tokens`, `temperature`,
@@ -537,54 +570,9 @@ carries the full body, and the recorder dedups it by hash.
 
 ## 9. `BENCHMARK_CHAMPIONS.md` regeneration
 
-The champion table is generated, never edited by hand:
-
-```bash
-make metrics-export     # rmlx metrics export --markdown > BENCHMARK_CHAMPIONS.md
-```
-
-The file is git-ignored. It is a function of a machine-local DB, so each host
-has its own.
-
-`export --markdown` (`rmlx_metrics::export::export_markdown`) renders:
-
-1. A fixed header (`crates/rmlx-metrics/src/templates/header.md`).
-2. `## Records`: one table per model with one row per (backend, KV quant,
-   decode config) cell. With `--scope <toml>` (`config/scope.toml`), only the listed models
-   appear, in its order. A backend the scope lists as `unsupported` shows
-   `N/A`. Without `--scope`, every model in `bests` appears.
-3. A speculative-decoding table, when any champion's `decode_config` names a
-   drafter.
-4. A champion summary: the best decode rate per model and the rMLX gap.
-5. A provenance block: export time, `bests` row count, cells rendered.
-
-A missing value renders as `-`.
-
-`--json`, `--csv` and `--jsonl` print one record per `bests` row, including
-`git_sha`. Exactly one format flag is allowed.
-
-### 9.1 What the `Updated` column means
-
-Every metric column of a row is a separate `bests` lookup, one partition per
-cell **and metric** (`METRICS_SCHEMA.md` §3.3). A row's decode record and its memory record can
-come from two runs. The column reports provenance for the metric columns
-only:
-
-- **One run behind all of them**: its date, its `run_id` and its notes.
-- **More than one**: `no single run —`, then each `run_id` with the columns
-  it backs. Naming one run would put its id and notes beside numbers it does
-  not contain.
-- **No metric column printed**: `-`.
-
-`git_sha` is not in this column. From a Markdown row, look it up in
-`observations` by `run_id`.
-
-`KV GB` and `reduction vs bf16` are outside the column's scope. Both are
-minima over `kv_cache_bytes` rows keyed on `(namespace, model, ctx_max,
-kv_quant)` — so the minimum runs across every backend, prompt and decode
-config at the row's own `ctx_max` and `kv_quant` (`ctx_max` taken from the
-row's alphabetically-first metric), not across every `ctx_max`. No single
-observation backs them.
+`make metrics-export` regenerates the git-ignored champion table from
+`bests`; it is never edited by hand. What it renders, the other export
+formats and the `Updated` column are in [`METRICS_EXPORT.md`](METRICS_EXPORT.md).
 
 ---
 
@@ -620,8 +608,8 @@ rmlx --metrics off serve --model <snapshot>
 
 `rmlx_metrics::mode::init` sets the mode once, at process start, and every
 writer reads it there. `off` stops the producers, so no record is built. A
-GPU-capture run is forced to `off`, because capture makes every timing false.
-`off` also stops the `metrics/baseline.csv` append of `rmlx baseline`.
+GPU-capture run records only as `diagnostic`, because capture makes every
+timing false. `off` also stops the `metrics/baseline.csv` append of `rmlx baseline`.
 
 `off` stops telemetry writes only. `rmlx metrics` read commands work in
 every mode. `rmlx metrics record` and `migrate` are explicit commands, not
@@ -629,10 +617,11 @@ telemetry, and are not gated.
 
 ### 10.2 Retention policy
 
-- `observations` is append-only. No command deletes a row. Three things
+- `observations` is append-only. No command deletes a row. Four things
   update one: `describe` sets `description`; `doctor --fix` corrects `unit`
   and `direction` from the registry; the post-hooks of migrations 6, 7 and 8
-  rewrite `decode_config` (`migrate::schema_runner`).
+  rewrite `decode_config` (`migrate::schema_runner`); migration 9 sets
+  `run_class` to `gate` on every row written before the column.
 - `bests` is a view and holds no rows.
 - `prompts` rows stay; `observations.prompt_id` references them. A changed
   prompt body is a new row.
@@ -662,6 +651,9 @@ do not fail it.
    against their §5 lists, and `metric` against the registry.
    Error, naming the value and a row id. The `kv_quant` sweep cannot fail,
    because the field is free-form (§5.3).
+4b. Rows with no `run_class`. Warning, never repaired: such a row was written
+    around the recorder, reaches no gate, and has no class to recover. The
+    column's `CHECK` refuses any other spelling.
 5. `direction` against the registry. Error; `--fix` corrects it, and the
    run that corrects it still exits 1.
 6. `unit` against the registry. Error; `--fix` corrects it, and the run that
@@ -686,13 +678,22 @@ do not fail it.
 
 ---
 
+## 11. DB import (`rmlx metrics import`)
+
+`rmlx metrics import --from <db>` copies another metrics DB's observations
+and their prompts into this one. The contract is in
+[`METRICS_IMPORT.md`](METRICS_IMPORT.md).
+
+---
+
 ## 12. CI integration
 
 ### 12.1 Pre-push gate (`make ci`)
 
-`make ci` runs `ci-metrics`: `rmlx metrics doctor` against
-`$RMLX_HOME/metrics/runs.db` (default `.rmlx/`), skipped when that file is
-absent. CI never runs a bench. It checks the DB's structure, its identity
+`make ci` runs `ci-metrics`: `rmlx metrics doctor` against the DB
+`rmlx metrics path` resolves, `<RMLX_HOME>/metrics/runs.db` (default `.rmlx/`),
+skipped when that file is absent. The check and the doctor read the same path;
+a relative `RMLX_HOME` turns the target red with the binary's refusal. CI never runs a bench. It checks the DB's structure, its identity
 whitelists, its registry agreement and its `METRICS_SCHEMA.md` §4.1 plausibility.
 
 It does not diff `BENCHMARK_CHAMPIONS.md`. That file is git-ignored and
@@ -738,9 +739,55 @@ change to what `bests` publishes, such as a `METRICS_SCHEMA.md` §4.1 bounds cha
     on a DB in a suspect state (§10.4).
 20. **Identity comes from `RunIdentity`** or `rmlx metrics identity --json`,
     never from a literal (§8.5.1).
-21. **A/B experiments never write here.** `scripts/perf_ab.sh` runs every
-    slot with `--metrics off`, so `runs.db` is not opened. A row from a
-    discarded arm would be permanent. Record the surviving arm once with
-    `rmlx baseline --record`.
+21. **Record every measurement run, under its class** (§8.5). `gate`: a
+    canary, a release gate, the surviving arm of an A/B recorded once.
+    `ab_arm`: every A/B slot; `scripts/perf_ab.sh` records each slot, and
+    `scripts/bench_llama_ab.sh` each arm's medians. `diagnostic`: profiling,
+    traced and investigation runs, among them the canary's warmup and
+    measured calls, a GPU capture, a codec probe and the server's live
+    requests. Only `gate` rows reach `bests`, the gates and the exports.
+    Bring a scratch DB's rows in with `rmlx metrics import` (§11). Not
+    recorded, and why:
+    - `rmlx bench` (§8.1.1): recording it would need a record builder beside
+      `rmlx baseline`'s.
+    - A run that measured nothing: the canary's one-token codec probe, a
+      failed or skipped bench cell. The recorder refuses a record with no
+      measurement.
+    - The `rmlx baseline` runs of a `scripts/bench_cell.sh` cache-type cell,
+      and the `rmlx bench` slots of `scripts/prefill_chunk_sweep.sh`: each
+      set is recorded once, as the aggregate the script computes.
+    - `scripts/schema_constraint_canary.sh`: a correctness proof run under
+      `--log verbose` in a hermetic `RMLX_HOME` per probe, so that probe's
+      log holds its own records only. It measures no rate.
+    - A `scripts/mst_capture.sh` run its `--time-limit` stops: `baseline`
+      records at exit.
+    - A `scripts/perf_ab.sh` arm whose binary predates `--run-class`, and any
+      `--synthetic-arms` run: an old binary cannot state a class, and a stub
+      measures nothing.
 22. **A new rule, metric or backend** updates this doc or `METRICS_SCHEMA.md`,
     `CLAUDE.md` and `crates/rmlx-metrics/README.md` in the same change.
+23. **A binary built before migration 9 must not open a DB that holds
+    non-gate rows.** That includes an installed release binary run from inside
+    the repo, which resolves `<workspace>/.rmlx/`. Its writers rebuild `bests`
+    without the class filter, and its readers have none, so an `ab_arm` or
+    `diagnostic` row would win a champion and move a gate. A binary from
+    migration 9 on refuses a DB at a later version than it knows, naming
+    both: every `rmlx metrics` subcommand that opens the DB, reader, writer
+    or `doctor`, except `backup` and `restore`, which only copy the file; and
+    `serve`, `chat`, `transcribe`, `info`, `healthcheck`, `baseline`, `bench`
+    and `eval ppl` unless run with `--metrics off`, since each opens the DB
+    at start to record its events. `claim`, `profile`, `kv-calibrate` and
+    `eval spec-answer` do not open it. A scratch
+    `RMLX_HOME`, or `--db` for `rmlx metrics`, points it at another DB.
+    `make canary-gate` under `git bisect` builds the old commit's binary with
+    that commit's own `Makefile`. When bisecting across migration 9, run
+    `metrics deltas --since-sha <SHA> --threshold-pct 3 --exit-code true`
+    with a binary built at or after migration 9, copied outside the
+    checkout, and run the bisected build under a scratch `RMLX_HOME`.
+24. **Exit 75 means measured, record pending.** `rmlx baseline --record` and
+    `rmlx eval ppl --corpus` exit 75 when the run measured and its record did
+    not land; the buffer file it names stays for `rmlx metrics record
+    --replay-pending`. A caller that records `gate` fails on 75: the gate has
+    no row to read. A caller that records `ab_arm` or `diagnostic` keeps the
+    measurement, prints the buffer file and the replay command, goes on, and
+    ends non-zero, with its own INCOMPLETE code where it has one.

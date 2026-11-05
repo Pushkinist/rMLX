@@ -39,6 +39,7 @@ pub mod gated_delta_msl;
 pub mod gemma3;
 pub mod gemma4;
 pub mod hadamard;
+mod hadamard_msl;
 pub mod jina_v4;
 pub mod kv_bytes;
 pub mod kv_cache;

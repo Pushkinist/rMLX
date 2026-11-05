@@ -123,6 +123,8 @@ fn canonicalize_backend_unknown() {
             assert_eq!(value, "pytorch");
         }
         Error::MissingBackendVersion { .. }
+        | Error::MissingRunClass
+        | Error::ImportRunClass(_)
         | Error::Sqlite(_)
         | Error::Io(_)
         | Error::Schema(_)
@@ -199,6 +201,8 @@ fn alias_normalization_non_backend_field_untouched() {
     match err {
         Error::IdentityNotInWhitelist { field, .. } => assert_eq!(field, "weight_quant"),
         Error::MissingBackendVersion { .. }
+        | Error::MissingRunClass
+        | Error::ImportRunClass(_)
         | Error::Sqlite(_)
         | Error::Io(_)
         | Error::Schema(_)
@@ -327,4 +331,12 @@ fn canonicalize_kv_quant_malformed_mixed_records_verbatim() {
         "mixed_garbage"
     );
     assert_eq!(canonicalize_kv_quant("mixed_k8_v4").unwrap(), "mixed_k8_v4");
+}
+
+#[test]
+fn a_one_bit_snapshot_has_a_recordable_weight_quant() {
+    assert_eq!(
+        canonicalize("weight_quant", "1bit", WEIGHT_QUANT_WHITELIST).unwrap(),
+        "1bit"
+    );
 }

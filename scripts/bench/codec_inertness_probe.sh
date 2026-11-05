@@ -29,6 +29,12 @@
 # host. Use `scripts/perf_ab.sh` for any throughput claim. The two columns the
 # probe exists for — bytes and the id digest — do not depend on host load.
 #
+# Every run is recorded in runs.db by `rmlx baseline --record --run-class
+# diagnostic --label codec_inertness:<ts>:<codec>`, so its rows reach no
+# champion and no gate. The CSV's `recorded_run_class` and `record_status`
+# columns say so per row (below), and `codec_inertness_ingest.py` skips such a
+# row rather than write its `kv_cache_bytes` a second time.
+#
 # Usage:
 #   scripts/bench/codec_inertness_probe.sh --model <snapshot-abs-path> \
 #       --prompt-tokens 4096 [--max-tokens 100] [--max-ctx N] [--out CSV] \
@@ -41,7 +47,16 @@
 # Output CSV (appended, header written once):
 #   timestamp,model,prompt_tokens,prompt_tokens_measured,max_ctx,max_tokens,
 #   codec,exit_code,kv_cache_bytes,ids_sha,store_skipped,ttft_ms,decode_tps,
-#   prefill_tps,binary_sha,kv_boundary
+#   prefill_tps,binary_sha,kv_boundary,recorded_run_class,record_status
+#
+# `exit_code` is the measurement's status: 0 when the run measured, its own
+# exit code otherwise. The record's status is apart from it: `record_status` is
+# `landed`, or `pending` for a run that measured and whose record did not land
+# (`baseline` exit 75; its buffer file is printed for `rmlx metrics record
+# --replay-pending`), and empty for a run that did not measure.
+# `recorded_run_class` is `diagnostic` for both `landed` and `pending` rows,
+# which `codec_inertness_ingest.py` therefore never promotes: the replay
+# writes a pending one once. The probe ends 75 when any record is pending.
 #
 # `kv_boundary` is the `--kv-boundary-layers` value the sweep ran at, empty for
 # the engine default. It is a cell-identity term, not context: a sweep at a
@@ -165,7 +180,7 @@ fi
 BINARY_SHA="$(shasum -a 256 "$BINARY" | cut -c1-12)"
 MODEL_NAME="$(basename "$MODEL")"
 
-HEADER="timestamp,model,prompt_tokens,prompt_tokens_measured,max_ctx,max_tokens,codec,exit_code,kv_cache_bytes,ids_sha,store_skipped,ttft_ms,decode_tps,prefill_tps,binary_sha,kv_boundary"
+HEADER="timestamp,model,prompt_tokens,prompt_tokens_measured,max_ctx,max_tokens,codec,exit_code,kv_cache_bytes,ids_sha,store_skipped,ttft_ms,decode_tps,prefill_tps,binary_sha,kv_boundary,recorded_run_class,record_status"
 
 mkdir -p "$(dirname "$OUT")"
 if [[ ! -f "$OUT" ]]; then
@@ -198,6 +213,11 @@ fi
 
 "$BINARY" claim run -- true || exit $?
 
+# shellcheck source=scripts/lib/record_pending.sh
+. "${REPO_ROOT}/scripts/lib/record_pending.sh"
+PROBE_TS="$(date -u +%Y%m%dT%H%M%SZ)"
+PENDING=0
+
 for codec in "${CODECS[@]}"; do
 	raw="$(mktemp -t codec_inertness)"
 	RMLX_HOME="$RMLX_HOME" "$BINARY" baseline \
@@ -208,9 +228,24 @@ for codec in "${CODECS[@]}"; do
 		--max-ctx "$MAX_CTX" \
 		"${boundary_args[@]+"${boundary_args[@]}"}" \
 		--emit-token-ids \
-		--metrics off \
+		--record --run-class diagnostic --label "codec_inertness:${PROBE_TS}:${codec}" \
 		--log debug >"$raw" 2>&1
 	rc=$?
+	# The measurement's status and the record's are two columns: exit 75 is a
+	# run that measured and whose record did not land.
+	recorded=""
+	record_status=""
+	measure_rc="$rc"
+	if [[ "$rc" -eq 0 ]]; then
+		recorded=diagnostic
+		record_status=landed
+	elif [[ "$rc" -eq "$RECORD_PENDING_EXIT" ]]; then
+		recorded=diagnostic
+		record_status=pending
+		measure_rc=0
+		record_pending_note "$raw"
+		PENDING=$((PENDING + 1))
+	fi
 
 	# `token_ids=` is emitted only on a completed generation. An empty digest
 	# here is the sha256 of the empty string and must never be read as a
@@ -234,15 +269,19 @@ for codec in "${CODECS[@]}"; do
 
 	# `kv_boundary` is a `<head>,<tail>` pair, so it is quoted: an unquoted
 	# comma inside a field makes it two columns and every later column shift.
-	printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"%s"\n' \
+	printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"%s",%s,%s\n' \
 		"$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$MODEL_NAME" "$PROMPT_TOKENS" "${measured:-}" \
-		"$MAX_CTX" "$MAX_TOKENS" "$codec" "$rc" "${kv_bytes:-}" "${ids_sha:-}" "$skipped" \
-		"${ttft:-}" "${dtps:-}" "${ptps:-}" "$BINARY_SHA" "$KV_BOUNDARY" >>"$OUT"
+		"$MAX_CTX" "$MAX_TOKENS" "$codec" "$measure_rc" "${kv_bytes:-}" "${ids_sha:-}" "$skipped" \
+		"${ttft:-}" "${dtps:-}" "${ptps:-}" "$BINARY_SHA" "$KV_BOUNDARY" "$recorded" "$record_status" >>"$OUT"
 
-	printf '  %-24s rc=%-3s bytes=%-12s ids=%-16s skipped=%s\n' \
-		"$codec" "$rc" "${kv_bytes:-NONE}" "${ids_sha:-NONE}" "$skipped"
+	printf '  %-24s rc=%-3s bytes=%-12s ids=%-16s skipped=%s record=%s\n' \
+		"$codec" "$rc" "${kv_bytes:-NONE}" "${ids_sha:-NONE}" "$skipped" "${record_status:-none}"
 
 	rm -f "$raw"
 done
 
 echo "probe: done -> $OUT"
+if [[ "$PENDING" -gt 0 ]]; then
+	echo "probe: INCOMPLETE: $PENDING record(s) pending (named above); the CSV rows stand" >&2
+	exit "$RECORD_PENDING_EXIT"
+fi

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Ingest a `scripts/perf_ab.sh` result into the rMLX metrics DB.
 
-`perf_ab.sh` deliberately never touches `runs.db` — an A/B run is an experiment
-and the store is append-only. This is the separate, explicit step that promotes
-one accepted comparison into two §8.5 RunRecords, one per arm.
+`perf_ab.sh` records every slot as an `ab_arm` row, which reaches no champion
+and no gate. This is the separate, explicit step that promotes the surviving
+arm of one accepted comparison, `--keep-arm A|B`, into one §8.5 RunRecord of
+class `gate`. The other arm is not written again: its slots are its record.
 
 Sibling of `llama_ab_ingest.py`, which does the same job for
 `bench_llama_ab.sh`. The two inputs are different shapes and different
@@ -17,7 +18,7 @@ Usage:
     python3 scripts/ingest/perf_ab_ingest.py --dry-run RESULT.json \
         --model Qwen3.8-27B-mxfp8 --weight-quant mxfp8 \
         --arm-a-kv-quant none --arm-b-kv-quant mixed_k8g64_v4g64 \
-        --prompt-tokens 130848
+        --prompt-tokens 130848 --keep-arm B
 
     # Write buffer files and ingest them:
     python3 scripts/ingest/perf_ab_ingest.py --record RESULT.json ...
@@ -51,11 +52,13 @@ from typing import Any
 _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR.parent / "lib"))
 from kv_boundary_default import kv_boundary_default  # noqa: E402
+from recorder_check import require_run_class_recorder  # noqa: E402
+from rmlx_home import rmlx_home  # noqa: E402
 
 RMLX_REPO_ROOT = Path(os.environ.get("RMLX_REPO_ROOT", str(_SCRIPT_DIR.parents[1])))
 # Runtime state lives under a single root (CLAUDE.md). `RMLX_HOME` wins; the
 # in-repo `.rmlx/` is the dev default.
-RMLX_HOME = Path(os.environ.get("RMLX_HOME", str(RMLX_REPO_ROOT / ".rmlx")))
+RMLX_HOME = rmlx_home(RMLX_REPO_ROOT)
 BUFFER_PENDING = RMLX_HOME / "metrics" / "buffer" / "pending"
 # Records are assembled HERE first and only moved into `pending/` for the
 # moment the recorder is actually invoked. Anything sitting in `pending/` is,
@@ -248,6 +251,7 @@ def _arm_record(
         "n_measure": stats["n"],
         "notes": notes,
         "description": args.description,
+        "run_class": "gate",
         "metrics": metrics,
     }
 
@@ -288,6 +292,13 @@ def main() -> int:
         help="caller-supplied provenance (§8.5.1); the binary does no git.",
     )
     p.add_argument("--description", default=None)
+    p.add_argument(
+        "--keep-arm",
+        required=True,
+        choices=["A", "B"],
+        help="the surviving arm, written as one gate record (docs/METRICS_DB.md "
+        "§8.5). Both arms' slots are already in runs.db as ab_arm rows.",
+    )
     p.add_argument("--accept-tainted", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument(
@@ -383,9 +394,12 @@ def main() -> int:
             )
         prompt_tokens = measured
 
+    # The kept row's notes name the arm it was paired with, so both declared
+    # codecs are held to the arguments that ran.
+    for arm, declared in (("A", args.arm_a_kv_quant), ("B", args.arm_b_kv_quant)):
+        _kv_quant_of(result["arm_a" if arm == "A" else "arm_b"].get("args", ""), declared, arm)
     records = [
-        _arm_record(result, cell, arm, args, prompt_body, prompt_tokens, prompt_name)
-        for arm in ("A", "B")
+        _arm_record(result, cell, args.keep_arm, args, prompt_body, prompt_tokens, prompt_name)
     ]
 
     if args.dry_run:
@@ -394,6 +408,9 @@ def main() -> int:
             trimmed["prompt"] = dict(rec["prompt"], body=f"<{len(prompt_body)} chars>")
             print(json.dumps(trimmed, indent=2))
         return 0
+
+    if args.record:
+        require_run_class_recorder(args.rmlx_bin)
 
     stamp = result["ts_utc"].replace("-", "").replace(":", "")
     STAGING.mkdir(parents=True, exist_ok=True)

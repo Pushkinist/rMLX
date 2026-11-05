@@ -49,7 +49,7 @@
 //! The oracle cannot see a change that moves the one-thread output: both arms
 //! run the changed binary. Other suites hold the one-thread output for some of
 //! the snapshots here: the golden-token suites of `rmlx-models` for Bonsai-8B,
-//! medgemma, Qwen3.6-35B and BitNet (gemma4 is held at e4b, not the e2b used
+//! Qwen3.6-35B and BitNet (gemma4 is held at e4b, not the e2b used
 //! here), the speculative equivalence pairs for the drafters, and
 //! `crates/rmlx-audio/tests/transcribe.rs` for Whisper. No suite holds
 //! ReaderLM-v2, Ternary-Bonsai-27B, gemma-4-e2b, gemma-4-12B, Qwen3-VL, jina-v4
@@ -196,10 +196,6 @@ pub const ORNITH_9B: (&str, &str) = (
 pub const GEMMA4_UNIFIED_12B: (&str, &str) = (
     "mlx-community__gemma-4-12B-it-mxfp8",
     "Gemma4UnifiedForConditionalGeneration",
-);
-pub const MEDGEMMA: (&str, &str) = (
-    "mlx-community__medgemma-1.5-4b-it-8bit",
-    "Gemma3ForConditionalGeneration",
 );
 pub const QWEN3_VL: (&str, &str) = (
     "mlx-community__Qwen3-VL-30B-A3B-Instruct-4bit",

@@ -642,3 +642,7 @@ mod first_logprobs_tests;
 #[cfg(test)]
 #[path = "prefill_plan_tests.rs"]
 mod prefill_plan_tests;
+
+#[cfg(test)]
+#[path = "shared_input_tests.rs"]
+mod shared_input_tests;

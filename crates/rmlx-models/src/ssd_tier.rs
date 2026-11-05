@@ -90,6 +90,7 @@ pub fn attach_at_load(
     match arch {
         "Gemma4ForConditionalGeneration" | "Gemma4UnifiedForConditionalGeneration" => {
             crate::gemma4::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
+                &info.kv_root,
                 &info.namespace,
                 info.kv_quant,
                 info.layout_key,
@@ -98,6 +99,7 @@ pub fn attach_at_load(
         }
         "Gemma3ForConditionalGeneration" => {
             crate::gemma3::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
+                &info.kv_root,
                 &info.namespace,
                 info.kv_quant,
                 info.layout_key,
@@ -109,6 +111,7 @@ pub fn attach_at_load(
         // only the MoE name left every dense Qwen3.5 snapshot silently RAM-only.
         "Qwen3_5MoeForConditionalGeneration" | "Qwen3_5ForConditionalGeneration" => {
             crate::qwen3_5_moe::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
+                &info.kv_root,
                 &info.namespace,
                 info.kv_quant,
                 info.layout_key,
@@ -117,6 +120,7 @@ pub fn attach_at_load(
         }
         "Qwen3ForCausalLM" => {
             crate::qwen3::QWEN3_PROMPT_CACHE.attach_ssd_tier(
+                &info.kv_root,
                 &info.namespace,
                 info.kv_quant,
                 info.layout_key,
@@ -125,6 +129,7 @@ pub fn attach_at_load(
         }
         "Qwen2ForCausalLM" => {
             crate::qwen2::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
+                &info.kv_root,
                 &info.namespace,
                 info.kv_quant,
                 info.layout_key,
@@ -133,6 +138,7 @@ pub fn attach_at_load(
         }
         "BitNetForCausalLM" => {
             crate::bitnet::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
+                &info.kv_root,
                 &info.namespace,
                 info.kv_quant,
                 info.layout_key,
@@ -141,6 +147,7 @@ pub fn attach_at_load(
         }
         "Qwen3VLMoeForConditionalGeneration" => {
             crate::qwen3_vl_moe::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
+                &info.kv_root,
                 &info.namespace,
                 info.kv_quant,
                 info.layout_key,
@@ -149,6 +156,7 @@ pub fn attach_at_load(
         }
         "LagunaForCausalLM" => {
             crate::laguna::prompt_cache::PROMPT_CACHE.attach_ssd_tier(
+                &info.kv_root,
                 &info.namespace,
                 info.kv_quant,
                 info.layout_key,

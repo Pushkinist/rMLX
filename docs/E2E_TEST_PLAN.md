@@ -72,7 +72,7 @@ The manifest's `feature` column groups the rows:
 
 | feature | what it runs |
 |---|---|
-| `cli_surface` | `info --list-cache-types`, `info --probe-smoke`, `baseline --record`, `metrics query`, `healthcheck --full` |
+| `cli_surface` | `info --list-cache-types`, `info --probe-smoke`, `baseline --record --run-class diagnostic`, `metrics query`, `healthcheck --full` |
 | `text_core` | chat non-stream and seed determinism (`golden`), chat stream, Anthropic, multi-turn, `stop` |
 | `quant_matrix` | Bonsai at every `kv_quant` listed there, plus `rot_k` / `q4_g64` through `ctk`/`ctv`: `coherent` and `niah_retrieval` on each, `cosine_vs_bf16` on some |
 | `quant_matrix_konly` | the K-only and symmetric codecs on Bonsai (tag `konly`): short-context `coherent` only |

@@ -185,6 +185,7 @@ impl LegacyRunRecord {
             notes: Some("ingested from legacy buffer (schema pre-§8.5)".to_string()),
             description: None,
             decode_config: None,
+            run_class: None,
             metrics,
         })
     }
@@ -369,6 +370,7 @@ impl LegacyCbbRecord {
             }),
             description: self.description,
             decode_config: None,
+            run_class: None,
             metrics: self.metrics,
         })
     }

@@ -21,6 +21,7 @@ use crate::error::{Error, Result};
 use crate::ingest::{prompt_body_sha256, IdentityPolicy, PromptRef, RunRecord};
 use crate::prompts::{PromptId, PromptStore};
 use crate::registry;
+use crate::run_class::RunClass;
 use crate::time_util::now_iso8601;
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -148,14 +149,14 @@ impl<'a> Recorder<'a> {
                     run_id, ts_utc, git_sha, build_profile, backend_version, hardware_tag,
                     prompt_tokens, max_tokens, temperature, seed, n_warmups, n_measure,
                     output_first_64, decode_stddev, notes, description, decode_config,
-                    inserted_utc, inserted_by
+                    inserted_utc, inserted_by, run_class
                 ) VALUES (
                     ?1,  ?2,  ?3,  ?4,  ?5,  ?6,  ?7,
                     ?8,  ?9,  ?10, ?11,
                     ?12, ?13, ?14, ?15, ?16, ?17,
                     ?18, ?19, ?20, ?21, ?22, ?23,
                     ?24, ?25, ?26, ?27, ?28,
-                    ?29, ?30
+                    ?29, ?30, ?31
                 )",
                 params![
                     // cell identity
@@ -197,6 +198,7 @@ impl<'a> Recorder<'a> {
                     // bookkeeping
                     inserted_utc,
                     self.inserted_by,
+                    run.run_class.map(RunClass::as_str),
                 ],
             )?;
 

@@ -113,12 +113,12 @@ fn spill_and_hydrate(
     let path = ns.dir.join(format!("{key}.kvb"));
     write_caches(&path, device, &ns.name, base, caches, &[]).expect("spill block");
     let size = std::fs::metadata(&path).expect("block metadata").len();
-    SsdKvIndex::open(&ns.name)
+    SsdKvIndex::open(ns.kv_root(), &ns.name)
         .expect("index open")
         .record(&key, LAYOUT_KEY, &path, &ns.name, &base.to_string(), size)
         .expect("index record");
 
-    SsdHydrator::open(&ns.name, LAYOUT_KEY, device)
+    SsdHydrator::open(ns.kv_root(), &ns.name, LAYOUT_KEY, device)
         .expect("hydrator open")
         .lookup(
             &prompt_ids,

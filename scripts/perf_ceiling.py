@@ -862,8 +862,10 @@ def prefill_anchor(db: Path, model_basename: str) -> dict | None:
     i.e. `value > 0 AND value <= 1e5`. Do not "tighten" it here; change METRICS_SCHEMA.md §4.1 and
     the registry, then mirror it.
 
-    Also filters backend=rmlx and ts_utc >= PREFILL_ANCHOR_MIN_TS. Picks the
-    cell with the most rows.
+    Also filters backend=rmlx, run_class='gate' (the anchor is a published
+    bound, so an A/B slot or a diagnostic run must not move it; a DB that
+    predates the column has no anchor) and ts_utc >= PREFILL_ANCHOR_MIN_TS.
+    Picks the cell with the most rows.
     """
     if not db.exists():
         return None
@@ -874,7 +876,8 @@ def prefill_anchor(db: Path, model_basename: str) -> dict | None:
     try:
         rows = con.execute(
             "SELECT prompt_tokens, value, hardware_tag FROM observations "
-            "WHERE metric='prefill_tps' AND backend='rmlx' AND model=? "
+            # run_class spelling: RunClass::Gate.as_str() in crates/rmlx-metrics/src/run_class.rs
+            "WHERE metric='prefill_tps' AND backend='rmlx' AND run_class='gate' AND model=? "
             "AND value>0 AND value<=1e5 AND ts_utc>=?",  # METRICS_SCHEMA.md §4.1 Bounds::positive(1e5)
             (model_basename, PREFILL_ANCHOR_MIN_TS),
         ).fetchall()
