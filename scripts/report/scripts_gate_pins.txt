@@ -23,7 +23,6 @@ class gpu_capture.sh
 class gputrace_preflight.sh
 class mst_capture.sh
 class perf_ceiling.py
-class prefill_chunk_sweep.sh
 class release_e2e/stage6_perf/codec_smoke_runner.sh
 class release_e2e/stage6_perf/kv_codec_matrix.toml
 class release_e2e/stage6_perf/niah_long_context.sh
@@ -38,7 +37,7 @@ purpose bench_identity_selftest.sh
 purpose codec_smoke_runner_selftest.sh
 purpose gpu_capture.sh
 purpose mst_capture.sh
-purpose prefill_chunk_sweep.sh
+purpose bench/prefill_chunk_sweep.sh
 purpose lib/record_pending.sh
 purpose run_class_selftest.sh
 usage bench_identity_selftest.sh
@@ -58,7 +57,7 @@ usage lib/snapshot_identity.py
 usage lib/spec_round_log.py
 usage mst_capture.sh
 usage bench/ab.sh
-usage prefill_chunk_sweep.sh
+usage bench/prefill_chunk_sweep.sh
 usage release/release_cpu.py
 usage release/release_cpu_selftest.sh
 usage suite/run_gpu_tests.sh
@@ -82,7 +81,7 @@ exit-undeclared gen_lloyd_codebook.py 1
 exit-undeclared gpu_capture.sh 1,2
 exit-undeclared mst_capture.sh 0,1,2,75
 exit-undeclared bench/ab.sh 0,1,125
-exit-undeclared prefill_chunk_sweep.sh 0,125
+exit-undeclared bench/prefill_chunk_sweep.sh 0,125
 exit-undeclared release_e2e/stage6_perf/codec_smoke_runner.sh 0,1,2,3
 exit-undeclared release_e2e/stage6_perf/niah_long_context.sh 1,2
 exit-undeclared suite/run_gpu_tests.sh 0,1
@@ -96,7 +95,6 @@ exit-undeclared ssd_canary_selftest.sh 2
 exit-undeclared run_class_selftest.sh 1
 caller aggregate_decode_profile.py
 caller gen_lloyd_codebook.py
-caller prefill_chunk_sweep.sh
 caller release_e2e/stage6_perf/niah_long_context.sh
 caller sdpa_headdim_bench.py
 caller spec/broken_engine.sh
@@ -130,7 +128,7 @@ set-mode gpu_capture.sh
 set-mode gputrace_preflight.sh
 set-mode mst_capture.sh
 set-mode bench/ab.sh
-set-mode prefill_chunk_sweep.sh
+set-mode bench/prefill_chunk_sweep.sh
 set-mode schema_constraint_canary.sh
 set-mode bench/serve_bench_selftest.sh
 set-mode spec/broken_engine.sh
@@ -155,7 +153,7 @@ size ssd_canary.sh 1284
 heredoc bench_llama_ab.sh 30,27
 heredoc published/samples_selftest.sh 23
 heredoc ingest/ab_selftest.sh 29
-heredoc prefill_chunk_sweep.sh 162
+heredoc bench/prefill_chunk_sweep.sh 162
 heredoc ingest/published_selftest.sh 198
 heredoc published/table_selftest.sh 31
 heredoc report/debt_report_selftest.sh 26,24,24
@@ -184,7 +182,7 @@ binary-literal gpu_capture.sh 1
 binary-literal gputrace_preflight.sh 1
 binary-literal mst_capture.sh 2
 binary-literal bench/ab.sh 2
-binary-literal prefill_chunk_sweep.sh 2
+binary-literal bench/prefill_chunk_sweep.sh 2
 binary-literal release/release.sh 1
 binary-literal release_e2e/stage6_perf/codec_smoke_runner.sh 1
 binary-literal release_e2e/stage6_perf/niah_long_context.sh 1
@@ -207,7 +205,7 @@ env-knob lib/selftest_support.sh TOOL
 env-knob host/mlx_restore_pin.sh HOMEBREW_PREFIX
 env-knob mst_capture.sh RMLX_HOME
 env-knob bench/ab.sh RMLX_HOME,RMLX_O_MODELS_ROOT
-env-knob prefill_chunk_sweep.sh RMLX_HOME
+env-knob bench/prefill_chunk_sweep.sh RMLX_HOME
 env-knob published/table_selftest.sh MAKE_ENV
 env-knob release_e2e/stage6_perf/codec_smoke_runner.sh RMLX_O_MODELS_ROOT
 env-knob suite/run_gpu_tests.sh RMLX_O_MODELS_ROOT,RMLX_SKIP_GPU

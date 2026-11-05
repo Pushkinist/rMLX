@@ -752,7 +752,7 @@ change to what `bests` publishes, such as a `METRICS_SCHEMA.md` §4.1 bounds cha
       measurement.
     - The `rmlx baseline` runs of a `bench/baseline_cells.sh --preset
       cache-types` cell, and the `rmlx bench` slots of
-      `scripts/prefill_chunk_sweep.sh`: each set is recorded once, as the
+      `scripts/bench/prefill_chunk_sweep.sh`: each set is recorded once, as the
       aggregate the script computes.
     - `scripts/schema_constraint_canary.sh`: a correctness proof run under
       `--log verbose` in a hermetic `RMLX_HOME` per probe, so that probe's

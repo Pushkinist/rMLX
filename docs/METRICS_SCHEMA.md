@@ -231,7 +231,7 @@ its defaults. The empty string is refused.
 |---|---|---|
 | `<drafter>/block=<n>` | speculative arm and its configured block | `rmlx_metrics::cell::decode_config`, called by the round loop, which logs it on its `done` line |
 | `<drafter>/depth=<policy>` | how the loop sizes each round's block, when it resizes | same |
-| `prefill_chunk=<n>` | non-default prefill chunk | `scripts/prefill_chunk_sweep.sh` |
+| `prefill_chunk=<n>` | non-default prefill chunk | `scripts/bench/prefill_chunk_sweep.sh` |
 | `kv_boundary/head=<h>,kv_boundary/tail=<t>` | `--kv-boundary-layers` off its default | `rmlx baseline --record`, `rmlx eval ppl`, `scripts/ingest/ingest.py {ab,codec-inertness}` |
 
 `<drafter>` is the `DraftKind::as_str` name: `mtp`, `dflash`, `dflash2`,
@@ -264,7 +264,7 @@ carries one.
 producer of drafter terms. The other composers are `rmlx_models::kv_cache`
 (the boundary terms), `scripts/ingest/ingest.py`
 (modes `ab` and `codec-inertness`) and
-`scripts/prefill_chunk_sweep.sh`. `check-kv-boundary-default-parity` holds
+`scripts/bench/prefill_chunk_sweep.sh`. `check-kv-boundary-default-parity` holds
 their default values together; only `validate` holds their format.
 
 `bests`, the cell queries and the exports partition on the whole cell key.

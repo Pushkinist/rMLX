@@ -45,14 +45,20 @@
 # Exit codes:
 #   0   — ran cleanly; the verdict is on stdout
 #   1   — correctness failure: two levels of one cell produced different tokens
+#   75  — measured, but a record was refused; the refused file stays under `--out`
 #   125 — not usable: busy host, missing binary/model/prompt, bad arguments
+# Every other exit ends the run before any record is filed, so 75 is only reached
+# by a run that passed every gate and ended without a stronger failure.
+#
+# Not a mode of: bench/ab.sh — its ingest takes two arms and files one; this files a record per
+# level, and the engine names the chunk it used only in a debug event.
 
 # No `pipefail`: several parses here end in `| head -1`, which SIGPIPEs its
 # producer once it has what it needs. Every value parsed is checked for
 # emptiness immediately after and every subprocess status is tested.
 set -eu
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
 AWK_BUSIEST="${REPO_ROOT}/scripts/lib/busiest_between.awk"
 
@@ -60,6 +66,8 @@ AWK_BUSIEST="${REPO_ROOT}/scripts/lib/busiest_between.awk"
 source "${REPO_ROOT}/scripts/lib/cpu_snapshot.sh"
 # shellcheck source=scripts/lib/identity.sh
 source "${REPO_ROOT}/scripts/lib/identity.sh"
+# shellcheck source=scripts/lib/record_pending.sh
+source "${REPO_ROOT}/scripts/lib/record_pending.sh"
 
 BINARY="${REPO_ROOT}/target/release-perf/rmlx"
 MODEL=""
@@ -78,7 +86,7 @@ RECORD=false
 
 usage() {
 	cat <<'USAGE'
-usage: scripts/prefill_chunk_sweep.sh --model <snapshot> --arch-key <key> [options]
+usage: scripts/bench/prefill_chunk_sweep.sh --model <snapshot> --arch-key <key> [options]
 
 Required:
   --model PATH           model snapshot directory
@@ -477,14 +485,24 @@ PY
 if $RECORD; then
 	echo ""
 	echo "==> recording cells through the §8.5 ingest path"
+	refused=0
 	while read -r record; do
 		[[ -n "$record" ]] || continue
+		record_rc=0
 		if [[ -n "$DB_PATH" ]]; then
-			"$BINARY" metrics record --file "$record" --db "$DB_PATH"
+			"$BINARY" metrics record --file "$record" --db "$DB_PATH" || record_rc=$?
 		else
-			"$BINARY" metrics record --file "$record"
+			"$BINARY" metrics record --file "$record" || record_rc=$?
+		fi
+		if [[ $record_rc -ne 0 ]]; then
+			echo "ERROR: record not filed (exit $record_rc); it stays at $record — file it with \`rmlx metrics record --file\` once the cause is fixed" >&2
+			refused=$((refused + 1))
 		fi
 	done <"$OUT_DIR/records/manifest.txt"
+	if [[ $refused -gt 0 ]]; then
+		echo "ERROR: $refused record(s) measured but not filed; the other cells are filed" >&2
+		exit "$RECORD_PENDING_EXIT"
+	fi
 else
 	echo ""
 	echo "Not recorded. Pass --record to ingest these cells into runs.db."

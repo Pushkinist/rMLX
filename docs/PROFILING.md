@@ -18,7 +18,7 @@ penalty lands on one arm and looks like a clean result.
   BAAB, ABBA.
 - **Three or more levels**: run a Latin square. The level index is
   `(position + row) % n_levels`, one row per cycle, so every level holds every
-  slot once per `n_levels` rows. `scripts/prefill_chunk_sweep.sh` runs this
+  slot once per `n_levels` rows. `scripts/bench/prefill_chunk_sweep.sh` runs this
   shape.
 - **Report the paired statistic.** Compare each level to the baseline within
   a row and take the median over rows. A pooled median across slots re-admits
@@ -465,9 +465,11 @@ The per-arch chunk defaults and their resolution order are in
 measured on. Do not change one without a sweep run as a Latin square (see
 "Ordering on this host" above).
 
-`scripts/prefill_chunk_sweep.sh` drives the per-arch sweep through
+`scripts/bench/prefill_chunk_sweep.sh` drives the per-arch sweep through
 `RMLX_PREFILL_CHUNK_<ARCH>`. It records each cell in the metrics DB under
-`decode_config = 'prefill_chunk=<n>'`.
+`decode_config = 'prefill_chunk=<n>'`. A record the DB refuses is named on
+stderr and left under `--out`, the other cells are still filed, and the run ends
+75.
 
 `decode_loop::chunked_prefill` and `speculative::prefill_chunked_for_class`
 log the resolved size as `debug!` fields: `prefill_chunk` and
