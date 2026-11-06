@@ -384,6 +384,7 @@ check "a --claim-rmlx that is no executable file is refused" 125 "no rmlx binary
 # build of the checkout the harness runs from.
 DEFAULT_ROOT="$WORK/default_root"
 mkdir -p "$DEFAULT_ROOT"
+DEFAULT_ROOT="$(cd "$DEFAULT_ROOT" && pwd)"
 ln -s "$ROOT/scripts" "$DEFAULT_ROOT/scripts"
 REPO_AB="$AB"
 AB="$DEFAULT_ROOT/scripts/bench/llama_ab.sh"

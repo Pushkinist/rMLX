@@ -681,6 +681,7 @@ check binary_a_not_executable 125 \
 # build of the checkout it runs from.
 DEFAULT_ROOT="$WORK/default_root"
 mkdir -p "$DEFAULT_ROOT"
+DEFAULT_ROOT="$(cd "$DEFAULT_ROOT" && pwd)"
 ln -s "$REPO_ROOT/scripts" "$DEFAULT_ROOT/scripts"
 REPO_AB="$AB"
 AB="$DEFAULT_ROOT/scripts/bench/ab.sh"

@@ -40,8 +40,8 @@ FAILED=0
 #
 # serve_bench.sh resolves both its binary and its lib/ helpers from `$0/../..`, so a
 # root holding the real scripts/ and a stub binary is how the stub gets used.
-FAKE_ROOT="$WORK/repo"
-mkdir -p "$FAKE_ROOT/target/release-perf"
+mkdir -p "$WORK/repo/target/release-perf"
+FAKE_ROOT="$(cd "$WORK/repo" && pwd)"
 ln -s "$REPO_ROOT/scripts" "$FAKE_ROOT/scripts"
 # A checkout whose HEAD is a commit the identity under test does not name.
 git -C "$FAKE_ROOT" init -q
