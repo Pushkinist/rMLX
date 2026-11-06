@@ -11,6 +11,8 @@
 #     --kv-quant Q             KV codec to ask the engine for
 #     --max-ctx N              context the server is started with
 #     --port N
+#     --binary PATH            the rmlx that serves and gives the run identity (default: the
+#                              release-perf build of this checkout)
 #     --longctx SIZE           also measure prompts/longctx_SIZE.json (e.g. 32k), plain only;
 #                              repeatable
 #     --greedy-pass            also answer every sample at temperature 0, unstreamed
@@ -207,7 +209,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-BINARY="${REPO_ROOT}/target/release-perf/rmlx"
+# shellcheck source=scripts/lib/identity.sh
+. "${REPO_ROOT}/scripts/lib/identity.sh"
+BINARY="$(rmlx_default_binary "${REPO_ROOT}" release-perf)"
 RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
 LOG_DIR="${RMLX_HOME}/logs"
 SCRATCH_DIR="${RMLX_HOME}/tmp"
@@ -274,6 +278,7 @@ while [[ $# -gt 0 ]]; do
         --kv-quant) require_value "$1" "${2:-}"; KV_QUANT="$2"; shift 2 ;;
         --max-ctx) require_value "$1" "${2:-}"; MAX_CTX="$2"; shift 2 ;;
         --port) require_value "$1" "${2:-}"; PORT="$2"; shift 2 ;;
+        --binary) require_value "$1" "${2:-}"; BINARY="$2"; shift 2 ;;
         --samples-root) require_value "$1" "${2:-}"; SAMPLES_ROOT="$2"; shift 2 ;;
         --allow-busy-host) ALLOW_BUSY_HOST=true; shift ;;
         --greedy-pass) GREEDY_PASS=true; shift ;;
@@ -431,8 +436,6 @@ SNAPSHOT_ID="$(python3 "${REPO_ROOT}/scripts/lib/snapshot_identity.py" "${VERIFI
 
 # Backend, version, build profile and hardware tag come from the binary that is
 # actually being measured, never from a constant here.
-# shellcheck source=scripts/lib/identity.sh
-. "${REPO_ROOT}/scripts/lib/identity.sh"
 rmlx_export_identity "${BINARY}"
 
 MODEL_NAMESPACE="$(field_of "${SNAPSHOT_ID}" model_namespace)"

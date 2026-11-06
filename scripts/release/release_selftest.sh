@@ -49,6 +49,8 @@ place_tools() {
     for f in release.sh release_cpu.py; do
         cp "$REPO_ROOT/scripts/release/$f" "$REL/" || st_die "cannot copy $f"
     done
+    mkdir -p "$REPO/scripts/lib"
+    cp "$REPO_ROOT/scripts/lib/identity.sh" "$REPO/scripts/lib/" || st_die "cannot copy identity.sh"
 }
 
 tool_package() { st_bounded 120 bash "$REL/release.sh" package "$@"; }
@@ -486,7 +488,7 @@ fresh
 printf 'nobin\n' >"$S/cargo.mode"
 st_run tool_package
 expect_absent "$REPO/dist"
-finish package_no_binary 1 --has "error: target/release/rmlx not found"
+finish package_no_binary 1 --has "error: ./target/release/rmlx not found"
 
 fresh
 printf 'home\n' >"$S/cargo.mode"

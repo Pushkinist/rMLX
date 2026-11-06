@@ -9,13 +9,13 @@
 #
 # Usage:
 #   VERIFIER_MODEL=/path/to/snapshot bash scripts/ssd_canary.sh [--port N] \
-#     [--ssd-gb N] [--dry-run]
+#     [--ssd-gb N] [--dry-run] [--binary PATH]
 # Exit:   0 every check held; 1 a FAIL check failed or the setup was refused; 11 passthrough of
 #         rmlx serve (the Metal claim is held); 75 a phase record was refused, the run went on;
-#         125 no built binary
+#         125 the binary is missing or not executable
 #
 # Requires:
-#   - Built binary at target/release-perf/rmlx  (run: make build-perf)
+#   - Built binary at target/release-perf/rmlx  (run: make build-perf), or --binary PATH
 #   - VERIFIER_MODEL env var set to snapshot directory (resolve via LOCAL.md)
 #
 # Output, in a new directory <data root>/proofs/ssd-canary-<UTC stamp>.<random>/
@@ -54,7 +54,8 @@ trap on_exit EXIT
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BINARY="${REPO_ROOT}/target/release-perf/rmlx"
+source "${REPO_ROOT}/scripts/lib/identity.sh"
+BINARY="$(rmlx_default_binary "${REPO_ROOT}" release-perf)"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -77,9 +78,15 @@ while [[ $# -gt 0 ]]; do
         --port)            shift; PORT="${1:?--port requires a value}"; shift ;;
         --ssd-gb=*)        SSD_GB="${1#--ssd-gb=}"; shift ;;
         --ssd-gb)          shift; SSD_GB="${1:?--ssd-gb requires a value}"; shift ;;
+        --binary=*)        BINARY="${1#--binary=}"; shift ;;
+        --binary)          shift; BINARY="${1:?--binary requires a value}"; shift ;;
         *) echo "Unknown flag: $1" >&2; exit 1 ;;
     esac
 done
+case "${BINARY}" in
+    /*) ;;
+    *) BINARY="${PWD}/${BINARY}" ;;
+esac
 
 if [[ ! -x "${BINARY}" ]]; then
     echo "ERROR: binary not found at ${BINARY}. Run: make build-perf" >&2
@@ -90,7 +97,6 @@ fi
 
 # Run identity (backend / version / git sha / build profile / hardware tag)
 # comes from the measured binary — never hard-coded here.
-source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/server_wait.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/record_pending.sh"
 rmlx_export_identity "${BINARY}"

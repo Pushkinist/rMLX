@@ -60,6 +60,8 @@ REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
 # shellcheck source=scripts/lib/record_pending.sh
 . "$REPO_ROOT/scripts/lib/record_pending.sh"
+# shellcheck source=scripts/lib/identity.sh
+. "$REPO_ROOT/scripts/lib/identity.sh"
 
 MANIFEST="$REPO_ROOT/scripts/release_e2e/stage6_perf/kv_codec_matrix.toml"
 PROMPTS="$REPO_ROOT/scripts/release_e2e/stage6_perf/smoke_prompts.toml"
@@ -120,7 +122,7 @@ if [[ $DRY_RUN -eq 0 ]]; then
     cargo build --profile release-perf --bin rmlx || exit 2
     cargo test --no-run --profile release-perf -p rmlx-models --test niah_long_context || exit 2
 fi
-CLAIM_RMLX="$REPO_ROOT/target/release-perf/rmlx"
+CLAIM_RMLX="$(rmlx_default_binary "$REPO_ROOT" release-perf)"
 
 # Map manifest `model` -> snapshot slug under $RMLX_O_MODELS_ROOT. The
 # `GoldenModel` consts in crates/rmlx-models/tests/niah_long_context.rs list the

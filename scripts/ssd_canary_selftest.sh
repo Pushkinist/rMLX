@@ -5,6 +5,8 @@
 #
 # No GPU, no model, no metrics DB outside a throwaway directory.
 #
+# LOC-exempt: one recall test of one canary, a fixture builder and a stub shared by a flat list of cases
+#
 # Each run case builds a fixture tree (a copy of the script, the helpers it
 # reads, the real `prompts/ssd_bench/` and the Makefile, plus a stub binary at
 # `target/release-perf/rmlx`), seeds a data root, runs the canary (`make
@@ -23,7 +25,9 @@
 #            ceiling the servers were given
 #   ingest   the three phase records went to the DB the binary resolves
 #   gate     the gate read that same DB, scoped to the canary's prompts
-# Single cases: a missing binary exits 125, and `--tag` is refused.
+# Single cases: a missing binary exits 125, `--tag` is refused, `--binary` names
+# the binary to run (absolute or relative), and one that is no executable file
+# exits 125.
 #
 # The stub resolves its data root and DB the way the binary does (an absolute
 # RMLX_HOME, else the checkout found by walking up for Cargo.lock, else
@@ -977,6 +981,45 @@ if [[ $rc -eq 125 ]] && grep -q 'binary not found' "$nobin/out"; then
     pass "no-binary: exits 125 naming the missing binary"
 else
     fail "no-binary: exited $rc: $(head -1 "$nobin/out")"
+fi
+if grep -qF "binary not found at $nobin/tree/target/release-perf/rmlx." "$nobin/out"; then
+    pass "no-binary: the default binary is the checkout's release-perf build"
+else
+    fail "no-binary: the message names another path: $(head -1 "$nobin/out")"
+fi
+
+# binary_flag_case <name> <want-exit> <flag-arg>... — a tree with no default binary,
+# the stub elsewhere, and the canary run from outside the tree with the flag given.
+binary_flag_case() {
+    local name="$1" want="$2" cdir="$WORK/$1"
+    shift 2
+    local tree="$cdir/tree" rc
+    mkdir -p "$cdir/home" "$cdir/tmp" "$cdir/log" "$cdir/elsewhere"
+    make_tree "$tree"
+    cp "$tree/target/release-perf/rmlx" "$cdir/elsewhere/rmlx"
+    /bin/rm -f "$tree/target/release-perf/rmlx"
+    : >"$cdir/elsewhere/not_executable"
+    seed_root "$tree/.rmlx"
+    run_env "$cdir" "$cdir" "VERIFIER_MODEL=$tree/models/stub-ns__stub-model-8bit" "PORT=$(free_port)" -- \
+        bash "$tree/scripts/ssd_canary.sh" --ssd-gb 100 "$@" >"$cdir/run.out" 2>&1
+    rc=$?
+    if [[ $rc -ne $want ]]; then
+        fail "$name: exited $rc, want $want (tail: $(tail -3 "$cdir/run.out" | tr '\n' ' '))"
+    elif [[ $want -eq 0 && ! -s "$cdir/log/serve.log" ]]; then
+        fail "$name: exited 0 but the binary named was never run as a server"
+    else
+        pass "$name: exits $want"
+    fi
+}
+
+binary_flag_case binary-flag 0 --binary "$WORK/binary-flag/elsewhere/rmlx"
+binary_flag_case binary-flag-relative 0 --binary=elsewhere/rmlx
+binary_flag_case binary-flag-not-executable 125 --binary "$WORK/binary-flag-not-executable/elsewhere/not_executable"
+if grep -qF "binary not found at $WORK/binary-flag-not-executable/elsewhere/not_executable." \
+    "$WORK/binary-flag-not-executable/run.out"; then
+    pass "binary-flag-not-executable: the refusal names the path given"
+else
+    fail "binary-flag-not-executable: the refusal names another path: $(head -1 "$WORK/binary-flag-not-executable/run.out")"
 fi
 
 # --tag was parsed and never read; it is refused rather than silently dropped.

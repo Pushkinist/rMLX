@@ -23,6 +23,7 @@
 set -eu
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/identity.sh"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/rmlx_run_class_selftest.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -218,7 +219,7 @@ STUB
 	chmod +x "$1"
 }
 make_logging_recorder "$WORK/pathbin/rmlx" path
-make_logging_recorder "$WORK/llama_root/target/release/rmlx" checkout
+make_logging_recorder "$(rmlx_default_binary "$WORK/llama_root" release)" checkout
 : >"$WORK/llama_recorder.log"
 set +e
 PATH="$WORK/pathbin:$PATH" RMLX_HOME="$WORK/llama_home2" \

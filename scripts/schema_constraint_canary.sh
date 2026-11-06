@@ -112,9 +112,10 @@
 #   bash scripts/schema_constraint_canary.sh                  # --expect fixed
 #   bash scripts/schema_constraint_canary.sh --expect baseline
 #   bash scripts/schema_constraint_canary.sh --model bonsai   # one model only
+#   bash scripts/schema_constraint_canary.sh --binary PATH    # another rmlx than the build-perf one
 #
 # Requires:
-#   - target/release-perf/rmlx  (make build-perf)
+#   - target/release-perf/rmlx  (make build-perf), or --binary PATH
 #   - RMLX_O_MODELS_ROOT pointing at the snapshot root (resolve via LOCAL.md),
 #     or explicit BONSAI_MODEL / GEMMA_E2B_MODEL paths.
 #   - Exclusive GPU: one MLX process per Mac. Each server takes the Metal claim;
@@ -131,7 +132,8 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BINARY="${REPO_ROOT}/target/release-perf/rmlx"
+source "${REPO_ROOT}/scripts/lib/identity.sh"
+BINARY="$(rmlx_default_binary "${REPO_ROOT}" release-perf)"
 PORT="${PORT:-62265}"
 source "${REPO_ROOT}/scripts/lib/server_wait.sh"
 ROOT_DIR="${REPO_ROOT}/.rmlx/proofs/schema-constraint"
@@ -148,7 +150,8 @@ while [[ $# -gt 0 ]]; do
         --expect) EXPECT="$2"; shift 2 ;;
         --model)  ONLY_MODEL="$2"; shift 2 ;;
         --port)   PORT="$2"; shift 2 ;;
-        -h|--help) sed -n '1,125p' "$0"; exit 0 ;;
+        --binary) BINARY="$2"; shift 2 ;;
+        -h|--help) sed -n '1,126p' "$0"; exit 0 ;;
         *) echo "unknown flag: $1" >&2; exit 2 ;;
     esac
 done

@@ -126,14 +126,16 @@ run_case root_not_a_directory 1 "a root that is not a directory fails the row" \
 # Gate cases: a real pass over a copy of the runner. The stub `rmlx` prints
 # $STUB_FOUND as every needle reading; the stub `cargo` builds nothing.
 FAKE="$WORK/fake"
-mkdir -p "$FAKE/scripts/release_e2e/stage6_perf" "$FAKE/target/release-perf" "$FAKE/bin"
+. "$REPO_ROOT/scripts/lib/identity.sh"
+FAKE_RMLX="$(rmlx_default_binary "$FAKE" release-perf)"
+mkdir -p "$FAKE/scripts/release_e2e/stage6_perf" "$(dirname "$FAKE_RMLX")" "$FAKE/bin"
 cp "$RUNNER" "$REPO_ROOT/scripts/release_e2e/stage6_perf/smoke_prompts.toml" \
     "$FAKE/scripts/release_e2e/stage6_perf/"
 mkdir -p "$FAKE/scripts/lib"
-cp "$REPO_ROOT/scripts/lib/record_pending.sh" "$FAKE/scripts/lib/"
-printf '#!/bin/sh\nfor i in 1 2 3 4 5; do echo "needle_found=$STUB_FOUND"; done\nexit ${STUB_RC:-0}\n' >"$FAKE/target/release-perf/rmlx"
+cp "$REPO_ROOT/scripts/lib/record_pending.sh" "$REPO_ROOT/scripts/lib/identity.sh" "$FAKE/scripts/lib/"
+printf '#!/bin/sh\nfor i in 1 2 3 4 5; do echo "needle_found=$STUB_FOUND"; done\nexit ${STUB_RC:-0}\n' >"$FAKE_RMLX"
 printf '#!/bin/sh\nexit 0\n' >"$FAKE/bin/cargo"
-chmod +x "$FAKE/target/release-perf/rmlx" "$FAKE/bin/cargo"
+chmod +x "$FAKE_RMLX" "$FAKE/bin/cargo"
 # A `cargo` whose `run` fails, as `rmlx baseline` does when the Metal claim is held.
 mkdir -p "$FAKE/bin_run_fails"
 printf '#!/bin/sh\n[ "$1" = run ] && exit 7\nexit 0\n' >"$FAKE/bin_run_fails/cargo"

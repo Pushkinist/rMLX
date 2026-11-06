@@ -26,8 +26,10 @@ PASSED=0
 FAILED=0
 
 # ── Fake repo root ────────────────────────────────────────────────────────────
+. "$REPO_ROOT/scripts/lib/identity.sh"
 FAKE_ROOT="$WORK/repo"
-mkdir -p "$FAKE_ROOT/target/release-perf"
+CANARY_STUB="$(rmlx_default_binary "$FAKE_ROOT" release-perf)"
+mkdir -p "$(dirname "$CANARY_STUB")"
 ln -s "$REPO_ROOT/scripts" "$FAKE_ROOT/scripts"
 git -C "$FAKE_ROOT" init -q
 git -C "$FAKE_ROOT" -c user.name=selftest -c user.email=selftest@example.invalid \
@@ -86,7 +88,6 @@ verdict identity_without_sha_uses_head "an identity with no git_sha leaves HEAD"
 
 # ── bench/baseline_cells.sh --preset canary ───────────────────────────────────
 
-CANARY_STUB="$FAKE_ROOT/target/release-perf/rmlx"
 cat >"$CANARY_STUB" <<STUBEOF
 #!/usr/bin/env bash
 set -eu

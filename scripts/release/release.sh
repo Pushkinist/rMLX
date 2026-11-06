@@ -52,7 +52,7 @@ package() {
   RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER= CARGO_ENCODED_RUSTFLAGS="$RELEASE_RUSTFLAGS" \
     cargo build --release -p rmlx-cli
 
-  BIN="target/release/rmlx"
+  BIN="$(rmlx_default_binary . release)"
   [ -x "$BIN" ] || { echo "error: $BIN not found"; exit 1; }
 
   # A dependency's panic location is an absolute source path, and under the build
@@ -352,6 +352,8 @@ case "$MODE" in
 esac
 
 cd "$(dirname "$0")/../.." || exit 2
+# shellcheck source=scripts/lib/identity.sh
+. scripts/lib/identity.sh
 
 case "$MODE" in
   package) package ;;

@@ -44,6 +44,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO_ROOT"
+# shellcheck source=scripts/lib/identity.sh
+. "$REPO_ROOT/scripts/lib/identity.sh"
 
 FILTER=""
 MODE="turbo"
@@ -77,7 +79,7 @@ case "$MODE" in
 esac
 
 # The binary the passes take the Metal claim with is this checkout's.
-CLAIM_RMLX="${REPO_ROOT}/target/debug/rmlx"
+CLAIM_RMLX="$(rmlx_default_binary "$REPO_ROOT" debug)"
 # Every process a pass starts under the claim inherits it, so everything the
 # passes run is compiled here, outside it; a pass that still compiles fails.
 cargo build --manifest-path "${REPO_ROOT}/Cargo.toml" -p rmlx-cli --bin rmlx || exit 1

@@ -781,6 +781,17 @@ ln -s "${REPO_ROOT}/prompts" "${NOPREFILL_ROOT}/prompts"
 grep -v 'generate: prefill' "${STUB}" >"${NOPREFILL_ROOT}/target/release-perf/rmlx"
 chmod +x "${NOPREFILL_ROOT}/target/release-perf/rmlx"
 
+# A root with no binary, and a copy of the stub elsewhere that differs by one line, so
+# a result can say which of the two files it measured.
+NOBIN_ROOT="${WORK}/repo_nobinary"
+mkdir -p "${NOBIN_ROOT}" "${WORK}/alt"
+ln -s "${REPO_ROOT}/scripts" "${NOBIN_ROOT}/scripts"
+ln -s "${REPO_ROOT}/prompts" "${NOBIN_ROOT}/prompts"
+NOBIN_ROOT="$(cd "${NOBIN_ROOT}" && pwd)"
+{ cat "${STUB}"; echo '# the copy'; } >"${WORK}/alt/rmlx"
+chmod +x "${WORK}/alt/rmlx"
+: >"${WORK}/alt/not_executable"
+
 # A port this host is not already using. Probed rather than assumed: a foreign
 # listener would answer the readiness poll and the suite would measure it.
 PORT="$(python3 -c '
@@ -803,7 +814,7 @@ sys.exit("no free port in 18000-19999")
 
 # run_case <name> <want-exit> <what-it-proves> [KEY=VALUE ...] [ARGS:flag ...]
 #          [HOST:quiet|hostile|flaky] [THERM:nominal|throttled|unreadable]
-#          [VERIFIER:dir] [MEASURED:1] [CANONICAL:1] [MARKERLESS:itl|peak|prefill]
+#          [VERIFIER:dir] [MEASURED:1] [CANONICAL:1] [MARKERLESS:itl|peak|prefill] [NOBINARY:1]
 #          [LABEL:name | NOLABEL:1] [FIXED_TS:1] [PREDIR:path-under-home ...]
 #          [CLIENT_SHIM:N] [NO_STAMPS:1] [STUB:<stub server arguments>]
 #          [GREP:pat ...] [NOGREP:pat ...]
@@ -832,7 +843,7 @@ run_case() {
     mkdir -p "${CASE_HOME}/logs"
 
     local env_pairs=() greps=() nogreps=() extra_args=() host="quiet" a
-    local synthetic=true verifier="${VERIFIER}" canonical=false
+    local synthetic=true verifier="${VERIFIER}" canonical=false nobinary=false
     local therm="${SHIMS}" markerless="" delayed=0 stamps=true stub_args="" prelog=""
     local label="selftest-campaign" fixed_ts="" predirs=()
     for a in "$@"; do
@@ -848,6 +859,7 @@ run_case() {
         MEASURED:*) synthetic=false ;;
         CANONICAL:*) canonical=true ;;
         MARKERLESS:*) markerless="${a#MARKERLESS:}" ;;
+        NOBINARY:*) nobinary=true ;;
         CLIENT_SHIM:*) delayed="${a#CLIENT_SHIM:}" ;;
         NO_STAMPS:*) stamps=false ;;
         STUB:*) stub_args="${stub_args} ${a#STUB:}" ;;
@@ -883,6 +895,7 @@ LOGEOF
         peak) root="${NOPEAK_ROOT}" ;;
         prefill) root="${NOPREFILL_ROOT}" ;;
         esac
+        $nobinary && root="${NOBIN_ROOT}"
         extra_args+=(--samples-root "${SAMPLES}")
     fi
 
@@ -1676,6 +1689,30 @@ run_case binary_missing_a_marker_refused 1 \
     MARKERLESS:itl \
     'GREP:contains none of .generate: ITL stats' \
     'GREP:cannot write the event this run reads its decode_rate from' \
+    'NOGREP:\[server\] pid='
+no_result
+verdict
+
+run_case binary_default_is_release_perf 1 \
+    "with no --binary the harness looks for the release-perf build of the checkout it runs from" \
+    NOBINARY:1 \
+    "GREP:binary not found at ${NOBIN_ROOT}/target/release-perf/rmlx\\." \
+    'NOGREP:\[server\] pid='
+no_result
+verdict
+
+run_case binary_flag_names_the_binary 0 \
+    "--binary runs that file: the root has no binary of its own and the result carries this one's digest" \
+    NOBINARY:1 ARGS:--binary "ARGS:${WORK}/alt/rmlx"
+ALT_SHA="$(shasum -a 256 "${WORK}/alt/rmlx" | awk '{print $1}')"
+[ "$(jq_of "r['binary']['sha256']")" = "${ALT_SHA}" ] ||
+    note_bad "binary sha256=$(jq_of "r['binary']['sha256']") (want ${ALT_SHA})"
+verdict
+
+run_case binary_flag_not_executable_refused 1 \
+    "a --binary that is no executable file stops the run before it serves" \
+    NOBINARY:1 ARGS:--binary "ARGS:${WORK}/alt/not_executable" \
+    "GREP:binary not found at ${WORK}/alt/not_executable\\." \
     'NOGREP:\[server\] pid='
 no_result
 verdict
