@@ -462,16 +462,7 @@ if $RECORD; then
 	refused=0
 	while read -r record; do
 		[[ -n "$record" ]] || continue
-		record_rc=0
-		if [[ -n "$DB_PATH" ]]; then
-			"$BINARY" metrics record --file "$record" --db "$DB_PATH" || record_rc=$?
-		else
-			"$BINARY" metrics record --file "$record" || record_rc=$?
-		fi
-		if [[ $record_rc -ne 0 ]]; then
-			echo "ERROR: record not filed (exit $record_rc); it stays at $record — file it with \`rmlx metrics record --file\` once the cause is fixed" >&2
-			refused=$((refused + 1))
-		fi
+		rmlx_record_file "$BINARY" "$record" "${record##*/}" ${DB_PATH:+--db "$DB_PATH"} || refused=$((refused + 1))
 	done <"$OUT_DIR/records/manifest.txt"
 	if [[ $refused -gt 0 ]]; then
 		echo "ERROR: $refused record(s) measured but not filed; the other cells are filed" >&2

@@ -709,7 +709,7 @@ cache_types_combo() {
         --ttft "$(sed -n 's/.*ttft_ms=\([0-9.]*\).*/\1/p' <<<"${summary}")" \
         --load "$(sed -n 's/.*load=\([0-9.]*\)ms.*/\1/p' <<<"${summary}")" \
         --rss "$(sed -n 's/.*peak_rss=\([0-9.]*\)MB.*/\1/p' <<<"${summary}")" ||
-        ! "${BINARY}" metrics record --file "${record_file}"; then
+        ! rmlx_record_file "${BINARY}" "${record_file}" "ctype-${label}"; then
         echo "CELL FAIL label=${label}: the record did not land (${record_file##*/})" >&2
         types_row "${label}" "${shown_kv}" "" "" fail_rc9
         return

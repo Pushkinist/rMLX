@@ -952,7 +952,7 @@ st_verdict cache_types_run_fails "$why" "a cell run that fails ends its cell: a 
 home="$(new_home cache_types_record_not_filed)"
 control "$home" record_fails 1
 ct_run "$home"
-why="$(st_check 0 --has "CELL FAIL label=bf16")"
+why="$(st_check 0 --has "CELL FAIL label=bf16" --has "ERROR: ctype-bf16: the record did not land; it is kept at $home/metrics/buffer/pending/")"
 want "failed rows" "$(ct_rows "$ST_OUT" | grep -c ' fail_rc9$' || true)" 12
 st_verdict cache_types_record_not_filed "$why" "a record that does not land is a fail_rc9 row"
 

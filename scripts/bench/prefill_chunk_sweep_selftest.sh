@@ -54,10 +54,12 @@ claim)
 	fi
 	;;
 metrics)
+	argv="$*"
+	[ "$2" != --db ] || set -- "$1" "${@:4}"
 	case "$2" in
 	identity) echo '{"backend":"rmlx","backend_version":"9.9.9","git_sha":"abc1234"}' ;;
 	record)
-		echo "$*" >>"$RMLX_HOME/recorded.log"
+		echo "$argv" >>"$RMLX_HOME/recorded.log"
 		if [ -e "$RMLX_HOME/refuse_level" ] &&
 			grep -q "\"prefill_chunk=$(cat "$RMLX_HOME/refuse_level")\"" "$4"; then
 			echo "Error: validate record: refused" >&2
@@ -241,7 +243,7 @@ want "records filed" "$(summarize_records "$home/recorded")" "4096 prefill_chunk
 8192 prefill_chunk=512 diagnostic decode_tps_warm=60 kv_cache_bytes=4096 prefill_tps=1100 ttft_warm_ms=100
 8192 prefill_chunk=1024 diagnostic decode_tps_warm=70 kv_cache_bytes=4096 prefill_tps=1200 ttft_warm_ms=100"
 want "record calls" "$(wc -l <"$home/recorded.log" | tr -d ' ')" 6
-want "record calls through --db" "$(grep -c -- "--db $home/runs.db\$" "$home/recorded.log")" 6
+want "record calls through --db" "$(grep -c -- "^metrics --db $home/runs.db record --file " "$home/recorded.log")" 6
 st_verdict records_one_per_cell "$why" "one diagnostic record per prompt length and level, carrying the stub's numbers, filed through --db"
 
 # --- the verdict ---
@@ -379,7 +381,7 @@ st_verdict exit_125_slot_failed "$why" "a slot whose bench fails ends 125, namin
 home="$(new_home refused)"
 echo 512 >"$home/refuse_level"
 run_sweep "$home" --record
-why="$(st_check 75 --has "ERROR: record not filed (exit 1)" --has "$home/out/records/rec_001.json")"
+why="$(st_check 75 --has "ERROR: rec_001.json: the record did not land; it is kept at $home/out/records/rec_001.json")"
 want "records attempted" "$(sed 's|.*/||' "$home/recorded.log" | tr '\n' ' ')" "rec_000.json rec_001.json rec_002.json "
 want "records filed" "$(summarize_records "$home/recorded" | awk '{ print $2 }' | tr '\n' ' ')" "prefill_chunk=256 prefill_chunk=1024 "
 want "refused record left" "$(ls "$home/out/records/rec_001.json" 2>/dev/null | tr '\n' ' ')" "$home/out/records/rec_001.json "
