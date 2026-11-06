@@ -201,6 +201,25 @@ GATE_BIN="$FAKE/bin_pending" gate_case gate_smoke_record_pending 3 "a smoke run 
     true "$WORK/g_smoke.toml" "" "record_pending" "record pending: /x/pending/smoke.json" "niah_pass" "!smoke_fail"
 json_has gate_smoke_record_pending "the result file counts the pending record" '"records_pending":1'
 
+# A `cargo` that logs the argv of each `run` and builds nothing.
+mkdir -p "$FAKE/bin_argv"
+printf '#!/bin/sh\n[ "$1" = run ] && printf "%%s\\n" "$*" >>"$ARGV_LOG"\nexit 0\n' >"$FAKE/bin_argv/cargo"
+chmod +x "$FAKE/bin_argv/cargo"
+ARGV_LOG="$WORK/smoke.argv"
+: >"$ARGV_LOG"
+PATH="$FAKE/bin_argv:$PATH" ARGV_LOG="$ARGV_LOG" RMLX_O_MODELS_ROOT="$ROOT_GEMMA" RMLX_HOME="$WORK/home_smoke" \
+    bash "$FAKE/scripts/bench/codec_matrix/runner.sh" --manifest "$WORK/g_smoke.toml" \
+    --out "$WORK/smoke_argv.json" >"$WORK/smoke_argv.log" 2>&1
+if grep -q -- 'baseline .*--prompt-label coherence .*--record --run-class diagnostic --label codec_smoke:k8v4:coherence' "$ARGV_LOG"; then
+    PASSED=$((PASSED + 1))
+    printf '  ok   %-30s — the baseline of each smoke prompt records as diagnostic\n' codec_smoke_records_diagnostic
+else
+    FAILED=$((FAILED + 1))
+    printf '  FAIL %-30s — the baseline of a smoke prompt does not record as diagnostic\n' codec_smoke_records_diagnostic
+    printf '       | baseline argv: %s\n' "$(grep baseline "$ARGV_LOG" | head -1)"
+    sed 's/^/       | /' "$WORK/smoke_argv.log" | tail -2
+fi
+
 STUB_RC=7 gate_case gate_niah_fails 1 "a NIAH pass that exits non-zero fails the row with its own status" \
     true "$WORK/g_one.toml" "" "niah_fail" "rc=7" "!niah_pass" "!niah_no_pct"
 

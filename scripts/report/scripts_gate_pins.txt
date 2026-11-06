@@ -11,11 +11,9 @@
 # Never pin a new file, a new member or a larger measure.
 #
 # pinnable: class purpose usage exit-undeclared caller recall-missing silenced lib-consumers lib-run shebang exec-bit dead-path set-mode name size heredoc twin lib-shadow binary-literal env-knob unguarded-array
-class run_class_selftest.sh
 purpose bench/codec_matrix/runner_selftest.sh
 purpose bench/prefill_chunk_sweep.sh
 purpose lib/record_pending.sh
-purpose run_class_selftest.sh
 usage bench/llama_ab.sh
 usage bench/llama_ab_selftest.sh
 usage check/eval_lock.sh
@@ -40,7 +38,6 @@ usage bench/serve_bench_selftest.sh
 usage spec/broken_engine.sh
 usage spec/round_stream_compare.py
 usage spec/round_stream_compare_selftest.sh
-usage run_class_selftest.sh
 exit-undeclared profile/aggregate_decode_profile.py 2
 exit-undeclared bench/llama_ab.sh 0,4,125
 exit-undeclared bench/llama_ab_selftest.sh 1
@@ -61,7 +58,6 @@ exit-undeclared spec/broken_engine.sh 2,3
 exit-undeclared spec/round_stream_compare.py 2
 exit-undeclared spec/round_stream_compare_selftest.sh 1
 exit-undeclared bench/ssd_canary_selftest.sh 2
-exit-undeclared run_class_selftest.sh 1
 caller profile/aggregate_decode_profile.py
 caller gen/lloyd_codebook.py
 caller bench/codec_matrix/niah_long_context.sh
@@ -69,7 +65,6 @@ caller bench/sdpa_headdim.py
 caller spec/broken_engine.sh
 recall-missing bench/llama_ab_selftest.sh default
 recall-missing bench/codec_matrix/runner_selftest.sh default
-recall-missing run_class_selftest.sh default
 silenced published/table.py default
 silenced report/debt_report.py --file-sizes,default
 lib-consumers lib/run_log_for_pid.py
@@ -94,7 +89,6 @@ set-mode bench/schema_constraint_canary.sh
 set-mode bench/serve_bench_selftest.sh
 set-mode spec/broken_engine.sh
 set-mode spec/round_stream_compare_selftest.sh
-set-mode run_class_selftest.sh
 name bench/llama_ab_selftest.sh ROOT
 name bench/wikitext2_ppl.py workspace
 name lib/kv_boundary_default.py _REPO_ROOT

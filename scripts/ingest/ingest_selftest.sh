@@ -8,7 +8,11 @@
 # staging and in the pending queue. `ab_selftest.sh`, `bench/llama_ab_selftest.sh` and
 # `published_selftest.sh` hold the refusals of their own sources; this file holds the
 # record fields of codec-inertness and llama-bench, which nothing else watches, and the tail the
-# modes share: dry run, staged but not ingested, ingested, and a recorder that refuses.
+# modes share: dry run, staged but not ingested, ingested, and a recorder that refuses. It also holds
+# what the run class asks of both modes: no row the sweep already recorded is written again, a weight
+# label the metrics DB lacks and a recorder with no `--run-class` or a failing `--help` are refused
+# before anything is written, and llama-bench queues under $RMLX_HOME and records through the
+# checkout's build, not an `rmlx` on PATH.
 #
 # Usage:  bash scripts/ingest/ingest_selftest.sh
 # Exit:   0 every case held; 1 a case did not, or none ran; 2 a fixture could not be built
@@ -20,6 +24,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 INGEST="$REPO_ROOT/scripts/ingest/ingest.py"
 # shellcheck source=scripts/lib/selftest_support.sh
 . "$REPO_ROOT/scripts/lib/selftest_support.sh"
+# shellcheck source=scripts/lib/identity.sh
+. "$REPO_ROOT/scripts/lib/identity.sh"
 st_init ingest-selftest
 
 FILED="$ST_WORK/filed"
@@ -96,6 +102,11 @@ write_csv no_measured "2026-10-01T00:00:00Z,host__m,4096,,8192,32,k8v8,0,1000,ab
 write_csv no_ctx "2026-10-01T00:00:00Z,host__m,4096,4200,,32,k8v8,0,1000,abc123,false,1,10.0,1.0,bin456,,,"
 write_csv no_fixture "2026-10-01T00:00:00Z,host__m,16384,4200,8192,32,k8v8,0,1000,abc123,false,1,10.0,1.0,bin456,,,"
 write_csv wide "$CSV_ROW,,,,extra"
+# The sweep's own CSV: one run recorded, one whose record is pending, one that did not measure.
+write_csv sweep "${CSV_ROW/,k8v8,/,none,},,diagnostic,landed" "$CSV_ROW,,diagnostic,pending" \
+    "2026-10-01T00:00:00Z,host__m,4096,,8192,32,iso3,1,,,,,,,bin456,,,"
+# A sweep from before the tool recorded its runs: the same rows without the two record columns.
+cut -d, -f1-16 "$ST_WORK/sweep.csv" >"$ST_WORK/sweep_legacy.csv"
 printf '%s\n%s\n' "timestamp,model,prompt_tokens,prompt_tokens_measured,max_ctx,max_tokens,codec,exit_code,kv_cache_bytes,ids_sha,store_skipped,binary_sha" \
     "2026-10-01T00:00:00Z,host__m,4096,4200,8192,32,k8v8,0,1000,abc123,false,bin456" >"$ST_WORK/legacy.csv"
 
@@ -178,6 +189,31 @@ why="$(st_check 1 --has 'ingest FAILED for' --has '(exit 3)' --has 'record kept 
 [ "$(count "$home/metrics/buffer/pending")" = 0 ] || why="${why:+$why
 }the refused record was left in pending"
 st_verdict codec_refused_record_stays_in_staging "$why" "a recorder that refuses ends 1 and the record goes back to staging"
+
+home="$(fresh_home sweep)"
+st_case ingest_promotes_no_recorded_or_pending_row 2 --what "the ingest writes neither a landed nor a pending row of the sweep's CSV" \
+    --has 'skipping 2 row(s) the sweep already recorded, or whose record is' --lacks '"schema_version"' \
+    -- codec "$home" sweep --dry-run
+
+st_run codec "$home" sweep_legacy --dry-run
+why="$(st_check 0 --has '"run_class": "diagnostic"' --has '"weight_quant": "fp16"')"
+records="$(grep -c '"schema_version"' <<<"$ST_OUT" || true)"
+[ "$records" = 2 ] || why="${why:+$why
+}$records record(s), want 2 (the two measured rows)"
+st_verdict ingest_writes_a_legacy_sweep_once "$why" "a sweep with no record columns has each measured row written once"
+
+mkdir -p "$ST_WORK/models_mxfp6/host__m"
+printf '{"quantization": {"mode": "mxfp6", "bits": 6, "group_size": 32}}\n' >"$ST_WORK/models_mxfp6/host__m/config.json"
+st_case ingest_refuses_a_snapshot_with_no_recordable_label 1 --what "the ingest refuses a weight mode the metrics DB has no label for" \
+    --has "describes weight quantization 'mxfp6', which is not one of the labels the metrics DB records" --lacks '"schema_version"' \
+    -- codec "$home" sweep_legacy --dry-run --models-root "$ST_WORK/models_mxfp6"
+
+home="$(fresh_home sweep_classless)"
+st_run codec "$home" sweep_legacy --record --rmlx-bin "$OLD_RECORDER"
+why="$(st_check 1 --has 'rmlx_old has no `metrics record --run-class`')"
+[ ! -d "$home/bench/codec_inertness/records" ] || why="${why:+$why
+}records were staged before the refusal"
+st_verdict ingest_refuses_a_classless_recorder "$why" "a recorder without --run-class is refused before anything is written"
 
 # ── llama-bench ───────────────────────────────────────────────────────────────
 
@@ -297,6 +333,59 @@ why="$(st_check 1 --has 'WARN: skipping group' --has 'Llama-3.2-3B-Instruct' --h
 grep -q 'Qwen3-8B-Q8_0' "$FILED"/*.json || why="${why:+$why
 }the record filed is not the good group"
 st_verdict llama_bench_unbuildable_group_ends_non_zero "$why" "a group that cannot be built is named with its reason, the rest is filed, the run ends 1"
+
+mkdir -p "$ST_WORK/oldbin"
+cp "$OLD_RECORDER" "$ST_WORK/oldbin/rmlx"
+home="$(fresh_home llama_classless)"
+st_run ingest_in "$home" llama-bench --record --rmlx-bin "$ST_WORK/oldbin/rmlx" "$ST_WORK/llama_empty.json"
+why="$(st_check 1 --has 'oldbin/rmlx has no `metrics record --run-class`')"
+[ ! -d "$home/metrics" ] || why="${why:+$why
+}a record was written before the refusal"
+st_verdict llama_bench_refuses_a_classless_recorder "$why" "a recorder without --run-class is refused before anything is written"
+
+# A copy of the scripts tree stands for a checkout, so the tool's repo root is the copy's.
+mkdir -p "$ST_WORK/llama_root"
+cp -R "$REPO_ROOT/scripts" "$ST_WORK/llama_root/scripts"
+LLAMA_COPY="$ST_WORK/llama_root/scripts/ingest/ingest.py"
+
+home="$(fresh_home llama_under_home)"
+st_run env RMLX_HOME="$home" python3 "$LLAMA_COPY" llama-bench "$ST_WORK/llama_rows.json"
+why="$(st_check 0)"
+[ "$(count "$home/metrics/buffer/pending")" = 1 ] || why="${why:+$why
+}$(count "$home/metrics/buffer/pending") file(s) under \$RMLX_HOME/metrics/buffer/pending (want 1)"
+[ ! -d "$ST_WORK/llama_root/metrics" ] || why="${why:+$why
+}a record was queued under the repo root"
+st_verdict llama_bench_queues_under_rmlx_home "$why" "a record is queued under \$RMLX_HOME, not the repo root"
+
+# A recorder that has the flag and logs which copy of it ran.
+make_logging_recorder() { # <path> <name>
+    mkdir -p "$(dirname "$1")"
+    cat >"$1" <<STUB
+#!/usr/bin/env bash
+if [ "\$*" = "metrics record --help" ]; then echo "      --run-class <CLASS>"; exit 0; fi
+echo "$2" >>"$ST_WORK/llama_recorder.log"
+STUB
+    chmod +x "$1"
+}
+make_logging_recorder "$ST_WORK/pathbin/rmlx" path
+make_logging_recorder "$(rmlx_default_binary "$ST_WORK/llama_root" release)" checkout
+: >"$ST_WORK/llama_recorder.log"
+home="$(fresh_home llama_checkout_build)"
+st_run env PATH="$ST_WORK/pathbin:$PATH" RMLX_HOME="$home" python3 "$LLAMA_COPY" llama-bench --record "$ST_WORK/llama_rows.json"
+used="$(sort -u "$ST_WORK/llama_recorder.log" | tr '\n' ' ')"
+why="$(st_check 0)"
+[ "$used" = "checkout " ] || why="${why:+$why
+}the recorder that ran: ${used:-none} (want the checkout's build only)"
+st_verdict llama_bench_records_through_the_checkout "$why" "an rmlx on PATH is not chosen over the checkout's build"
+
+# A recorder whose help fails is reported as failing, not as an old binary.
+BROKEN_RECORDER="$ST_WORK/rmlx_broken"
+printf '#!/usr/bin/env bash\necho "dyld: library not loaded" >&2\nexit 2\n' >"$BROKEN_RECORDER"
+chmod +x "$BROKEN_RECORDER"
+home="$(fresh_home llama_broken_recorder)"
+st_case recorder_whose_help_fails_is_reported_as_failing 1 --what "a recorder whose --help exits non-zero is reported as failing" \
+    --has 'metrics record --help` failed (exit 2): dyld: library not loaded' --lacks 'built before the run class' \
+    -- ingest_in "$home" llama-bench --record --rmlx-bin "$BROKEN_RECORDER" "$ST_WORK/llama_empty.json"
 
 # ── ab: a bench/ab.sh result (--harness rmlx, the default) ─────────────────────
 

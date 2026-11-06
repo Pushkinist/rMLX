@@ -95,7 +95,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
         build-perf build-debug test-perf ci-perf gpu-test claim-rmlx model-check model-check-full \
         profile-samply profile-samply-debug profile-instruments bench asm perf-iter \
         canary canary-gate canary-ab canary-ab-selftest canary-ab-ingest-selftest ingest-selftest \
-        canary-ab-host-gate-fixtures codec-smoke-runner-selftest llama-ab-selftest spec-bench-selftest baseline-cells-selftest cross-backend-selftest prefill-chunk-sweep-selftest profile-capture-selftest run-class-selftest \
+        canary-ab-host-gate-fixtures codec-smoke-runner-selftest llama-ab-selftest spec-bench-selftest baseline-cells-selftest cross-backend-selftest prefill-chunk-sweep-selftest profile-capture-selftest wikitext2-ppl-selftest \
         spec-bench-published-selftest published-ingest-selftest \
         published-table check-published-table published-table-selftest \
         check-spec-metric-parity check-spec-metric-parity-fixtures \
@@ -802,7 +802,7 @@ ci: fmt-check lint test test-capture deny audit ci-metrics ## full pre-merge gat
 	@$(MAKE) --no-print-directory cross-backend-selftest
 	@$(MAKE) --no-print-directory prefill-chunk-sweep-selftest
 	@$(MAKE) --no-print-directory profile-capture-selftest
-	@$(MAKE) --no-print-directory run-class-selftest
+	@$(MAKE) --no-print-directory wikitext2-ppl-selftest
 	@$(MAKE) --no-print-directory spec-bench-published-selftest
 	@$(MAKE) --no-print-directory published-ingest-selftest
 	@$(MAKE) --no-print-directory published-table-selftest
@@ -1025,8 +1025,8 @@ prefill-chunk-sweep-selftest: ## recall-check the prefill-chunk sweep: slot orde
 profile-capture-selftest: ## recall-check the GPU-instrument launcher: both captures' argv, bundle directory and retention, every refusal, and the host preflight (shims; no GPU, no Xcode, no model)
 	bash scripts/profile/capture_selftest.sh
 
-run-class-selftest: ## check that the inertness sweep and its ingest record under a stated run class, and record a run once (stub binaries; no GPU, no model, no DB write)
-	bash scripts/run_class_selftest.sh
+wikitext2-ppl-selftest: ## recall-check the Wikitext-2 perplexity harness: a reading whose record did not land is kept and ends 75, a failed run ends 1 (stub rmlx; no download, no GPU, no model)
+	bash scripts/bench/wikitext2_ppl_selftest.sh
 
 spec-bench-published-selftest: ## mutation-check the published-protocol bench against a stub server (no GPU, no model)
 	bash scripts/published/bench_selftest.sh

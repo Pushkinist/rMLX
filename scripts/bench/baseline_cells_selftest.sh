@@ -13,9 +13,10 @@
 #
 # It also drives lib/identity.sh: the git_sha of a run identity, its refusals and its normalisation;
 # and the canary's commit and run-log sources: the filed sha is the identity's, and the codec is read
-# from the run log the probe wrote, also when another process shares that log.
+# from the run log the probe wrote, also when another process shares that log. It holds
+# lib/snapshot_identity.py to the weight-quant label table the Rust loader is held to.
 #
-# LOC-exempt: one recall test of one tool and the identity library it reads, a flat list of cases over one shared stub
+# LOC-exempt: one recall test of one tool and the identity libraries it reads, a flat list of cases over one shared stub
 #
 # Usage:  bash scripts/bench/baseline_cells_selftest.sh
 # Exit:   0 every case held; 1 a case did not, or none ran; 2 a fixture could not be built
@@ -246,6 +247,23 @@ st_verdict identity_unresolvable_is_verbatim "$([ "$got" = "0|deadbeefcafe|" ] |
 
 got="$(identity_sha "{$BASE_IDENTITY}")"
 st_verdict identity_without_sha_uses_head "$([ "$got" = "0|$HEAD_SHA|" ] || echo "got $got (want 0|$HEAD_SHA|)")" "an identity with no git_sha leaves HEAD"
+
+# ── lib/snapshot_identity.py ──────────────────────────────────────────────────
+
+# The Rust producer, `ModelConfig::weight_quant_label`, is held to the same
+# table by `weight_quant_label_matches_the_shared_fixture_table`.
+why="$(python3 - "$REPO_ROOT" <<'LABELS'
+import json, sys
+root = sys.argv[1]
+sys.path.insert(0, f"{root}/scripts/lib")
+from snapshot_identity import weight_quant
+table = json.load(open(f"{root}/crates/rmlx-loader/tests/fixtures/weight_quant_labels.json"))
+wrong = [f"{c['name']}: {weight_quant(c['config'])!r} != {c['label']!r}"
+         for c in table if weight_quant(c["config"]) != c["label"]]
+print("; ".join(wrong) if len(table) >= 17 else f"the table lost cases: {len(table)}")
+LABELS
+)"
+st_verdict python_label_matches_the_shared_table "$why" "snapshot_identity.py labels every config in the shared table"
 
 # ── the canary preset ─────────────────────────────────────────────────────────
 
@@ -596,6 +614,16 @@ want "binary that ran" "$(sort -u "$home/ran")" "$ST_WORK/rmlx_named"
 want "rows in the named file" "$(sed 1d "$ST_WORK/named.csv" | wc -l | tr -d ' ')" 1
 want "files under the data root" "$(ls "$home/bench" 2>/dev/null || true)" ""
 st_verdict inertness_csv_and_binary_flags "$why" "--csv names the file the rows go to and --binary the rmlx that runs"
+
+home="$(new_home probe_keeps_measured_runs_apart_from_their_records)"
+control "$home" pending_on "--kv-quant k8v8 "
+control "$home" crash_on "--kv-quant iso3 "
+run_tool "$home" "$FAKE" --measure inertness --model "$CELL_MODEL" --kv-quant none --kv-quant k8v8 --kv-quant iso3
+why="$(st_check 75 --has "record pending: $home/metrics/buffer/pending/stub.json")"
+want "runs asking to record as diagnostic" "$(argv_lines_with "$home/baseline_argv" "--record --run-class diagnostic" "--label codec_inertness:")" 3
+want "exit_code/recorded_run_class/record_status" "$(inertness_rows "$home" | cut -d, -f6,7,16,17 | tr '\n' ' ')" \
+	'none,0,diagnostic,landed k8v8,0,diagnostic,pending iso3,1,, '
+st_verdict probe_keeps_measured_runs_apart_from_their_records "$why" "a measured run keeps exit_code 0 whatever its record did; a pending record is named and ends the sweep 75"
 
 # ── the cache-types preset ────────────────────────────────────────────────────
 

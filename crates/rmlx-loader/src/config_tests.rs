@@ -791,7 +791,7 @@ fn every_local_snapshot_dispatches_on_the_class_its_config_names() {
 
 /// The one table both label producers are held to: this one, and
 /// `weight_quant` in `scripts/lib/snapshot_identity.py`, which
-/// `scripts/run_class_selftest.sh` runs over the same file.
+/// `scripts/bench/baseline_cells_selftest.sh` runs over the same file.
 #[test]
 fn weight_quant_label_matches_the_shared_fixture_table() {
     let table: Vec<serde_json::Value> =
