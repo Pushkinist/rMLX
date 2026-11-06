@@ -76,6 +76,8 @@ tool_env_age() { MAX_AGE_DAYS=abc tool_target "$@"; }
 
 # env_home <cmd...>: the command with RMLX_HOME naming a directory of its own, apart from the scratch repo.
 env_home() { RMLX_HOME="$ST_WORK/home" "$@"; }
+# env_dir <cmd...>: the command with DIR in its environment, naming a directory the tool must not take.
+env_dir() { DIR="$ST_WORK/other" "$@"; }
 # env_relative, env_empty <cmd...>: the command with RMLX_HOME relative, or set and empty.
 env_relative() { RMLX_HOME=rel/home "$@"; }
 env_empty() { RMLX_HOME= "$@"; }
@@ -123,6 +125,7 @@ left_traces() { ls "$SCRATCH_REPO/.rmlx/traces" | sed 's/\.gputrace$//' | tr '\n
 left_home() { ls "$ST_WORK/home/traces" | sed 's/\.gputrace$//' | tr '\n' ' ' | sed 's/ $//'; }
 left_both() { echo "home=$(left_home) repo=$(left_traces)"; }
 left_other() { ls "$ST_WORK/other" | tr '\n' ' ' | sed 's/ $//'; }
+left_home_and_other() { echo "home=$(left_home) other=$(left_other)"; }
 
 # disk_case <name> <want-exit> <lister> <entries-left> [--has S]... [--lacks S]... -- <cmd...>:
 # the exit code and output as st_case, and the entries the lister finds left on disk.
@@ -359,6 +362,19 @@ disk_case "traces RMLX_HOME: --dir wins over it" 0 left_both "home=h1 repo=bysta
     --has "prune   o1.gputrace" --lacks "h1.gputrace" -- env_home tool_traces --apply --max-count 0 --all --dir "$ST_WORK/other"
 rm -rf "$ST_WORK/home"
 st_case "traces RMLX_HOME: no <RMLX_HOME>/traces is a no-op that names it" 0 --has "no $ST_WORK/home/traces — nothing to do" -- env_home tool_traces --apply
+
+plant_dir_and_home() {
+    fresh
+    rm -rf "$ST_WORK/home" "$ST_WORK/other"
+    mkdir -p "$ST_WORK/home/traces/h1.gputrace" "$ST_WORK/home/traces/h2.gputrace" "$ST_WORK/other/o1.gputrace"
+}
+plant_dir_and_home
+disk_case "traces: a DIR in the environment is not the directory bounded" 0 left_home_and_other "home= other=o1.gputrace" \
+    --has "prune   h1.gputrace" --lacks "o1.gputrace" -- env_home env_dir tool_traces --apply --max-count 0 --all
+plant_dir_and_home
+disk_case "traces: a DIR in the environment is not the directory bounded, on the system bash" 0 left_home_and_other "home= other=o1.gputrace" \
+    --has "prune   h1.gputrace" --lacks "o1.gputrace" -- env_home env_dir tool_traces_system_bash --apply --max-count 0 --all
+rm -rf "$ST_WORK/home" "$ST_WORK/other"
 
 plant_traces
 disk_case "traces: an unknown argument is a usage error and deletes nothing" 2 left_traces "$ALL_BUNDLES" \

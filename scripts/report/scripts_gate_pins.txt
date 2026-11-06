@@ -89,7 +89,6 @@ set-mode bench/serve_bench_selftest.sh
 set-mode spec/broken_engine.sh
 set-mode spec/round_stream_compare_selftest.sh
 name bench/llama_ab_selftest.sh ROOT
-name bench/wikitext2_ppl.py workspace
 name lib/kv_boundary_default.py _REPO_ROOT
 name profile/rmlx-capture.entitlements hyphen
 name suite/run_gpu_tests_selftest.sh ROOT
@@ -129,7 +128,6 @@ binary-literal bench/wikitext2_ppl.py 2
 env-knob bench/cross_backend.sh CROSS_BENCH_ROOT,LLAMA_CPP_ROOT,LLAMA_CPP_TURBOQUANT_ROOT,MLX_LM_ROOT,MLX_LM_TURBOQUANT_ROOT,OMLX_ROOT,PAROQUANT_ROOT
 env-knob bench/llama_ab_selftest.sh FORCE_UNMEASURED_ROWS,NO_RECORD_ARGS
 env-knob bench/codec_matrix/runner_selftest.sh GATE_BIN
-env-knob bench/wikitext2_ppl.py RMLX_HOME
 env-knob suite/eval_lock_stress.sh RUNS,TIMEOUT_SECS
 env-knob lib/server_wait.sh PORT
 env-knob lib/cpu_snapshot.sh CPU_SNAPSHOT_MIN_ROWS,SYNTHETIC_ARMS
@@ -143,7 +141,6 @@ env-knob bench/codec_matrix/runner.sh RMLX_O_MODELS_ROOT
 env-knob suite/run_gpu_tests.sh RMLX_O_MODELS_ROOT,RMLX_SKIP_GPU
 env-knob bench/schema_constraint_canary.sh BONSAI_MODEL,GEMMA_E2B_MODEL,PORT,RMLX_O_MODELS_ROOT
 env-knob bench/serve_bench.sh PORT,RMLX_HARDWARE_TAG
-env-knob published/bench.sh KV_QUANT_SEEN,MEMORY_PID,SAMPLING_SEEN,SERVER_PID
 env-knob bench/serve_bench_selftest.sh OUT_PATH
 env-knob bench/ssd_canary.sh PORT,SSD_GB,VERIFIER_MODEL
 env-knob lib/rmlx_home.py RMLX_HOME

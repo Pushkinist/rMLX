@@ -39,6 +39,7 @@ MAX_AGE_DAYS=""
 MAX_COUNT=6
 MAX_TOTAL_GB=40
 WARN_GB=""
+unset DIR
 
 usage_text() {
 	echo "usage: $0 {target|traces} [--apply] [--all] [--max-age-days N] [--max-count N] [--max-total-gb N] [--warn-gb N] [--dir DIR]"

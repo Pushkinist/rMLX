@@ -17,7 +17,7 @@ Dependencies:
 
 Exit codes:
     0  success -- prints the rMLX JSON line on stdout
-    1  argument / I/O / subprocess error
+    1  argument / I/O / subprocess error, or a relative or empty ``RMLX_HOME``
     2  PPL value outside the plausible band (sanity gate, opt-in via
        ``--plausibility``)
     75 measured, record pending: the PPL is printed, and its record did not
@@ -31,12 +31,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "scripts" / "lib"))
+from rmlx_home import rmlx_home  # noqa: E402
 
 # Direct mirror of the wikitext-2-raw test split.  The original Salesforce S3
 # bucket now returns a permanent 301 with no Location header, so we resolve
@@ -103,7 +106,8 @@ def parse_args() -> argparse.Namespace:
         "--cache-dir",
         default="",
         help="Cache directory for the downloaded wikitext-2 archive. Default: "
-        "`$RMLX_HOME/cache/wikitext-2/` or `$HOME/.rmlx/cache/wikitext-2/`.",
+        "`$RMLX_HOME/cache/wikitext-2/` (absolute), else "
+        "`<repo>/.rmlx/cache/wikitext-2/`.",
     )
     p.add_argument(
         "--git-sha",
@@ -131,10 +135,7 @@ def parse_args() -> argparse.Namespace:
 def resolve_cache_dir(arg_cache: str) -> Path:
     if arg_cache:
         return Path(arg_cache).expanduser().resolve()
-    rmlx_home = os.environ.get("RMLX_HOME")
-    if rmlx_home:
-        return Path(rmlx_home).expanduser() / "cache" / "wikitext-2"
-    return Path.home() / ".rmlx" / "cache" / "wikitext-2"
+    return rmlx_home(REPO_ROOT) / "cache" / "wikitext-2"
 
 
 def download_wikitext2_test(cache_dir: Path) -> Path:
@@ -175,11 +176,10 @@ def resolve_rmlx_binary(arg_binary: str) -> Path:
         if not p.exists():
             raise FileNotFoundError(f"rmlx binary not found: {p}")
         return p
-    workspace = Path(__file__).resolve().parents[2]
     for candidate in (
-        workspace / "target" / "release-perf" / "rmlx",
-        workspace / "target" / "release" / "rmlx",
-        workspace / "target" / "debug" / "rmlx",
+        REPO_ROOT / "target" / "release-perf" / "rmlx",
+        REPO_ROOT / "target" / "release" / "rmlx",
+        REPO_ROOT / "target" / "debug" / "rmlx",
     ):
         if candidate.exists():
             return candidate

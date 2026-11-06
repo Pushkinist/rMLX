@@ -454,6 +454,7 @@ run_mst() {
 
 	[ -n "$OUT_DIR" ] || OUT_DIR="$TRACES_DIR/mst"
 	mkdir -p "$OUT_DIR" || exit 1
+	trace=""
 	trap prune_traces EXIT
 
 	require_binary "$BIN" "make build       # cargo build --workspace --release"

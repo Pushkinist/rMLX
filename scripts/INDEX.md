@@ -108,8 +108,8 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/published_run_log.py` | profile/prefill_ms.py, published/bench.sh, published/binary_identity.py, +1 more scripts | Read one rmlx run log back as a per-request table. |
 | `lib/record_pending.sh` | crates/rmlx-cli/src/exit_tests.rs, bench/ab.sh, bench/baseline_cells.sh, bench/codec_matrix/runner.sh, +4 more scripts | The exit code `rmlx baseline --record` and `rmlx eval ppl --corpus` give a |
 | `lib/recorder_check.py` | ingest/ingest.py, ingest/llama_bench.py | Refuse a recorder that cannot state a run class. |
-| `lib/rmlx_home.py` | ingest/ingest.py, ingest/llama_bench.py | Resolve the runtime home the way the binary does. |
-| `lib/rmlx_home.sh` | bench/ab.sh, bench/codec_matrix/runner.sh, bench/cross_backend.sh, +7 more scripts | Resolve the runtime home the way the binary does, for the shell tools; source it. |
+| `lib/rmlx_home.py` | bench/wikitext2_ppl.py, ingest/ingest.py, ingest/llama_bench.py | Resolve the runtime home the way the binary does. |
+| `lib/rmlx_home.sh` | make logs-tail, bench/ab.sh, bench/codec_matrix/runner.sh, bench/cross_backend.sh, +7 more scripts | Resolve the runtime home the way the binary does, for the shell tools; source it. |
 | `lib/run_log_for_pid.py` | lib/bench_server.sh | Pick the run log a given process wrote, out of the candidates on stdin. |
 | `lib/selftest_support.sh` | bench/baseline_cells_selftest.sh, bench/cross_backend_selftest.sh, bench/llama_ab_selftest.sh, +23 more scripts | The case runner and shims the self-tests share; source it. |
 | `lib/server_kv_quant.py` | bench/ssd_canary.sh, lib/bench_server.sh, published/binary_identity.py | Read the KV codec a run resolved out of its rmlx run log. |

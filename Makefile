@@ -88,7 +88,7 @@ AUDIT_IGNORES := --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
 
 .PHONY: help build check test fmt fmt-check lint audit deny precommit hooks \
         ci ci-metrics tag release-package release-cpu-selftest release-selftest release-sha release-sign bottle tap-sync \
-        clean serve chat info logs-tail metrics-summary \
+        clean serve chat info logs-tail \
         metrics-init metrics-doctor metrics-doctor-fix metrics-export \
         metrics-backup metrics-replay-pending metrics-prompts-sync \
         metrics-champions metrics-champions-rmlx \
@@ -864,12 +864,9 @@ info:            ## rmlx info --model $(MODEL)
 	cargo run --release --bin rmlx -- info --model "$(MODEL)"
 
 # ---- logs + metrics (retention is append-only; see CLAUDE.md) ---------
-logs-tail:       ## tail newest log file
-	@ls -1t logs/*.jsonl 2>/dev/null | head -1 | xargs -I{} tail -f {}
-
-metrics-summary: ## cat .rmlx/metrics/summary.csv (rolling)
-	@RMLX_HOME="$${RMLX_HOME:-$$PWD/.rmlx}"; \
-		test -f "$$RMLX_HOME/metrics/summary.csv" && cat "$$RMLX_HOME/metrics/summary.csv" || echo "no metrics yet"
+logs-tail:       ## tail the newest log file under <RMLX_HOME>/logs
+	@RMLX_HOME="$$(. scripts/lib/rmlx_home.sh && rmlx_home "$$PWD")" || exit 2; \
+		ls -1t "$$RMLX_HOME"/logs/*.jsonl 2>/dev/null | head -1 | xargs -I{} tail -f {}
 
 metrics-init:    ## Initialize the metrics SQLite DB at metrics/runs.db (refuses if file exists)
 	cargo run --release --bin rmlx -- metrics init
@@ -1025,7 +1022,7 @@ prefill-chunk-sweep-selftest: ## recall-check the prefill-chunk sweep: slot orde
 profile-capture-selftest: ## recall-check the GPU-instrument launcher: both captures' argv, bundle directory and retention, every refusal, and the host preflight (shims; no GPU, no Xcode, no model)
 	bash scripts/profile/capture_selftest.sh
 
-wikitext2-ppl-selftest: ## recall-check the Wikitext-2 perplexity harness: a reading whose record did not land is kept and ends 75, a failed run ends 1 (stub rmlx; no download, no GPU, no model)
+wikitext2-ppl-selftest: ## recall-check the Wikitext-2 perplexity harness: a reading whose record did not land is kept and ends 75, a failed run ends 1, the cache dir follows RMLX_HOME (stub rmlx; no download, no GPU, no model)
 	bash scripts/bench/wikitext2_ppl_selftest.sh
 
 spec-bench-published-selftest: ## mutation-check the published-protocol bench against a stub server (no GPU, no model)
@@ -1039,7 +1036,7 @@ published-ingest-selftest: ## mutation-check the published-protocol runs.db inge
 # $(1) is the gate target's name, $(2) the target that writes the rows it reads.
 define canary_deltas
 @test -n "$(SHA)" || { echo "ERROR: SHA= required. Usage: make $(1) SHA=<last-green-sha>"; exit 125; }
-@RMLX_HOME="$${RMLX_HOME:-$$PWD/.rmlx}"; \
+@RMLX_HOME="$$(. scripts/lib/rmlx_home.sh && rmlx_home "$$PWD")" || exit 2; \
 DB_PATH="$${CANARY_DB:-$$RMLX_HOME/metrics/runs.db}"; \
 if [ ! -f "$$DB_PATH" ]; then \
 	echo "skip: runs.db not found at $$DB_PATH (run 'make $(2)' first)"; \
