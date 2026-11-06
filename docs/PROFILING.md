@@ -257,9 +257,10 @@ each submission's `start` and `duration` in nanoseconds, `gpu-channel-name`,
   NULL. A naive parser misaligns columns into plausible wrong numbers.
   `rmlx_mlx::xctrace` checks each row's cell count and each cell's tag
   against the schema, and rejects an unresolvable `ref`.
-- **Bound the volume** with `--time-limit`. `.rmlx/traces/mst` keeps the
+- **Bound the volume** with `--time-limit`. `<RMLX_HOME>/traces/mst` keeps the
   newest `--keep` bundles (default 5) and prunes the rest on every exit.
-  `make traces-gc` does not cover this directory.
+  `make traces-gc` does not cover this directory: it bounds `*.gputrace`
+  bundles directly under `<RMLX_HOME>/traces`.
 - **No kernel names on the timeline.** The stock template records
   `Shader Timeline: Disabled`, so no key joins a name to a timed row. The
   table `metal-shader-profiler-shader-list` names each pipeline that a
@@ -309,8 +310,9 @@ answerable offline, how many times is not.
   each capture. Eviction is oldest-first, never the bundle just written, and
   each removal is printed.
 - `--keep-all` (`make profile-gputrace … KEEP_ALL=1`) skips the cap.
-- `make traces-gc` bounds the same directory: `<RMLX_HOME>/traces`, else
-  `.rmlx/traces`; `--dir` names another.
+- `make traces-gc` bounds the same directory: `<RMLX_HOME>/traces`; `RMLX_HOME`
+  defaults to the checkout's `.rmlx` and a relative value is refused; `--dir`
+  names another.
 
 ```sh
 make traces-gc                                   # report what is over the caps

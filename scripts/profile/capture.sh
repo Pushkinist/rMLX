@@ -70,6 +70,8 @@ USAGE
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)" || exit 1
 # shellcheck source=scripts/lib/identity.sh
 . "$REPO_ROOT/scripts/lib/identity.sh"
+# shellcheck source=scripts/lib/rmlx_home.sh
+. "$REPO_ROOT/scripts/lib/rmlx_home.sh"
 
 SUBCOMMAND="${1:-}"
 BIN="$(rmlx_default_binary "$REPO_ROOT" release-debug)"
@@ -150,8 +152,8 @@ done
 
 cd "$REPO_ROOT" || exit 1
 
-RMLX_HOME_DIR="${RMLX_HOME:-$REPO_ROOT/.rmlx}"
-TRACES_DIR="$RMLX_HOME_DIR/traces"
+RMLX_HOME="$(rmlx_home "$REPO_ROOT")" || exit 1
+TRACES_DIR="$RMLX_HOME/traces"
 
 # The model goes in the name: bundles are multi-GB and land side by side, and without it two runs
 # of the same codec and prompt size are indistinguishable short of reading kernel names out of
@@ -504,7 +506,7 @@ run_mst() {
 	# xctrace takes the child's exit code with its output, so a record that did not land
 	# (`baseline` exit 75) is found as the buffer file in the pending queue whose record carries
 	# this run's label. The label holds the run's start second, so no earlier run can carry it.
-	pending_dir="$RMLX_HOME_DIR/metrics/buffer/pending"
+	pending_dir="$RMLX_HOME/metrics/buffer/pending"
 
 	# RMLX_HOME is passed explicitly so the child writes its log and its buffer file where this
 	# script reads them.
@@ -513,7 +515,7 @@ run_mst() {
 		--no-prompt \
 		--output "$trace" \
 		--time-limit "${TIME_LIMIT}s" \
-		--env "RMLX_HOME=$RMLX_HOME_DIR" \
+		--env "RMLX_HOME=$RMLX_HOME" \
 		--launch -- ${run_cmd[@]+"${run_cmd[@]}"}
 	rc=$?
 
@@ -556,7 +558,7 @@ run_mst() {
 	# label, never merely the newest: every rmlx process writes a log.
 	if [ -z "$SKIP_MS" ]; then
 		log_file=""
-		for f in "$RMLX_HOME_DIR"/logs/*.jsonl; do
+		for f in "$RMLX_HOME"/logs/*.jsonl; do
 			[ -e "$f" ] && grep -qF "$label" "$f" || continue
 			[ -z "$log_file" ] || [ "$f" -nt "$log_file" ] && log_file="$f"
 		done

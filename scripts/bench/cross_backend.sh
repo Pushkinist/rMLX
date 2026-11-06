@@ -33,6 +33,7 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 source "${REPO_ROOT}/scripts/lib/identity.sh"
+source "${REPO_ROOT}/scripts/lib/rmlx_home.sh"
 RMLX_BIN="$(rmlx_default_binary "$REPO_ROOT" release)"
 if [ "${1:-}" = --binary ]; then
   [ -n "${2:-}" ] || { echo "ERROR: --binary needs a path" >&2; exit 1; }
@@ -65,7 +66,7 @@ BUDGET_S=$((BUDGET_MIN * 60))
 
 # Runtime state lives under one root (CLAUDE.md): `RMLX_HOME`, else the
 # checkout's `.rmlx/`. The CBB harness reads the DB path from RMLX_METRICS_DB.
-RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
+RMLX_HOME="$(rmlx_home "$REPO_ROOT")" || exit 1
 export RMLX_HOME
 export RMLX_METRICS_DB="${RMLX_HOME}/metrics/runs.db"
 PROGRESS="${RMLX_HOME}/bench/cross_backend_progress.md"

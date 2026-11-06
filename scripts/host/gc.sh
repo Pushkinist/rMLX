@@ -20,7 +20,8 @@
 #   1. --max-count N    keep the N newest bundles           (default 6)
 #   2. --max-total-gb N  then evict oldest-first until the directory fits (default 40)
 #   3. --max-age-days N  optional extra rule; off unless the flag is given
-# The directory is --dir, else <RMLX_HOME>/traces, else .rmlx/traces.
+# The directory is --dir, else <RMLX_HOME>/traces; a relative RMLX_HOME is refused (exit 2) and an
+# unset one is <repository root>/.rmlx.
 # Every eviction is printed with its reason: a capture that vanishes silently costs a re-run.
 
 set -uo pipefail
@@ -28,6 +29,8 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=scripts/lib/args.sh
 . "$REPO_ROOT/scripts/lib/args.sh"
+# shellcheck source=scripts/lib/rmlx_home.sh
+. "$REPO_ROOT/scripts/lib/rmlx_home.sh"
 
 MODE=""
 APPLY=0
@@ -36,7 +39,6 @@ MAX_AGE_DAYS=""
 MAX_COUNT=6
 MAX_TOTAL_GB=40
 WARN_GB=""
-DIR="${RMLX_HOME:-.rmlx}/traces"
 
 usage_text() {
 	echo "usage: $0 {target|traces} [--apply] [--all] [--max-age-days N] [--max-count N] [--max-total-gb N] [--warn-gb N] [--dir DIR]"
@@ -311,6 +313,10 @@ gc_traces() {
 }
 
 if [ "$MODE" = "traces" ]; then
+	if [ -z "${DIR+set}" ]; then
+		RMLX_HOME="$(rmlx_home "$REPO_ROOT")" || exit 2
+		DIR="$RMLX_HOME/traces"
+	fi
 	gc_traces
 elif [ -n "$WARN_GB" ]; then
 	size_report

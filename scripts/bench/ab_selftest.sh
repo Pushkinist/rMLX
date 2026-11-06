@@ -421,9 +421,10 @@ HOST_READING_CASES=0
 check() {
 	local name="$1" want="$2" what="$3"
 	shift 3
-	local args=() greps=() path_prefix="" real_host=0 slots=""
+	local args=() greps=() path_prefix="" real_host=0 slots="" home="$WORK/home"
 	for a in "$@"; do
 		case "$a" in
+		RMLX_HOME:*) home="${a#RMLX_HOME:}" ;;
 		GREP:*) greps+=("${a#GREP:}") ;;
 		NOGREP:*) greps+=("!${a#NOGREP:}") ;;
 		PATHPRE:*) path_prefix="${a#PATHPRE:}" ;;
@@ -451,7 +452,7 @@ check() {
 	# bash 3.2 (the system bash here) treats "${arr[@]}" on an empty array as an
 	# unbound variable under `set -u` and dies. Every current call site supplies
 	# both, but the guard keeps a future one from failing as a harness crash.
-	run_ab "$out" "$path_prefix" "$WORK/home" ${args[@]+"${args[@]}"}
+	run_ab "$out" "$path_prefix" "$home" ${args[@]+"${args[@]}"}
 	local got=$?
 
 	local ok=1
@@ -668,6 +669,11 @@ check missing_model 125 \
 	"a model path that does not exist stops the run" \
 	--binary-a "$SLOW" --binary-b "$FAST" --model "$WORK/nope" --slots 8 --max-tokens 5 \
 	"GREP:model path not found"
+
+check relative_rmlx_home 125 \
+	"a relative RMLX_HOME stops the run before any slot runs" \
+	RMLX_HOME:rel/home --binary-a "$SLOW" --binary-b "$FAST" --model "$MODEL" --slots 8 --max-tokens 5 \
+	"GREP:RMLX_HOME=rel/home must be an absolute path"
 
 # ---- the binaries ------------------------------------------------------------
 

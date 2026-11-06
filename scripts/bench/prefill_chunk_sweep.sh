@@ -59,7 +59,9 @@
 set -eu
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
+# shellcheck source=scripts/lib/rmlx_home.sh
+source "${REPO_ROOT}/scripts/lib/rmlx_home.sh"
+RMLX_HOME="$(rmlx_home "${REPO_ROOT}")" || exit 125
 AWK_BUSIEST="${REPO_ROOT}/scripts/lib/busiest_between.awk"
 
 # shellcheck source=scripts/lib/args.sh

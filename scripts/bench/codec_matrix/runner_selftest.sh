@@ -123,6 +123,9 @@ run_case only_known 1 "a manifest of known dispositions alone ran nothing: non-z
 run_case root_not_a_directory 1 "a root that is not a directory fails the row" \
     "$NOT_A_DIR" "$WORK/m_present.toml" "models_root_not_a_directory"
 
+RMLX_HOME=rel/home run_case relative_rmlx_home 2 "a relative RMLX_HOME is a setup error and the matrix does not start" \
+    "$ROOT_GEMMA" "$WORK/m_present.toml" "RMLX_HOME=rel/home must be an absolute path" "!ran="
+
 # Gate cases: a real pass over a copy of the runner. The stub `rmlx` prints
 # $STUB_FOUND as every needle reading; the stub `cargo` builds nothing.
 FAKE="$WORK/fake"
@@ -132,7 +135,8 @@ mkdir -p "$FAKE/scripts/bench/codec_matrix" "$(dirname "$FAKE_RMLX")" "$FAKE/bin
 cp "$RUNNER" "$REPO_ROOT/scripts/bench/codec_matrix/smoke_prompts.toml" \
     "$FAKE/scripts/bench/codec_matrix/"
 mkdir -p "$FAKE/scripts/lib"
-cp "$REPO_ROOT/scripts/lib/record_pending.sh" "$REPO_ROOT/scripts/lib/identity.sh" "$FAKE/scripts/lib/"
+cp "$REPO_ROOT/scripts/lib/record_pending.sh" "$REPO_ROOT/scripts/lib/identity.sh" "$REPO_ROOT/scripts/lib/rmlx_home.sh" \
+    "$FAKE/scripts/lib/"
 printf '#!/bin/sh\nfor i in 1 2 3 4 5; do echo "needle_found=$STUB_FOUND"; done\nexit ${STUB_RC:-0}\n' >"$FAKE_RMLX"
 printf '#!/bin/sh\nexit 0\n' >"$FAKE/bin/cargo"
 chmod +x "$FAKE_RMLX" "$FAKE/bin/cargo"

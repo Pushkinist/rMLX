@@ -62,10 +62,12 @@ cd "$REPO_ROOT"
 . "$REPO_ROOT/scripts/lib/record_pending.sh"
 # shellcheck source=scripts/lib/identity.sh
 . "$REPO_ROOT/scripts/lib/identity.sh"
+# shellcheck source=scripts/lib/rmlx_home.sh
+. "$REPO_ROOT/scripts/lib/rmlx_home.sh"
 
 MANIFEST="$REPO_ROOT/scripts/bench/codec_matrix/kv_codec_matrix.toml"
 PROMPTS="$REPO_ROOT/scripts/bench/codec_matrix/smoke_prompts.toml"
-RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
+RMLX_HOME="$(rmlx_home "$REPO_ROOT")" || exit 2
 LAST_RUN="${RMLX_HOME}/bench/codec_matrix/last_run.json"
 
 FILTER_CODEC=""

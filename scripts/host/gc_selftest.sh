@@ -2,6 +2,7 @@
 # Recall test for the cleanup tools: planted scratch trees, never the real target/ or traces.
 #
 # Recall test for: host/gc.sh target traces
+#                  lib/rmlx_home.sh
 # Not a mode of: profile/gputrace_selftest.sh — that one reads .gputrace bundles; this one plants and deletes them
 # Runs in make ci, not in hosted CI: it uses BSD stat and date.
 #
@@ -48,7 +49,8 @@ export PATH="$ST_WORK/stubs:$PATH"
 place_tool() {
     cp "$REPO_ROOT/scripts/host/gc.sh" "$SCRATCH_TOOLS/" || st_die "cannot copy gc.sh"
     mkdir -p "$SCRATCH_REPO/scripts/lib"
-    cp "$REPO_ROOT/scripts/lib/args.sh" "$SCRATCH_REPO/scripts/lib/" || st_die "cannot copy args.sh"
+    cp "$REPO_ROOT/scripts/lib/args.sh" "$REPO_ROOT/scripts/lib/rmlx_home.sh" "$SCRATCH_REPO/scripts/lib/" ||
+        st_die "cannot copy the lib helpers"
 }
 
 # tool_target [args]: prune stale target/ profiles.
@@ -74,6 +76,9 @@ tool_env_age() { MAX_AGE_DAYS=abc tool_target "$@"; }
 
 # env_home <cmd...>: the command with RMLX_HOME naming a directory of its own, apart from the scratch repo.
 env_home() { RMLX_HOME="$ST_WORK/home" "$@"; }
+# env_relative, env_empty <cmd...>: the command with RMLX_HOME relative, or set and empty.
+env_relative() { RMLX_HOME=rel/home "$@"; }
+env_empty() { RMLX_HOME= "$@"; }
 
 # tool_mode <arg>: the tool with a first argument that is no mode.
 tool_mode() {
@@ -333,7 +338,7 @@ disk_case "traces: only .gputrace bundles are candidates" 0 left_traces "mst not
 fresh
 st_case "traces: an empty directory is a no-op" 0 --has "holds no .gputrace bundles" -- tool_traces --apply
 rm -rf "$SCRATCH_REPO/.rmlx"
-st_case "traces: no directory is a no-op" 0 --has "no .rmlx/traces — nothing to do" -- tool_traces --apply
+st_case "traces: no directory is a no-op" 0 --has "no $(cd "$SCRATCH_REPO" && pwd)/.rmlx/traces — nothing to do" -- tool_traces --apply
 
 fresh
 mkdir -p "$ST_WORK/other/b1.gputrace" "$ST_WORK/other/b2.gputrace"
@@ -374,6 +379,13 @@ disk_case "traces: a flag of the target mode is a usage error and deletes nothin
     --has "--warn-gb does not apply to the traces mode" -- tool_traces --apply --warn-gb 5
 disk_case "traces: --help prints the usage and deletes nothing" 0 left_traces "$ALL_BUNDLES" \
     --has "usage:" -- tool_traces --apply --help
+disk_case "traces RMLX_HOME: a relative value is a usage error and deletes nothing" 2 left_traces "$ALL_BUNDLES" \
+    --has "RMLX_HOME=rel/home must be an absolute path" -- env_relative tool_traces --apply --max-count 0 --all
+disk_case "traces RMLX_HOME: an empty value is a usage error and deletes nothing" 2 left_traces "$ALL_BUNDLES" \
+    --has "RMLX_HOME= must be an absolute path" -- env_empty tool_traces --apply --max-count 0 --all
+disk_case "traces --dir: a relative RMLX_HOME is not consulted" 0 left_traces "$ALL_BUNDLES" \
+    --has "nothing to do" -- env_relative tool_traces --apply --dir "$ST_WORK/none"
+st_case "target: a relative RMLX_HOME is not consulted" 0 --lacks "RMLX_HOME" -- env_relative tool_target
 
 # ---- target --warn-gb -----------------------------------------------------------------
 
@@ -398,5 +410,35 @@ st_case "size report: a non-numeric threshold is a usage error" 2 --has "--warn-
 st_case "size report: a negative threshold is a usage error" 2 --has "--warn-gb must be a whole number (got '-5')" --lacks "target/: " -- tool_report -5
 rm -rf "$SCRATCH_REPO/target"
 st_case "size report: no target/ is a no-op" 0 --has "target/ absent" -- tool_report
+
+# ---- lib/rmlx_home.sh --------------------------------------------------------------------------
+
+# home_sh, home_py <env arg>...: the shell function and lib/rmlx_home.py asked for the home of a
+# checkout at /repo, under the environment the arguments give to `env`.
+home_sh() { env "$@" bash -c '. "$1/scripts/lib/rmlx_home.sh"; rmlx_home /repo' bash "$REPO_ROOT"; }
+home_py() {
+    env "$@" python3 -I -c 'import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1])
+import rmlx_home
+print(rmlx_home.rmlx_home(Path("/repo")))' "$REPO_ROOT/scripts/lib"
+}
+
+# same_home <name> <env arg>...: both give one output and one status.
+same_home() {
+    local name="$1" sh_out sh_rc py_out py_rc
+    shift
+    sh_out=$(home_sh "$@" 2>&1) && sh_rc=0 || sh_rc=$?
+    py_out=$(home_py "$@" 2>&1) && py_rc=0 || py_rc=$?
+    st_verdict "$name" "$([ "$sh_out/$sh_rc" = "$py_out/$py_rc" ] || echo "shell '$sh_out' ($sh_rc), python '$py_out' ($py_rc)")" \
+        "lib/rmlx_home.sh and lib/rmlx_home.py agree"
+}
+
+st_case "rmlx_home: unset is <root>/.rmlx" 0 --is "/repo/.rmlx" -- home_sh -u RMLX_HOME
+st_case "rmlx_home: an absolute value is used as given" 0 --is "/abs/home" -- home_sh RMLX_HOME=/abs/home
+st_case "rmlx_home: a relative value is refused" 1 --is "RMLX_HOME=rel/home must be an absolute path" -- home_sh RMLX_HOME=rel/home
+st_case "rmlx_home: an empty value is refused" 1 --is "RMLX_HOME= must be an absolute path" -- home_sh RMLX_HOME=
+same_home rmlx_home_unset_agrees -u RMLX_HOME
+same_home rmlx_home_absolute_agrees RMLX_HOME=/abs/home
+same_home rmlx_home_relative_agrees RMLX_HOME=rel/home
+same_home rmlx_home_empty_agrees RMLX_HOME=
 
 st_done

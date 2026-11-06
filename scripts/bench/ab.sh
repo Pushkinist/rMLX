@@ -101,7 +101,9 @@
 set -eu
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
+# shellcheck source=scripts/lib/rmlx_home.sh
+. "${REPO_ROOT}/scripts/lib/rmlx_home.sh"
+RMLX_HOME="$(rmlx_home "${REPO_ROOT}")" || exit 125
 # shellcheck source=scripts/lib/args.sh
 . "${REPO_ROOT}/scripts/lib/args.sh"
 # shellcheck source=scripts/lib/record_pending.sh

@@ -126,7 +126,7 @@
 #     holder named in serve.log). The script stops only the servers it started.
 #
 # Writes nothing to the real metrics DB: hermetic RMLX_HOME per probe under
-# .rmlx/proofs/schema-constraint, `--metrics off` on every server.
+# <RMLX_HOME>/proofs/schema-constraint, `--metrics off` on every server.
 #
 # Artifacts per (model, probe), under that hermetic root:
 #   <model>/<probe>/{request,response}.json, status.txt, verdict.txt,
@@ -140,7 +140,9 @@ source "${REPO_ROOT}/scripts/lib/identity.sh"
 BINARY="$(rmlx_default_binary "${REPO_ROOT}" release-perf)"
 PORT="${PORT:-62265}"
 source "${REPO_ROOT}/scripts/lib/server_wait.sh"
-ROOT_DIR="${REPO_ROOT}/.rmlx/proofs/schema-constraint"
+source "${REPO_ROOT}/scripts/lib/rmlx_home.sh"
+RMLX_HOME="$(rmlx_home "${REPO_ROOT}")" || exit 2
+ROOT_DIR="${RMLX_HOME}/proofs/schema-constraint"
 
 O_MODELS_ROOT="${RMLX_O_MODELS_ROOT:-}"
 BONSAI_MODEL="${BONSAI_MODEL:-${O_MODELS_ROOT:+${O_MODELS_ROOT}/prism-ml__Ternary-Bonsai-8B-mlx-2bit}}"

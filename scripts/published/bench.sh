@@ -211,8 +211,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=scripts/lib/identity.sh
 . "${REPO_ROOT}/scripts/lib/identity.sh"
+# shellcheck source=scripts/lib/rmlx_home.sh
+. "${REPO_ROOT}/scripts/lib/rmlx_home.sh"
 BINARY="$(rmlx_default_binary "${REPO_ROOT}" release-perf)"
-RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
+RMLX_HOME="$(rmlx_home "${REPO_ROOT}")" || exit 1
 LOG_DIR="${RMLX_HOME}/logs"
 SCRATCH_DIR="${RMLX_HOME}/tmp"
 CAMPAIGN_ROOT="${RMLX_HOME}/bench/published"

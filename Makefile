@@ -169,7 +169,7 @@ build-capture: ## build + entitle the debug-only GPU-capture binary (release-deb
 gputrace-preflight: ## check the GPU-tools prerequisites (developer mode, get-task-allow, Xcode selected, Metal toolchain)
 	@bash scripts/profile/capture.sh preflight $(if $(BIN),--binary $(BIN),)
 
-traces-gc:       ## report <RMLX_HOME>/traces (else .rmlx/traces) against the retention caps (APPLY=1 to prune; MAX_COUNT=/MAX_TOTAL_GB=/MAX_AGE_DAYS= to retune)
+traces-gc:       ## report <RMLX_HOME>/traces (RMLX_HOME defaults to the checkout's .rmlx) against the retention caps (APPLY=1 to prune; MAX_COUNT=/MAX_TOTAL_GB=/MAX_AGE_DAYS= to retune)
 	bash scripts/host/gc.sh traces $(if $(APPLY),--apply,) $(if $(ALL),--all,) \
 		$(if $(MAX_COUNT),--max-count $(MAX_COUNT),) \
 		$(if $(MAX_TOTAL_GB),--max-total-gb $(MAX_TOTAL_GB),) \

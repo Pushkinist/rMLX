@@ -806,6 +806,14 @@ for flag in --model --kv-quant --prompt-tokens --max-tokens --time-limit --skip-
 	st_verdict "mst_capture_refuses_an_empty_${flag#--}" "$why" "$flag \"\" ends 2 before anything runs"
 done
 
+make_root gp_relative_home
+CAP_HOME="rel/home"
+run_gputrace --kv-quant none --model "$MODEL"
+why="$(st_check 1 --is "RMLX_HOME=rel/home must be an absolute path")"
+want "engine runs" "$(logged rmlx.argv)" ""
+want "directory" "$(listing "$ROOT/.rmlx")" ""
+st_verdict gpu_capture_refuses_a_relative_rmlx_home "$why" "a relative RMLX_HOME ends 1 before anything runs"
+
 make_root pf_empty_binary
 run_preflight --binary ""
 why="$(st_check 2 --has "ERROR: --binary needs a value")"
