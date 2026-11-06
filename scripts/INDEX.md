@@ -33,6 +33,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
+| `bench/codec_matrix/decoded_field.py` | bench/codec_matrix/runner.sh, bench/codec_matrix/runner_selftest.sh | Print the generated text of a `rmlx baseline` stderr log read on stdin; exit 1 when it has none. |
 | `bench/codec_matrix/kv_codec_matrix.toml` | bench/codec_matrix/runner.sh | KV-codec smoke + NIAH gate matrix. |
 | `bench/codec_matrix/niah_long_context.sh` | none | Needle-in-a-haystack long-context validation driver: a kernel-gate off pass, then an on pass. |
 | `bench/codec_matrix/runner.sh` | make smoke-codec-matrix, bench/codec_matrix/runner_selftest.sh | KV-codec smoke + NIAH gate matrix runner. |
@@ -101,6 +102,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/bench_server.sh` | bench/baseline_cells.sh, bench/cross_backend.sh, bench/serve_bench.sh, +1 more scripts | Start, wait for and identify one rmlx server, for bench harnesses; source it. |
 | `lib/busiest_between.awk` | bench/ab.sh, bench/ab_selftest.sh, bench/llama_ab.sh, +2 more scripts | Which process burned the most CPU between two cpu_snapshot files. |
 | `lib/cpu_snapshot.sh` | bench/ab.sh, bench/ab_selftest.sh, bench/llama_ab.sh, +2 more scripts | Per-process cumulative CPU seconds, for interference gates; source it. |
+| `lib/decoded_text.py` | bench/cache_types.py, bench/codec_matrix/decoded_field.py | Read the generated text out of a `rmlx baseline` stderr log. |
 | `lib/identity.sh` | bench/ab.sh, bench/baseline_cells.sh, bench/codec_matrix/niah_long_context.sh, +13 more scripts | Shared §8.5 run-identity for rMLX bench scripts. |
 | `lib/kv_boundary_default.py` | ingest/ingest.py | The engine's default KV boundary-layer counts, read from the engine. |
 | `lib/metal_dirs.sh` | check/kernel_dispatch.sh, check/metal_kernels.sh, check/metal_kernels_selftest.sh, +1 more scripts | The directories holding gated .metal kernels; sourced by the metal gates. |

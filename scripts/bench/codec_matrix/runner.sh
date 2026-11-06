@@ -332,31 +332,6 @@ codec_to_kv_quant() {
     esac
 }
 
-# Extract decoded text from the rmlx baseline tracing stream. The baseline
-# emits a `decoded=<text>` field on a tracing line; the rest of the stream
-# carries log noise that can accidentally satisfy a validate_regex (the
-# input prompt itself is echoed by tracing into stderr — review MED-2).
-# Replaces $1 in place with only the joined decoded fragments.
-extract_decoded_from_trace() {
-    local outfile="$1"
-    "$PYTHON3" - "$outfile" <<'PY'
-import re, sys, pathlib
-path = pathlib.Path(sys.argv[1])
-txt = path.read_text(encoding='utf-8', errors='replace')
-# Strip ANSI escape codes before matching: the tracing subscriber wraps
-# field keys and values in ANSI CSI sequences (\x1b[...m) which break the
-# `decoded="..."` regex if applied to raw output (review MED-2 path (b)).
-txt = re.sub(r'\x1b\[[0-9;]*m', '', txt)
-# Match `decoded=` followed by either a quoted string or a tail-of-line.
-# tracing's default formatter prints `decoded="..."` (Debug); we accept both.
-parts = re.findall(r'decoded="([^"]*)"', txt)
-if not parts:
-    parts = [m.group(1).strip() for m in re.finditer(r'decoded=(.*)$', txt, re.M)]
-if parts:
-    path.write_text(''.join(parts), encoding='utf-8')
-PY
-}
-
 # ── per-row execution ───────────────────────────────────────────────────────
 ROW_JSONS=()
 AGG_RC=0
@@ -455,8 +430,7 @@ while IFS=$'\t' read -r CODEC MODEL CTX EXPECTED PROMPTS_CSV SKIP CLI_ARGS NIAH_
         printf '%s' "$PCONTENT" >"$PROMPT_FILE"
 
         # `rmlx baseline` writes a one-line summary to stdout; the actual
-        # decoded text is emitted to a tracing log. We grep the tracing
-        # output for the `decoded=` field that baseline emits.
+        # decoded text is emitted to a tracing log as the `decoded=` field.
         #
         # The `||` arm keeps errexit from ending the run and records the
         # failed command's status: PIPESTATUS read after `|| true` would
@@ -474,18 +448,13 @@ while IFS=$'\t' read -r CODEC MODEL CTX EXPECTED PROMPTS_CSV SKIP CLI_ARGS NIAH_
             $CLI_ARGS 2>&1 | tee "$OUTPUT_FILE" >/dev/null || BASELINE_RC=${PIPESTATUS[0]}
 
         # A run that measured and whose record did not land is judged on its
-        # output like any other; its record makes the matrix INCOMPLETE. The
-        # buffer file is read off the output before the trace is reduced.
+        # output like any other; its record makes the matrix INCOMPLETE.
         if [[ $BASELINE_RC -eq $RECORD_PENDING_EXIT ]]; then
             record_pending_note "$OUTPUT_FILE"
             log_evt warn "record_pending codec=$CODEC model=$MODEL prompt=$PNAME"
             RECORDS_PENDING=$((RECORDS_PENDING + 1))
             BASELINE_RC=0
         fi
-
-        # Extract `decoded=` so validate_regex sees only model output, not the
-        # tracing-echoed prompt (review MED-2 path (a)).
-        extract_decoded_from_trace "$OUTPUT_FILE"
 
         if [[ $BASELINE_RC -ne 0 ]]; then
             SMOKE_VERDICT="fail"
@@ -495,15 +464,25 @@ while IFS=$'\t' read -r CODEC MODEL CTX EXPECTED PROMPTS_CSV SKIP CLI_ARGS NIAH_
             break
         fi
 
-        if ! validate_output "$PREGEX" "$PMIN" "$OUTPUT_FILE" >/dev/null; then
+        # The log echoes the prompt, which can satisfy a validate_regex; only the decoded text is judged.
+        DECODED_FILE="$(mktemp -t rmlx-smoke-decoded.XXXXXX)"
+        if ! python3 "$REPO_ROOT/scripts/bench/codec_matrix/decoded_field.py" <"$OUTPUT_FILE" >"$DECODED_FILE"; then
             SMOKE_VERDICT="fail"
-            SMOKE_FAIL_PROMPT="$PNAME:validate"
-            log_evt error "smoke_fail codec=$CODEC model=$MODEL prompt=$PNAME reason=validate"
-            rm -f "$PROMPT_FILE" "$OUTPUT_FILE"
+            SMOKE_FAIL_PROMPT="$PNAME:no_decoded_field"
+            log_evt error "smoke_fail codec=$CODEC model=$MODEL prompt=$PNAME reason=no_decoded_field"
+            rm -f "$PROMPT_FILE" "$OUTPUT_FILE" "$DECODED_FILE"
             break
         fi
 
-        rm -f "$PROMPT_FILE" "$OUTPUT_FILE"
+        if ! VALIDATION="$(validate_output "$PREGEX" "$PMIN" "$DECODED_FILE")"; then
+            SMOKE_VERDICT="fail"
+            SMOKE_FAIL_PROMPT="$PNAME:validate"
+            log_evt error "smoke_fail codec=$CODEC model=$MODEL prompt=$PNAME reason=validate $VALIDATION"
+            rm -f "$PROMPT_FILE" "$OUTPUT_FILE" "$DECODED_FILE"
+            break
+        fi
+
+        rm -f "$PROMPT_FILE" "$OUTPUT_FILE" "$DECODED_FILE"
     done
 
     if [[ "$SMOKE_VERDICT" != "pass" ]]; then

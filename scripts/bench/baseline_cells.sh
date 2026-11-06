@@ -620,6 +620,8 @@ smoke_rejection() {
     }
     if [[ "${repeat}" == none ]]; then
         echo no_output
+    elif [[ "${repeat}" == empty ]]; then
+        echo empty_output
     elif [[ "${repeat}" -gt 3 ]]; then
         echo "4gram_repeat=${repeat}"
     fi

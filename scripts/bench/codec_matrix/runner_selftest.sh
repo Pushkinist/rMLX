@@ -9,7 +9,9 @@
 # loaded. Each case asserts the literal exit code and the text the run prints.
 # The gate cases run a real pass over a copy of the runner with a stub `cargo` and
 # a stub `rmlx` that print a chosen NIAH reading, so the verdict path runs.
-# One more case holds the runner's slug table equal to the NIAH cells' slugs.
+# Cases over a stub `cargo` that prints a chosen log hold the smoke verdict: no decoded field, an escaped
+# quote, an empty text. The decoded-text reader (decoded_field.py over lib/decoded_text.py) is run on logs
+# of its own. One more case holds the runner's slug table equal to the NIAH cells' slugs.
 #
 # Exit 0 = every case held. Exit 1 = at least one did not.
 
@@ -17,6 +19,7 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 RUNNER="$REPO_ROOT/scripts/bench/codec_matrix/runner.sh"
+FIELD_CLI="$REPO_ROOT/scripts/bench/codec_matrix/decoded_field.py"
 NIAH="$REPO_ROOT/crates/rmlx-models/tests/niah_long_context.rs"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -132,11 +135,11 @@ FAKE="$WORK/fake"
 . "$REPO_ROOT/scripts/lib/identity.sh"
 FAKE_RMLX="$(rmlx_default_binary "$FAKE" release-perf)"
 mkdir -p "$FAKE/scripts/bench/codec_matrix" "$(dirname "$FAKE_RMLX")" "$FAKE/bin"
-cp "$RUNNER" "$REPO_ROOT/scripts/bench/codec_matrix/smoke_prompts.toml" \
+cp "$RUNNER" "$REPO_ROOT/scripts/bench/codec_matrix/smoke_prompts.toml" "$FIELD_CLI" \
     "$FAKE/scripts/bench/codec_matrix/"
 mkdir -p "$FAKE/scripts/lib"
 cp "$REPO_ROOT/scripts/lib/record_pending.sh" "$REPO_ROOT/scripts/lib/identity.sh" "$REPO_ROOT/scripts/lib/rmlx_home.sh" \
-    "$FAKE/scripts/lib/"
+    "$REPO_ROOT/scripts/lib/decoded_text.py" "$FAKE/scripts/lib/"
 printf '#!/bin/sh\nfor i in 1 2 3 4 5; do echo "needle_found=$STUB_FOUND"; done\nexit ${STUB_RC:-0}\n' >"$FAKE_RMLX"
 printf '#!/bin/sh\nexit 0\n' >"$FAKE/bin/cargo"
 chmod +x "$FAKE_RMLX" "$FAKE/bin/cargo"
@@ -204,6 +207,53 @@ chmod +x "$FAKE/bin_pending/cargo"
 GATE_BIN="$FAKE/bin_pending" gate_case gate_smoke_record_pending 3 "a smoke run whose record did not land is judged on its output, named, and the matrix is INCOMPLETE" \
     true "$WORK/g_smoke.toml" "" "record_pending" "record pending: /x/pending/smoke.json" "niah_pass" "!smoke_fail"
 json_has gate_smoke_record_pending "the result file counts the pending record" '"records_pending":1'
+
+# trace_cargo <case> <trace>: a `cargo` whose baseline run prints <trace> and exits 0.
+trace_cargo() {
+    mkdir -p "$FAKE/bin_$1"
+    printf '%s\n' "$2" >"$WORK/$1.trace"
+    printf '#!/bin/sh\n[ "$1" = run ] || exit 0\ncat "%s"\n' "$WORK/$1.trace" >"$FAKE/bin_$1/cargo"
+    chmod +x "$FAKE/bin_$1/cargo"
+}
+sed 's/\["coherence"\]/["multi_turn"]/' "$WORK/g_smoke.toml" >"$WORK/g_smoke_seed.toml"
+
+trace_cargo no_field 'INFO baseline: prompt echo: The coastal lighthouse was painted red and white.'
+GATE_BIN="$FAKE/bin_no_field" gate_case gate_smoke_no_decoded_field 1 "a log with no decoded field fails the smoke, though its prompt echo matches the row's regex" \
+    true "$WORK/g_smoke_seed.toml" "" "smoke_fail" "reason=no_decoded_field" "no decoded field" "!niah_pass"
+json_has gate_smoke_no_decoded_field "the result file names the prompt and the reason" '"fail_prompt":"multi_turn:no_decoded_field"'
+
+trace_cargo escaped_quote 'INFO baseline: decoded preview decoded="it was \"red\" indeed"'
+GATE_BIN="$FAKE/bin_escaped_quote" gate_case gate_smoke_escaped_quote 0 "a decoded text is read past an escaped quote" \
+    true "$WORK/g_smoke_seed.toml" "" "niah_pass" "!smoke_fail"
+
+trace_cargo empty_text 'INFO baseline: decoded preview decoded=""'
+GATE_BIN="$FAKE/bin_empty_text" gate_case gate_smoke_empty_text 1 "an empty decoded text fails the smoke as empty output" \
+    true "$WORK/g_smoke_seed.toml" "" "smoke_fail" "reason=validate" "fail: empty output" "!niah_pass"
+
+# field_case <name> <want-exit> <what> <log> <want-stdout>: the decoded-text reader over a log on stdin.
+field_case() {
+    local name="$1" want="$2" what="$3" out got err
+    out="$(printf '%s' "$4" | python3 "$FIELD_CLI" 2>"$WORK/$name.err")"
+    got=$?
+    err="$(cat "$WORK/$name.err")"
+    if [ "$got" = "$want" ] && [ "$out" = "$5" ] && { [ "$want" = 0 ] || [ "$err" = "no decoded field in the log" ]; }; then
+        PASSED=$((PASSED + 1))
+        printf '  ok   %-30s exit=%s — %s\n' "$name" "$got" "$what"
+    else
+        FAILED=$((FAILED + 1))
+        printf '  FAIL %-30s exit=%s (want %s) — %s\n       | stdout [%s] want [%s]\n       | stderr [%s]\n' \
+            "$name" "$got" "$want" "$what" "$out" "$5" "$err"
+    fi
+}
+
+field_case field_none 1 "a log with no decoded field exits 1 and names it" 'INFO baseline: prompt: red and white' ''
+field_case field_empty 0 "an empty decoded text is printed as nothing" 'decoded=""' ''
+field_case field_escaped_quote 0 "a decoded text runs past an escaped quote" 'decoded="say \"hi\" now"' 'say "hi" now'
+field_case field_backslash 0 "an escaped backslash is one backslash" 'decoded="C:\\temp"' 'C:\temp'
+field_case field_newline_tab 0 "escaped newline and tab are the characters" 'decoded="a\nb\tc"' "$(printf 'a\nb\tc')"
+field_case field_ansi 0 "the colour codes the subscriber wraps around the field are stripped" \
+    "$(printf '\033[2m12:00\033[0m INFO baseline: decoded preview \033[3mdecoded\033[0m\033[2m=\033[0m"x y"')" 'x y'
+field_case field_last_wins 0 "of two fields, the last is the text" 'decoded="first" and later decoded="second"' 'second'
 
 # A `cargo` that logs the argv of each `run` and builds nothing.
 mkdir -p "$FAKE/bin_argv"

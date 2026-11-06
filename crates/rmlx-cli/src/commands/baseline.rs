@@ -622,8 +622,8 @@ pub(crate) fn run_baseline(
     // Truncate to 200 chars for notes field.
     let notes_truncated: String = preview_full.chars().take(200).collect();
 
-    // Emit properly decoded text for the smoke runner's
-    // `extract_decoded_from_trace`. Raw `id_to_token()` pieces use tokenizer-
+    // Emit properly decoded text for the smoke checks that read it back
+    // (`scripts/lib/decoded_text.py`). Raw `id_to_token()` pieces use tokenizer-
     // specific space markers (SentencePiece `▁`, GPT-2 `Ġ`) that the runner's
     // validate_regex cannot match. `tokenizer.decode()` converts the token ids
     // back to human-readable text with proper spaces. Falls back to the raw
@@ -633,8 +633,8 @@ pub(crate) fn run_baseline(
     // models (Bonsai / Qwen3.6) spend tokens on <think> blocks before the
     // actual answer; with a 50-token cap those models would fail instruction
     // prompts whose answer begins after token 50. The full decode is written
-    // as a single tracing field; the runner's extract_decoded_from_trace
-    // strips ANSI and captures the quoted value.
+    // as a single tracing field; `decoded_text` strips ANSI and captures the
+    // quoted value.
     let token_ids: Vec<u32> = steps.iter().map(|s| s.token_id).collect();
     let decoded_text: String = tokenizer
         .decode(&token_ids, true)

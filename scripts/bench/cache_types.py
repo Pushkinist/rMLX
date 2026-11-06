@@ -6,7 +6,8 @@ Module of: bench/baseline_cells.sh
 measured runs, with their stddev, filed as `gate`. Its `kv_quant` is the codec name the
 caller read from the run's own log; this module maps no flags to a name. `repeat` reads a
 smoke run's stderr log on stdin. It prints how often the most repeated four-word sequence
-of the last `decoded="..."` field occurs, or `none` when the log holds no such field.
+of the last `decoded="..."` field occurs, `none` when the log holds no such field, or
+`empty` when the field holds no word.
 """
 
 from __future__ import annotations
@@ -14,15 +15,13 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
-import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from decoded_text import decoded_text  # noqa: E402
+
 FOUR_GRAM = 4
-ANSI = re.compile(r"\x1b\[[0-9;]*m")
-DECODED = re.compile(r'decoded="((?:[^"\\]|\\.)*)"')
-DEBUG_ESCAPE = re.compile(r'\\(["\\nt])')
-UNESCAPED = {'"': '"', "\\": "\\", "n": "\n", "t": "\t"}
 
 
 def number(raw: str) -> float | None:
@@ -72,17 +71,6 @@ def build_record(args: argparse.Namespace) -> dict:
     }
 
 
-def decoded_text(log: str) -> str | None:
-    """The text of the last `decoded` field of a run's stderr log, or None when it has none.
-
-    The field is a Rust Debug string, so `"`, `\\`, newline and tab arrive escaped.
-    """
-    fields = DECODED.findall(ANSI.sub("", log))
-    if not fields:
-        return None
-    return DEBUG_ESCAPE.sub(lambda m: UNESCAPED[m[1]], fields[-1])
-
-
 def max_repeat(text: str) -> int:
     """How often the most repeated run of four whitespace-separated words occurs in `text`."""
     words = text.split()
@@ -107,7 +95,12 @@ def main() -> int:
     args = parser.parse_args()
     if args.command == "repeat":
         text = decoded_text(sys.stdin.read())
-        print("none" if text is None else max_repeat(text))
+        if text is None:
+            print("none")
+        elif not text.split():
+            print("empty")
+        else:
+            print(max_repeat(text))
         return 0
     Path(args.out).write_text(json.dumps(build_record(args), indent=2))
     return 0

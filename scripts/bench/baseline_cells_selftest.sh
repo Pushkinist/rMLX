@@ -48,6 +48,7 @@ GEMMA26=mlx-community__gemma-4-26b-a4b-it-mxfp8
 #   decoded      lines `<call number> <text>`: the body of one `decoded="..."` field that run prints, as
 #                Rust Debug writes it, one field per line; any other call prints one clean sentence
 #   no_decoded_on  the run whose argv holds this text prints its summary line and no `decoded` field
+#   empty_decoded_on  the run whose argv holds this text prints an empty `decoded=""` field
 #   no_summary_on  the run whose argv holds this text prints its `decoded` field and no summary line
 #   no_codec_on  the run whose argv holds this text states no codec in its log
 #   fail_on      the first line is an exit code; the run whose argv holds every later line exits with it
@@ -115,10 +116,12 @@ baseline)
 	[ -z "$irow" ] || read -r bytes ids skipped <<<"$irow"
 	holds no_summary_on || echo "baseline: model=stub  load=${load}ms ttft_ms=$ttft  decode_tps=$1  prefill_tps=$2  prompt_tokens=4200  peak_rss=${rss}MB  kv_cache_bytes=$bytes"
 	text="$(awk -v n="$n" '$1 == n { sub(/^[^ ]+ /, ""); print }' "$RMLX_HOME/decoded" 2>/dev/null || true)"
+	default_text="the quick brown fox jumps over the lazy dog"
+	! holds empty_decoded_on || default_text=""
 	if ! holds no_decoded_on; then
 		while IFS= read -r line; do
 			printf '\033[2m2026-09-03T00:00:00Z\033[0m \033[32m INFO\033[0m baseline: decoded preview \033[3mdecoded\033[0m\033[2m=\033[0m"%s"\n' "$line" >&2
-		done <<<"${text:-the quick brown fox jumps over the lazy dog}"
+		done <<<"${text:-$default_text}"
 	fi
 	[ -z "$ids" ] || echo "baseline: token_ids=$ids"
 	[ "$skipped" = 0 ] || echo "exit_prefill: packed store skipped - decode reads the bf16 mirror only" >&2
@@ -893,6 +896,11 @@ home="$(new_home cache_types_smoke_no_decoded_field)"
 control "$home" no_decoded_on " --label ctype-smoke-k8v4 "
 ct_run "$home"
 smoke_case cache_types_smoke_no_decoded_field "a smoke run that prints its summary line and no decoded field is a smoke_fail row" smoke_fail no_output
+
+home="$(new_home cache_types_smoke_empty_decoded)"
+control "$home" empty_decoded_on " --label ctype-smoke-k8v4 "
+ct_run "$home"
+smoke_case cache_types_smoke_empty_decoded "a smoke run whose decoded text is empty is a smoke_fail row" smoke_fail empty_output
 
 home="$(new_home cache_types_smoke_no_summary_line)"
 control "$home" no_summary_on " --label ctype-smoke-k8v4 "
