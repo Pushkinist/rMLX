@@ -132,7 +132,7 @@ PY
         extra+=(--ppl "${dir}/ppl.json")
     fi
 
-    python3 "${EMITTER}" "${inputs[@]}" --model "${model}" \
+    python3 "${EMITTER}" ${inputs[@]+"${inputs[@]}"} --model "${model}" \
         ${extra[@]+"${extra[@]}"} >"${CASE_OUT}" 2>"${CASE_ERR}"
     local got=$?
     [ "${got}" -ne "${want}" ] && CASE_BAD="exit=${got} (want ${want})"
@@ -404,6 +404,12 @@ table_case missing_snapshot_is_refused 1 \
     "a snapshot that is not there is named, not silently priced at zero" \
     'is not a directory' \
     ONLY:plain MODEL:"${WORK}/no-such-snapshot"
+verdict
+
+table_case no_result_is_refused 2 \
+    "an emitter given no result file is refused, not rendered from nothing" \
+    'arguments are required: result' \
+    ONLY:
 verdict
 
 # ── One ceiling must describe the whole decode window ────────────────────────

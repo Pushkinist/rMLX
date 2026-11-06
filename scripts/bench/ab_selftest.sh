@@ -534,7 +534,7 @@ echo "ab selftest (logic): mutation checks"
 
 check planted_10pct 0 \
 	"a planted +9.95% arm is reported as +9.95% and SEPARATED" \
-	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" ${COMMON[@]+"${COMMON[@]}"} \
 	"GREP:ratio B/A = 1\.0995" \
 	"GREP:median= *100\.5000" \
 	"GREP:median= *110\.5000" \
@@ -542,20 +542,20 @@ check planted_10pct 0 \
 
 check planted_inverted 0 \
 	"--invert swaps the pattern and still reports the same ratio" \
-	--binary-a "$SLOW" --binary-b "$FAST" --invert "${COMMON[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" --invert ${COMMON[@]+"${COMMON[@]}"} \
 	"GREP:ratio B/A = 1\.0995" \
 	"GREP:VERDICT: SEPARATED" \
 	"GREP:pattern: BAAB ABBA BAAB"
 
 check planted_memory 0 \
 	"a planted +15 MB allocation shows up in the peak-memory column" \
-	--binary-a "$SLOW" --binary-b "$HUNGRY" --allow-null-arms "${COMMON[@]}" \
+	--binary-a "$SLOW" --binary-b "$HUNGRY" --allow-null-arms ${COMMON[@]+"${COMMON[@]}"} \
 	"GREP:A median=40\.0000  B median=55\.0000  delta=\+15\.0 MB" \
 	"GREP:ratio B/A = 1\.0000"
 
 check planted_kv_residency 0 \
 	"a 2x resident-KV arm is reported as ratio 2.0000, in MB" \
-	--binary-a "$KV_SMALL" --binary-b "$KV_BIG" "${COMMON[@]}" \
+	--binary-a "$KV_SMALL" --binary-b "$KV_BIG" ${COMMON[@]+"${COMMON[@]}"} \
 	"GREP:kv_cache_bytes      A median=1000\.0 MB  B median=2000\.0 MB  ratio B/A=2\.0000" \
 	"GREP:result: "
 
@@ -580,13 +580,13 @@ fi
 # is the shape of every silent-fallback defect this repo has had to unpick.
 check kv_residency_refusal_is_not_zero 0 \
 	"a slot whose KV accounting refused reports n/a, never 0" \
-	--binary-a "$KV_NA" --binary-b "$KV_BIG" "${COMMON[@]}" \
+	--binary-a "$KV_NA" --binary-b "$KV_BIG" ${COMMON[@]+"${COMMON[@]}"} \
 	"GREP:kv_cache_bytes      A median=n/a MB  B median=2000\.0 MB  ratio B/A=n/a" \
 	"NOGREP:A median=0\.0 MB"
 
 check kv_residency_absent_column_is_not_zero 0 \
 	"a binary that emits no KV column reports n/a, never 0" \
-	--binary-a "$KV_ABSENT" --binary-b "$KV_BIG" "${COMMON[@]}" \
+	--binary-a "$KV_ABSENT" --binary-b "$KV_BIG" ${COMMON[@]+"${COMMON[@]}"} \
 	"GREP:kv_cache_bytes      A median=n/a MB  B median=2000\.0 MB  ratio B/A=n/a"
 
 # The invariant is "n/a if ANY slot refused", and an all-refuse stub cannot tell
@@ -594,7 +594,7 @@ check kv_residency_absent_column_is_not_zero 0 \
 # mixture separates them.
 check kv_residency_any_refusal_taints_the_arm 0 \
 	"one refusing slot makes the whole arm n/a, not a median of the rest" \
-	--binary-a "$KV_PARTIAL" --binary-b "$KV_BIG" "${COMMON[@]}" \
+	--binary-a "$KV_PARTIAL" --binary-b "$KV_BIG" ${COMMON[@]+"${COMMON[@]}"} \
 	"GREP:kv_cache_bytes      A median=n/a MB  B median=2000\.0 MB  ratio B/A=n/a" \
 	"NOGREP:A median=1000\.0 MB"
 
@@ -602,21 +602,21 @@ check kv_residency_any_refusal_taints_the_arm 0 \
 # median of 0 bytes and record as the smallest cache ever measured.
 check kv_residency_non_numeric_refused 125 \
 	"a kv_cache_bytes token that is neither a number nor n/a is refused" \
-	--binary-a "$KV_NAN" --binary-b "$KV_BIG" "${COMMON[@]}" \
+	--binary-a "$KV_NAN" --binary-b "$KV_BIG" ${COMMON[@]+"${COMMON[@]}"} \
 	"GREP:reported kv_cache_bytes=nan"
 
 # ---- does it stay quiet when there is nothing there? -------------------------
 
 check null_arms 0 \
 	"two arms with identical numbers report ratio 1.0000 and INCONCLUSIVE" \
-	--binary-a "$SLOW" --binary-b "$SLOW_TWIN" "${COMMON[@]}" \
+	--binary-a "$SLOW" --binary-b "$SLOW_TWIN" ${COMMON[@]+"${COMMON[@]}"} \
 	"GREP:ratio B/A = 1\.0000" \
 	"GREP:VERDICT: INCONCLUSIVE" \
 	"NOGREP:VERDICT: SEPARATED"
 
 check overlapping_ranges 0 \
 	"a 1% median gap whose ranges overlap is INCONCLUSIVE, not a result" \
-	--binary-a "$SLOW" --binary-b "$OVERLAP" "${COMMON[@]}" \
+	--binary-a "$SLOW" --binary-b "$OVERLAP" ${COMMON[@]+"${COMMON[@]}"} \
 	"GREP:ratio B/A = 1\.0149" \
 	"GREP:VERDICT: INCONCLUSIVE" \
 	"GREP:is not evidence that the arms differ"
@@ -625,38 +625,38 @@ check overlapping_ranges 0 \
 
 check same_binary_refused 125 \
 	"the same binary with the same args on both arms is refused" \
-	--binary-a "$SLOW" --binary-b "$SLOW" "${COMMON[@]}" \
+	--binary-a "$SLOW" --binary-b "$SLOW" ${COMMON[@]+"${COMMON[@]}"} \
 	"GREP:indistinguishable"
 
 check same_binary_waived 0 \
 	"--allow-null-arms permits it deliberately and says so" \
-	--binary-a "$SLOW" --binary-b "$SLOW" --allow-null-arms "${COMMON[@]}" \
+	--binary-a "$SLOW" --binary-b "$SLOW" --allow-null-arms ${COMMON[@]+"${COMMON[@]}"} \
 	"GREP:null calibration" \
 	"GREP:VERDICT: INCONCLUSIVE"
 
 check token_divergence 1 \
 	"arms that generate different tokens fail instead of being timed" \
-	--binary-a "$SLOW" --binary-b "$WRONG" "${COMMON[@]}" \
+	--binary-a "$SLOW" --binary-b "$WRONG" ${COMMON[@]+"${COMMON[@]}"} \
 	"GREP:the arms generate different tokens"
 
 check token_divergence_waived 0 \
 	"--allow-token-divergence permits it and labels the ratio" \
-	--binary-a "$SLOW" --binary-b "$WRONG" --allow-token-divergence "${COMMON[@]}" \
+	--binary-a "$SLOW" --binary-b "$WRONG" --allow-token-divergence ${COMMON[@]+"${COMMON[@]}"} \
 	"GREP:DIVERGED between arms"
 
 check token_drift_within_arm 1 \
 	"a slot that stops reproducing its own arm's tokens fails" \
-	--binary-a "$DRIFTER" --binary-b "$FAST" --allow-token-divergence "${COMMON[@]}" \
+	--binary-a "$DRIFTER" --binary-b "$FAST" --allow-token-divergence ${COMMON[@]+"${COMMON[@]}"} \
 	"GREP:did not reproduce its own arm"
 
 check missing_tps 125 \
 	"an arm that emits no decode_tps is a failed measurement, not a zero" \
-	--binary-a "$NO_TPS" --binary-b "$FAST" "${COMMON[@]}" \
+	--binary-a "$NO_TPS" --binary-b "$FAST" ${COMMON[@]+"${COMMON[@]}"} \
 	"GREP:produced no decode_tps"
 
 check missing_token_ids 125 \
 	"an arm that emits no token_ids is refused rather than timed blind" \
-	--binary-a "$NO_IDS" --binary-b "$FAST" "${COMMON[@]}" \
+	--binary-a "$NO_IDS" --binary-b "$FAST" ${COMMON[@]+"${COMMON[@]}"} \
 	"GREP:emitted no token_ids line"
 
 check unbalanced_slots 125 \
@@ -674,7 +674,7 @@ check missing_model 125 \
 : >"$WORK/not_executable_rmlx"
 check binary_a_not_executable 125 \
 	"a --binary-a that is no executable file stops the run" \
-	--binary-a "$WORK/not_executable_rmlx" --binary-b "$FAST" "${COMMON[@]}" \
+	--binary-a "$WORK/not_executable_rmlx" --binary-b "$FAST" ${COMMON[@]+"${COMMON[@]}"} \
 	"GREP:not an executable binary: $WORK/not_executable_rmlx"
 
 # A checkout of its own: with no --binary-a the harness takes the release-perf
@@ -688,14 +688,14 @@ AB="$DEFAULT_ROOT/scripts/bench/ab.sh"
 
 check default_binary_missing 125 \
 	"with no --binary-a the harness looks for the checkout's release-perf build" \
-	--binary-b "$FAST" "${COMMON[@]}" \
+	--binary-b "$FAST" ${COMMON[@]+"${COMMON[@]}"} \
 	"GREP:not an executable binary: $DEFAULT_ROOT/target/release-perf/rmlx"
 
 mkdir -p "$DEFAULT_ROOT/target/release-perf"
 cp "$(make_stub default_arm "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN")" "$DEFAULT_ROOT/target/release-perf/rmlx"
 check default_binary_is_release_perf 0 \
 	"with no --binary-a arm A runs the checkout's release-perf build" \
-	--binary-b "$FAST" "${COMMON[@]}" \
+	--binary-b "$FAST" ${COMMON[@]+"${COMMON[@]}"} \
 	"GREP:VERDICT: SEPARATED"
 if grep -q '^stub=default_arm ' "$STATE/slots.log"; then
 	PASSED=$((PASSED + 1))
@@ -719,7 +719,7 @@ AB="$REPO_AB"
 
 check real_slots_record_as_ab_arm 0 \
 	"on a quiet host every slot, warmups included, is recorded as an ab_arm row" \
-	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" ${COMMON[@]+"${COMMON[@]}"} \
 	REALHOST "PATHPRE:$WORK/quietbin" \
 	"GREP:arm A: every slot, warmups included, is recorded in runs.db as an ab_arm" \
 	"GREP:arm B: every slot, warmups included, is recorded in runs.db as an ab_arm" \
@@ -727,7 +727,7 @@ check real_slots_record_as_ab_arm 0 \
 
 check old_binary_arm_records_nothing 0 \
 	"an arm whose binary predates --run-class runs --metrics off; the other arm still records" \
-	--binary-a "$SLOW_OLD" --binary-b "$FAST" "${COMMON[@]}" \
+	--binary-a "$SLOW_OLD" --binary-b "$FAST" ${COMMON[@]+"${COMMON[@]}"} \
 	REALHOST "PATHPRE:$WORK/quietbin" \
 	"SLOTS:^(stub=slow_old mode=off record=0 class= label=|stub=fast mode=full record=1 class=ab_arm label=perf_ab:[0-9]{8}T[0-9]{6}Z:B:(warm_b|slot_[0-9]+))$" \
 	"GREP:arm A: its binary has no --run-class" \
@@ -736,7 +736,7 @@ check old_binary_arm_records_nothing 0 \
 
 STUB_RECORD_PENDING=1 check slots_with_pending_records_keep_their_verdict 75 \
 	"slots that measured and whose ab_arm record did not land still count; the run names each file and ends 75" \
-	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" ${COMMON[@]+"${COMMON[@]}"} \
 	REALHOST "PATHPRE:$WORK/quietbin" \
 	"GREP:VERDICT: SEPARATED" \
 	"GREP:record pending: .*metrics/buffer/pending/(slow|fast)-[0-9]+\.json" \
@@ -744,7 +744,7 @@ STUB_RECORD_PENDING=1 check slots_with_pending_records_keep_their_verdict 75 \
 
 check busy_host_refused 125 \
 	"a host over the CPU threshold is refused before anything is measured" \
-	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" ${COMMON[@]+"${COMMON[@]}"} \
 	REALHOST "PATHPRE:$WORK/busybin" \
 	"GREP:host is not quiescent" \
 	"GREP:hog"
@@ -754,7 +754,7 @@ check busy_host_refused 125 \
 # old format (taint replacing the verdict) rather than the behaviour.
 check busy_host_taints 125 \
 	"--allow-busy-host prints the numbers but a tainted run is still not clean" \
-	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" --allow-busy-host \
+	--binary-a "$SLOW" --binary-b "$FAST" ${COMMON[@]+"${COMMON[@]}"} --allow-busy-host \
 	REALHOST "PATHPRE:$WORK/busybin" \
 	"GREP:^  TAINTED:" \
 	"GREP:VERDICT: SEPARATED"
@@ -765,7 +765,7 @@ check busy_host_taints 125 \
 # number look better is not the harness's call.
 check metal_holder_refused 125 \
 	"a host where something else holds the Metal context is refused" \
-	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" ${COMMON[@]+"${COMMON[@]}"} \
 	REALHOST "PATHPRE:$WORK/servebin" \
 	"GREP:holds the Metal context" \
 	"NOGREP:VERDICT:"
@@ -779,26 +779,26 @@ check metal_holder_refused 125 \
 
 check metrics_flag_in_arm_refused 125 \
 	"--metrics in an arm's arguments is refused before anything runs" \
-	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" ${COMMON[@]+"${COMMON[@]}"} \
 	--arm-b "--metrics full" \
 	"GREP:--metrics may not appear in arm arguments" \
 	"GREP:change how that arm is recorded"
 
 check metrics_flag_equals_form_refused 125 \
 	"the --metrics=VALUE spelling is refused too" \
-	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" ${COMMON[@]+"${COMMON[@]}"} \
 	--arm-a "--metrics=full" \
 	"GREP:--metrics may not appear in arm arguments"
 
 check run_class_flag_in_arm_refused 125 \
 	"--run-class in an arm's arguments is refused before anything runs" \
-	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" ${COMMON[@]+"${COMMON[@]}"} \
 	--arm-a "--run-class gate" \
 	"GREP:--run-class may not appear in arm arguments"
 
 check record_flag_in_arm_refused 125 \
 	"--record in an arm's arguments is refused before anything runs" \
-	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" ${COMMON[@]+"${COMMON[@]}"} \
 	--arm-b "--record" \
 	"GREP:--record may not appear in arm arguments"
 
@@ -807,13 +807,13 @@ check record_flag_in_arm_refused 125 \
 ZEROPEAK="$(make_stub zeropeak "100.0,100.5,101.0" 0.0 "$TOKENS_MAIN" "" zeropeak)"
 check vacuous_memory_refused 125 \
 	"a slot whose peak bracket measured nothing is refused, not averaged as 0" \
-	--binary-a "$ZEROPEAK" --binary-b "$FAST" "${COMMON[@]}" \
+	--binary-a "$ZEROPEAK" --binary-b "$FAST" ${COMMON[@]+"${COMMON[@]}"} \
 	"GREP:metal_peak_mb=0"
 
 SHORT="$(make_stub short "100.0,100.5,101.0" 40.0 "1,2")"
 check short_generation_refused 125 \
 	"a slot that generated fewer tokens than asked for is refused" \
-	--binary-a "$SHORT" --binary-b "$FAST" "${COMMON[@]}" \
+	--binary-a "$SHORT" --binary-b "$FAST" ${COMMON[@]+"${COMMON[@]}"} \
 	"GREP:emitted 2 token ids, expected 5"
 
 # ---- option validation -------------------------------------------------------
@@ -825,7 +825,7 @@ check non_numeric_slots 125 \
 
 check non_numeric_busy_pct 125 \
 	"a non-numeric --busy-pct is refused rather than silently disabling the gate" \
-	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" --busy-pct abc \
+	--binary-a "$SLOW" --binary-b "$FAST" ${COMMON[@]+"${COMMON[@]}"} --busy-pct abc \
 	"GREP:--busy-pct must be a number"
 
 check slots_too_few_for_a_verdict 125 \
@@ -1002,7 +1002,7 @@ fi
 # End to end: a failing `ps` must taint the run rather than let it report clean.
 check failing_ps_taints 125 \
 	"a slot whose interference could not be sampled taints the comparison" \
-	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" ${COMMON[@]+"${COMMON[@]}"} \
 	REALHOST "PATHPRE:$WORK/failbin" \
 	"GREP:^  TAINTED:" \
 	"GREP:could not be sampled" \
@@ -1032,7 +1032,7 @@ fi
 
 check pattern_is_balanced 0 \
 	"the default 12-slot pattern is the balanced ABBA BAAB ABBA schedule" \
-	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" ${COMMON[@]+"${COMMON[@]}"} \
 	"GREP:pattern: ABBA BAAB ABBA" \
 	"GREP:n=6"
 
@@ -1063,7 +1063,7 @@ fi
 
 check json_result_parses 0 \
 	"the result file is valid JSON even with quotes and backslashes in a label" \
-	--binary-a "$SLOW" --binary-b "$FAST" "${COMMON[@]}" \
+	--binary-a "$SLOW" --binary-b "$FAST" ${COMMON[@]+"${COMMON[@]}"} \
 	--label-a 'he said "fast"' --label-b 'back\slash' \
 	"GREP:result: "
 

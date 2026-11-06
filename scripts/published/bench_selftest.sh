@@ -1522,7 +1522,7 @@ payload_case() { # payload_case <name> <want-exit> <what-it-proves> <grep> <cell
     for c in "$@"; do cell_args+=(--cell "$c"); done
     python3 "${REPO_ROOT}/scripts/published/payloads.py" \
         --samples-root "${SAMPLES}" --out "${dir}" --model-id stub \
-        --index "${dir}/index.tsv" "${cell_args[@]}" >"${CASE_OUT}" 2>&1
+        --index "${dir}/index.tsv" ${cell_args[@]+"${cell_args[@]}"} >"${CASE_OUT}" 2>&1
     local got=$?
     CASE_BAD=""
     [ "${got}" -ne "${want}" ] && CASE_BAD="exit=${got} (want ${want})"
@@ -1539,6 +1539,11 @@ payload_case dataset_no_cell_measures_is_refused 1 \
     "a checked-in dataset no cell measures is refused, not skipped" \
     "which no cell measures" \
     mt_bench:1024 math_500:1024
+verdict
+
+payload_case no_cell_is_refused 2 \
+    "a run given no cell is refused, not rendered with none" \
+    "arguments are required: --cell"
 verdict
 
 payload_case every_dataset_covered_is_accepted 0 \

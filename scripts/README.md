@@ -261,8 +261,7 @@ section 3); that a code means what this table says is the reviewer's. [review]
   does not. Every `${NAME[@]}` and `${NAME[*]}`, quoted or not, outside a
   `${NAME[@]+...}` guard fails as `${NAME[@]}`, comments and single-quoted
   strings excepted. The fix is the guard `${NAME[@]+"${NAME[@]}"}`, or a
-  `${#NAME[@]}` test earlier on the same line (a count is not an expansion). The
-  files that expand one today are pinned with the array names.
+  `${#NAME[@]}` test earlier on the same line (a count is not an expansion).
   [gate: `unguarded-array`]
 
 ## 6. Use what `lib/` has

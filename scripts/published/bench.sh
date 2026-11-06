@@ -480,13 +480,13 @@ trap cleanup EXIT INT TERM
 
 CELL_INDEX="${WORK}/cells.tsv"
 CELL_ARGS=()
-for spec in "${CELLS[@]}"; do CELL_ARGS+=(--cell "${spec}"); done
+for spec in ${CELLS[@]+"${CELLS[@]}"}; do CELL_ARGS+=(--cell "${spec}"); done
 python3 "${REPO_ROOT}/scripts/published/payloads.py" \
     --samples-root "${SAMPLES_ROOT}" \
     --out "${WORK}/payloads" \
     --model-id "${MODEL_ID}" \
     --index "${CELL_INDEX}" \
-    "${CELL_ARGS[@]}" || exit 1
+    ${CELL_ARGS[@]+"${CELL_ARGS[@]}"} || exit 1
 
 REQUESTS_PER_PASS="$(wc -l < "${CELL_INDEX}" | tr -d ' ')"
 # Written beside the cells and outside the index: the warmup is a request, not a
@@ -666,7 +666,7 @@ start_server() {
     RMLX_HOME="${RMLX_HOME}" \
     RMLX_LOG_CAP_MB=400 \
     RUST_LOG="info,rmlx_server::engine::arch_generator=debug" \
-        "${BINARY}" "${args[@]}" \
+        "${BINARY}" ${args[@]+"${args[@]}"} \
         > "${WORK}/server_${tag}.txt" 2>&1 &
     SERVER_PID=$!
     echo "  [server] pid=${SERVER_PID}" >&2
@@ -891,7 +891,7 @@ print(json.dumps(json.load(open(sys.argv[1]))["sampling"], sort_keys=True))' \
     echo "  [pass ${pass}] host window: ${WINDOW}"
     if ! $SYNTHETIC_ARMS; then
         echo "  [pass ${pass}] thermal: $(printf '%s; ' \
-            "${THERMAL_READINGS[@]: -3}")"
+            ${THERMAL_READINGS[@]+"${THERMAL_READINGS[@]: -3}"})"
     fi
     echo ""
 done
@@ -968,7 +968,7 @@ print(json.load(open(sys.argv[1]))["ctx_max"])' "${LC_META}")"
         SERVER_PID=""
         sleep 3
     done
-    LONGCTX_REPORT_ARGS+=(--longctx "${label}" "${LC_RUNS[@]}")
+    LONGCTX_REPORT_ARGS+=(--longctx "${label}" ${LC_RUNS[@]+"${LC_RUNS[@]}"})
     echo ""
 done
 
@@ -982,7 +982,7 @@ GREEDY_REPORT_ARGS=()
 if $GREEDY_PASS; then
     echo "==> greedy pass: temperature 0, unstreamed, with logprobs"
     GREEDY_CELL_ARGS=()
-    for spec in "${CELLS[@]}"; do
+    for spec in ${CELLS[@]+"${CELLS[@]}"}; do
         [[ "${spec#*:}" == "${MACRO_MAX_TOKENS}" ]] && GREEDY_CELL_ARGS+=(--cell "${spec}")
     done
     GREEDY_INDEX="${WORK}/greedy_cells.tsv"
@@ -991,7 +991,7 @@ if $GREEDY_PASS; then
         --out "${WORK}/greedy_payloads" \
         --model-id "${MODEL_ID}" \
         --index "${GREEDY_INDEX}" \
-        "${GREEDY_CELL_ARGS[@]}" || exit 1
+        ${GREEDY_CELL_ARGS[@]+"${GREEDY_CELL_ARGS[@]}"} || exit 1
 
     GREEDY_DIR="${RUN_DIR}/greedy"
     mkdir -p "${GREEDY_DIR}/answers"
@@ -1074,7 +1074,7 @@ MACRO_MAX_TOKENS="${MACRO_MAX_TOKENS}" \
 UNVERIFIED_SAMPLES="${UNVERIFIED_SAMPLES}" \
 SAMPLES_ROOT="${SAMPLES_ROOT}" TAINT="${TAINT}" \
 BINARY_IDENTITY="${BINARY_IDENTITY}" TS_UTC="${TS_UTC}" \
-HOST_WINDOWS="$(printf '%s\n' "${HOST_WINDOWS[@]}")" \
+HOST_WINDOWS="$(printf '%s\n' ${HOST_WINDOWS[@]+"${HOST_WINDOWS[@]}"})" \
 THERMAL_READINGS="$(printf '%s\n' ${THERMAL_READINGS[@]+"${THERMAL_READINGS[@]}"})" \
 python3 - > "${META}" <<'PY'
 import json, os
@@ -1138,11 +1138,11 @@ PY
 RESULT="${RUN_DIR}/result.json"
 set +e
 python3 "${REPO_ROOT}/scripts/published/aggregate.py" report \
-    "${PASS_FILES[@]}" \
+    ${PASS_FILES[@]+"${PASS_FILES[@]}"} \
     --range-pct "${RANGE_REFUSAL_PCT}" \
     --macro-max-tokens "${MACRO_MAX_TOKENS}" \
     --meta "${META}" \
-    ${FIXED_FILES[0]+--fixed "${FIXED_FILES[@]}"} \
+    ${FIXED_FILES[@]+--fixed "${FIXED_FILES[@]}"} \
     ${LONGCTX_REPORT_ARGS[@]+"${LONGCTX_REPORT_ARGS[@]}"} \
     ${GREEDY_REPORT_ARGS[@]+"${GREEDY_REPORT_ARGS[@]}"} \
     --json "${RESULT}"

@@ -839,12 +839,12 @@ fi
 # median is taken over runs that were not answering the same question. Under a
 # sampler they may differ with nothing wrong, and then there is no comparison to
 # make; the row says so rather than looking like one that was compared.
-NORMAL_ANSWER="$(one_answer "${NORMAL_ANSWER_DIGESTS[@]}")"
+NORMAL_ANSWER="$(one_answer ${NORMAL_ANSWER_DIGESTS[@]+"${NORMAL_ANSWER_DIGESTS[@]}"})"
 if [[ "${NORMAL_SAMPLED}" == "true" ]]; then
     NORMAL_ANSWER_CHECK="sampled"
 elif [[ "${NORMAL_ANSWER}" == "varied" ]]; then
     echo "ERROR: normal: the ${MEASURED_RUNS} measured runs of the no-drafter arm" \
-         "answered differently from each other (${NORMAL_ANSWER_DIGESTS[*]}) on a" \
+         "answered differently from each other (${NORMAL_ANSWER_DIGESTS[*]+${NORMAL_ANSWER_DIGESTS[*]}}) on a" \
          "run the engine says it resolved no sampler for" >&2
     exit 1
 else
@@ -852,10 +852,10 @@ else
 fi
 echo "  [normal] answer_check=${NORMAL_ANSWER_CHECK} answer=${NORMAL_ANSWER}" >&2
 
-NORMAL_MEDIAN_TPS=$(median "${NORMAL_ENGINE_TPS_VALUES[@]}")
-NORMAL_STDDEV_TPS=$(stddev "${NORMAL_ENGINE_TPS_VALUES[@]}")
+NORMAL_MEDIAN_TPS=$(median ${NORMAL_ENGINE_TPS_VALUES[@]+"${NORMAL_ENGINE_TPS_VALUES[@]}"})
+NORMAL_STDDEV_TPS=$(stddev ${NORMAL_ENGINE_TPS_VALUES[@]+"${NORMAL_ENGINE_TPS_VALUES[@]}"})
 cross_check normal "${NORMAL_MEDIAN_TPS}" \
-    "$(median "${NORMAL_CLIENT_TPS_VALUES[@]}")"
+    "$(median ${NORMAL_CLIENT_TPS_VALUES[@]+"${NORMAL_CLIENT_TPS_VALUES[@]}"})"
 
 echo "  [normal] median_tps=${NORMAL_MEDIAN_TPS} stddev=${NORMAL_STDDEV_TPS}" >&2
 
@@ -891,7 +891,7 @@ judge_difference() {
     local verdict_block verdict status want_status stderr_file="${SCRATCH_DIR}/spec_answer_stderr.txt"
     if [[ "${MTP_ANSWER}" == "varied" ]]; then
         echo "ERROR: ${DRAFT_KIND}: the ${MEASURED_RUNS} measured runs answered differently" \
-             "from each other (${MTP_ANSWER_DIGESTS[*]}) and differently from the" \
+             "from each other (${MTP_ANSWER_DIGESTS[*]+${MTP_ANSWER_DIGESTS[*]}}) and differently from the" \
              "no-drafter arm (${NORMAL_ANSWER}), with no sampler on either arm; there is" \
              "no one speculative answer to judge" >&2
         exit 1
@@ -1114,7 +1114,7 @@ fi
 # before the median: a rate measured while answering something else is not a
 # faster answer to the same question, and `observations` is append-only, so a row
 # filed here cannot be taken back out.
-MTP_ANSWER="$(one_answer "${MTP_ANSWER_DIGESTS[@]}")"
+MTP_ANSWER="$(one_answer ${MTP_ANSWER_DIGESTS[@]+"${MTP_ANSWER_DIGESTS[@]}"})"
 MTP_ANSWER_NOTES=""
 if [[ "${MTP_SAMPLED}" == "true" || "${NORMAL_SAMPLED}" == "true" ]]; then
     MTP_ANSWER_CHECK="sampled"
@@ -1128,9 +1128,9 @@ else
 fi
 echo "  [spec] answer_check=${MTP_ANSWER_CHECK} answer=${MTP_ANSWER}" >&2
 
-MTP_MEDIAN_TPS=$(median "${MTP_ENGINE_TPS_VALUES[@]}")
-MTP_STDDEV_TPS=$(stddev "${MTP_ENGINE_TPS_VALUES[@]}")
-MTP_CLIENT_MEDIAN_TPS=$(median "${MTP_CLIENT_TPS_VALUES[@]}")
+MTP_MEDIAN_TPS=$(median ${MTP_ENGINE_TPS_VALUES[@]+"${MTP_ENGINE_TPS_VALUES[@]}"})
+MTP_STDDEV_TPS=$(stddev ${MTP_ENGINE_TPS_VALUES[@]+"${MTP_ENGINE_TPS_VALUES[@]}"})
+MTP_CLIENT_MEDIAN_TPS=$(median ${MTP_CLIENT_TPS_VALUES[@]+"${MTP_CLIENT_TPS_VALUES[@]}"})
 cross_check "${DRAFT_KIND}" "${MTP_MEDIAN_TPS}" "${MTP_CLIENT_MEDIAN_TPS}"
 
 echo "  [spec] median_tps=${MTP_MEDIAN_TPS} stddev=${MTP_STDDEV_TPS}" \

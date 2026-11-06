@@ -894,7 +894,7 @@ echo "seq,prompt_name,ssd_hits,ssd_bytes_used,ssd_evict_total,index_count,index_
 # EVICT_REQUEST_COUNT was set during the dynamic budget computation above;
 # it defaults to 8 to match the original canary spec.
 _evict_n="${EVICT_REQUEST_COUNT:-8}"
-EVICT_PROMPTS=("${ALL_PROMPTS[@]:0:${_evict_n}}")
+EVICT_PROMPTS=(${ALL_PROMPTS[@]+"${ALL_PROMPTS[@]:0:${_evict_n}}"})
 EVICT_FINAL_COUNT=0
 EVICT_FINAL_SUM_BYTES=0
 EVICT_FINAL_EVICT_TOTAL=0

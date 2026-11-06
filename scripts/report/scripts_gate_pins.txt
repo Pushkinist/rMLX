@@ -102,7 +102,7 @@ size report/kv_census_selftest.sh 1212
 size suite/run_gpu_tests.sh 1322
 size bench/serve_bench.sh 1223
 size published/bench.sh 1163
-size published/bench_selftest.sh 2825
+size published/bench_selftest.sh 2830
 size bench/serve_bench_selftest.sh 2104
 size bench/ssd_canary.sh 1267
 heredoc bench/llama_ab.sh 30,27
@@ -122,7 +122,7 @@ twin ingest/published_selftest.sh+published/table_selftest.sh 89
 twin ingest/published_selftest.sh+published/bench_selftest.sh 66
 twin bench/serve_bench_selftest.sh+ingest/published_selftest.sh 68
 twin published/bench_selftest.sh+published/table_selftest.sh 82
-twin bench/serve_bench_selftest.sh+published/table_selftest.sh 80
+twin bench/serve_bench_selftest.sh+published/table_selftest.sh 81
 twin bench/serve_bench.sh+published/bench.sh 51
 twin bench/serve_bench.sh+bench/ssd_canary.sh 98
 twin bench/serve_bench_selftest.sh+published/bench_selftest.sh 202
@@ -152,11 +152,3 @@ env-knob published/bench.sh KV_QUANT_SEEN,MEMORY_PID,RMLX_HOME,SAMPLING_SEEN,SER
 env-knob bench/serve_bench_selftest.sh OUT_PATH
 env-knob bench/ssd_canary.sh PORT,SSD_GB,VERIFIER_MODEL
 env-knob lib/rmlx_home.py RMLX_HOME
-unguarded-array published/samples_selftest.sh args
-unguarded-array bench/ab.sh A_KV,A_MEM,A_TPS,B_KV,B_MEM,B_TPS,MODELS,record
-unguarded-array bench/ab_selftest.sh COMMON
-unguarded-array published/table_selftest.sh inputs
-unguarded-array bench/serve_bench.sh MTP_ANSWER_DIGESTS,MTP_CLIENT_TPS_VALUES,MTP_ENGINE_TPS_VALUES,NORMAL_ANSWER_DIGESTS,NORMAL_CLIENT_TPS_VALUES,NORMAL_ENGINE_TPS_VALUES
-unguarded-array published/bench.sh CELLS,CELL_ARGS,FIXED_FILES,GREEDY_CELL_ARGS,HOST_WINDOWS,LC_RUNS,PASS_FILES,THERMAL_READINGS,args
-unguarded-array published/bench_selftest.sh cell_args
-unguarded-array bench/ssd_canary.sh ALL_PROMPTS

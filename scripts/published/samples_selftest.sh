@@ -113,7 +113,7 @@ judge() {
 	local -a args=(verify --root "${dir}")
 	[ -n "${with_sources}" ] && args+=(--sources "${dir}/upstream")
 	set +e
-	python3 "${dir}/samples.py" "${args[@]}" >"${out}" 2>&1
+	python3 "${dir}/samples.py" ${args[@]+"${args[@]}"} >"${out}" 2>&1
 	got=$?
 	set -e
 	local bad=""

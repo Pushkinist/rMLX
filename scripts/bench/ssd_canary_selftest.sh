@@ -1022,6 +1022,21 @@ else
     fail "binary-flag-not-executable: the refusal names another path: $(head -1 "$WORK/binary-flag-not-executable/run.out")"
 fi
 
+# A prompt directory with no prompt file ends the setup with 1, before a server starts.
+noprompts="$WORK/no-prompts"
+mkdir -p "$noprompts/home" "$noprompts/tmp" "$noprompts/log"
+make_tree "$noprompts/tree"
+/bin/rm -f "$noprompts"/tree/prompts/ssd_bench/*.json
+seed_root "$noprompts/tree/.rmlx"
+run_env "$noprompts" "$noprompts" "VERIFIER_MODEL=$noprompts/tree/models/stub-ns__stub-model-8bit" "PORT=$(free_port)" -- \
+    bash "$noprompts/tree/scripts/bench/ssd_canary.sh" --ssd-gb 100 >"$noprompts/out" 2>&1
+rc=$?
+if [[ $rc -eq 1 ]] && grep -qF 'ERROR: expected >= 20 prompts, found 0' "$noprompts/out" && [[ ! -s "$noprompts/log/serve.log" ]]; then
+    pass "no-prompts: exits 1 naming the empty prompt list, no server started"
+else
+    fail "no-prompts: exited $rc: $(tail -1 "$noprompts/out")"
+fi
+
 # --tag was parsed and never read; it is refused rather than silently dropped.
 tag_dir="$WORK/tag"
 mkdir -p "$tag_dir/home" "$tag_dir/tmp" "$tag_dir/log"

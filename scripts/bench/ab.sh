@@ -513,7 +513,7 @@ run_slot() {
 			--max-tokens "$MAX_TOKENS" \
 			--max-ctx "$MAX_CTX" \
 			--emit-token-ids \
-			"${record[@]}" \
+			${record[@]+"${record[@]}"} \
 			$extra \
 			>"$raw" 2>"${raw}.err"
 	}; } 2>&1 )" || slot_rc=$?
@@ -794,7 +794,7 @@ fi
 OVERALL_EXIT=0
 JSON_MODELS=""
 
-for model in "${MODELS[@]}"; do
+for model in ${MODELS[@]+"${MODELS[@]}"}; do
 	short="$(basename "$model")"
 	if [[ ! -d "$model" ]]; then
 		echo "ERROR: model path not found: $model" >&2
@@ -946,12 +946,12 @@ for model in "${MODELS[@]}"; do
 		exit 125
 	fi
 
-	read -r A_MED A_SD A_MIN A_MAX A_N <<<"$(summarise "${A_TPS[@]}")"
-	read -r B_MED B_SD B_MIN B_MAX B_N <<<"$(summarise "${B_TPS[@]}")"
-	read -r AM_MED _ _ _ _ <<<"$(summarise "${A_MEM[@]}")"
-	read -r BM_MED _ _ _ _ <<<"$(summarise "${B_MEM[@]}")"
-	AK_MED="$(kv_arm_bytes "${A_KV[@]}")"
-	BK_MED="$(kv_arm_bytes "${B_KV[@]}")"
+	read -r A_MED A_SD A_MIN A_MAX A_N <<<"$(summarise ${A_TPS[@]+"${A_TPS[@]}"})"
+	read -r B_MED B_SD B_MIN B_MAX B_N <<<"$(summarise ${B_TPS[@]+"${B_TPS[@]}"})"
+	read -r AM_MED _ _ _ _ <<<"$(summarise ${A_MEM[@]+"${A_MEM[@]}"})"
+	read -r BM_MED _ _ _ _ <<<"$(summarise ${B_MEM[@]+"${B_MEM[@]}"})"
+	AK_MED="$(kv_arm_bytes ${A_KV[@]+"${A_KV[@]}"})"
+	BK_MED="$(kv_arm_bytes ${B_KV[@]+"${B_KV[@]}"})"
 	if [[ "$AK_MED" == "n/a" || "$BK_MED" == "n/a" ]]; then
 		KV_RATIO="n/a"
 	else
@@ -1007,11 +1007,11 @@ for model in "${MODELS[@]}"; do
      "prompt_tokens": $MODEL_PTOK,
      "arm_a": {"label": "$(json_str "$LABEL_A")", "median_tps": $A_MED, "sd_tps": $A_SD, "min_tps": $A_MIN, "max_tps": $A_MAX, "n": $A_N, "median_gen_alloc_mb": $AM_MED, "median_kv_cache_bytes": $(json_num "$AK_MED"), "tps": [$(
 			IFS=,
-			echo "${A_TPS[*]}"
+			echo "${A_TPS[*]+${A_TPS[*]}}"
 		)]},
      "arm_b": {"label": "$(json_str "$LABEL_B")", "median_tps": $B_MED, "sd_tps": $B_SD, "min_tps": $B_MIN, "max_tps": $B_MAX, "n": $B_N, "median_gen_alloc_mb": $BM_MED, "median_kv_cache_bytes": $(json_num "$BK_MED"), "tps": [$(
 			IFS=,
-			echo "${B_TPS[*]}"
+			echo "${B_TPS[*]+${B_TPS[*]}}"
 		)]},
      "ratio_b_over_a": $RATIO,
      "kv_cache_ratio_b_over_a": $(json_num "$KV_RATIO"),
