@@ -11,14 +11,11 @@
 # Never pin a new file, a new member or a larger measure.
 #
 # pinnable: class purpose usage exit-undeclared caller recall-missing silenced lib-consumers lib-run shebang exec-bit dead-path set-mode name size heredoc twin lib-shadow binary-literal env-knob unguarded-array
-class bench_identity_selftest.sh
 class run_class_selftest.sh
-purpose bench_identity_selftest.sh
 purpose bench/codec_matrix/runner_selftest.sh
 purpose bench/prefill_chunk_sweep.sh
 purpose lib/record_pending.sh
 purpose run_class_selftest.sh
-usage bench_identity_selftest.sh
 usage bench/llama_ab.sh
 usage bench/llama_ab_selftest.sh
 usage check/eval_lock.sh
@@ -45,7 +42,6 @@ usage spec/round_stream_compare.py
 usage spec/round_stream_compare_selftest.sh
 usage run_class_selftest.sh
 exit-undeclared profile/aggregate_decode_profile.py 2
-exit-undeclared bench_identity_selftest.sh 1
 exit-undeclared bench/llama_ab.sh 0,4,125
 exit-undeclared bench/llama_ab_selftest.sh 1
 exit-undeclared check/eval_lock.sh 1
@@ -71,7 +67,6 @@ caller gen/lloyd_codebook.py
 caller bench/codec_matrix/niah_long_context.sh
 caller bench/sdpa_headdim.py
 caller spec/broken_engine.sh
-recall-missing bench_identity_selftest.sh default
 recall-missing bench/llama_ab_selftest.sh default
 recall-missing bench/codec_matrix/runner_selftest.sh default
 recall-missing run_class_selftest.sh default
@@ -87,10 +82,8 @@ lib-run lib/spec_round_log.py bench/serve_bench.sh
 lib-run lib/sse_decode_window.py bench/serve_bench.sh,bench/serve_bench_selftest.sh,published/bench.sh
 shebang lib/snapshot_identity.py
 shebang lib/record_pending.sh
-exec-bit bench_identity_selftest.sh
 exec-bit profile/perf_ceiling.py
 set-mode bench/cross_backend.sh
-set-mode bench_identity_selftest.sh
 set-mode bench/llama_ab.sh
 set-mode bench/llama_ab_selftest.sh
 set-mode check/gpu_device_census.sh
@@ -164,7 +157,6 @@ env-knob bench/serve_bench.sh PORT,RMLX_HARDWARE_TAG,RMLX_HOME
 env-knob published/bench.sh KV_QUANT_SEEN,MEMORY_PID,RMLX_HOME,SAMPLING_SEEN,SERVER_PID
 env-knob bench/serve_bench_selftest.sh OUT_PATH
 env-knob bench/ssd_canary.sh PORT,SSD_GB,VERIFIER_MODEL
-env-knob bench_identity_selftest.sh STUB_CRASH_MEASURED,STUB_FAIL_GATE,STUB_FAIL_MEASURED,STUB_TURBO_NO_TPS
 env-knob lib/rmlx_home.py RMLX_HOME
 unguarded-array published/samples_selftest.sh args
 unguarded-array bench/ab.sh A_KV,A_MEM,A_TPS,B_KV,B_MEM,B_TPS,MODELS,record

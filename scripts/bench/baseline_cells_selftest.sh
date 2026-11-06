@@ -11,6 +11,12 @@
 # for the cache-types matrix the argv of every smoke and measured run, each cell's record, the
 # summary rows, every smoke rejection, the resolver skip and the pending smoke record.
 #
+# It also drives lib/identity.sh: the git_sha of a run identity, its refusals and its normalisation;
+# and the canary's commit and run-log sources: the filed sha is the identity's, and the codec is read
+# from the run log the probe wrote, also when another process shares that log.
+#
+# LOC-exempt: one recall test of one tool and the identity library it reads, a flat list of cases over one shared stub
+#
 # Usage:  bash scripts/bench/baseline_cells_selftest.sh
 # Exit:   0 every case held; 1 a case did not, or none ran; 2 a fixture could not be built
 
@@ -210,6 +216,37 @@ csv_rows() {
 	sed 1d "$1/bench/perf_canary.csv" | cut -d, -f2-
 }
 
+# ── lib/identity.sh ───────────────────────────────────────────────────────────
+
+# identity_sha <identity-json> — rmlx_git_sha against the fake root; prints
+# `<status>|<stdout>|<stderr>`.
+identity_sha() {
+	local out status=0
+	out="$(RMLX_IDENTITY_JSON="$1" bash -c '. "$1/scripts/lib/identity.sh"; rmlx_git_sha "$2"' \
+		_ "$REPO_ROOT" "$FAKE" 2>"$ST_WORK/identity.err")" || status=$?
+	printf '%s|%s|%s' "$status" "$out" "$(cat "$ST_WORK/identity.err")"
+}
+
+HEAD_FULL="$(git -C "$FAKE" rev-parse HEAD)"
+
+WANT_REFUSAL='1||rmlx_identity_git_sha: RMLX_IDENTITY_JSON is not a JSON object'
+got="$(identity_sha 'not json')"
+st_verdict identity_refuses_invalid_json "$([ "$got" = "$WANT_REFUSAL" ] || echo "got [$got]")" "invalid JSON is refused in one line, no traceback"
+got="$(identity_sha '[1]')"
+st_verdict identity_refuses_non_object "$([ "$got" = "$WANT_REFUSAL" ] || echo "got [$got]")" "a JSON array is refused in one line, no traceback"
+
+got="$(identity_sha "{$BASE_IDENTITY,\"git_sha\":\"unknown-dirty\"}")"
+st_verdict identity_unknown_is_absent "$([ "$got" = "0|$HEAD_SHA|" ] || echo "got $got (want 0|$HEAD_SHA|)")" "an 'unknown...' git_sha is not a commit; HEAD is the fallback"
+
+got="$(identity_sha "{$BASE_IDENTITY,\"git_sha\":\"$HEAD_FULL\"}")"
+st_verdict identity_full_sha_is_shortened "$([ "$got" = "0|$HEAD_SHA|" ] || echo "got $got (want 0|$HEAD_SHA|)")" "a resolvable sha is filed in the short form HEAD is filed in"
+
+got="$(identity_sha "{$BASE_IDENTITY,\"git_sha\":\"deadbeefcafe\"}")"
+st_verdict identity_unresolvable_is_verbatim "$([ "$got" = "0|deadbeefcafe|" ] || echo "got $got (want 0|deadbeefcafe|)")" "a hex sha that resolves nowhere is kept as given"
+
+got="$(identity_sha "{$BASE_IDENTITY}")"
+st_verdict identity_without_sha_uses_head "$([ "$got" = "0|$HEAD_SHA|" ] || echo "got $got (want 0|$HEAD_SHA|)")" "an identity with no git_sha leaves HEAD"
+
 # ── the canary preset ─────────────────────────────────────────────────────────
 
 # Call numbers of one model: 1 warmup, 2-4 measured, 5 codec probe, 6 gate record,
@@ -247,11 +284,12 @@ control "$home" identity.json "{$BASE_IDENTITY,\"git_sha\":\"feedbee\"}"
 run_tool "$home" "$FAKE" --preset canary --models-root "$MODELS"
 why="$(st_check 0)"
 want "csv git_sha" "$(csv_rows "$home" | head -1 | cut -d, -f1)" feedbee
+want "csv kv_quant" "$(csv_rows "$home" | head -1 | cut -d, -f3)" stubq
 want "runs given --git-sha feedbee" "$(argv_lines_with "$home/baseline_argv" "--git-sha feedbee")" 9
 want "runs labelled with it" "$(argv_lines_with "$home/baseline_argv" "--label canary sha=feedbee")" 9
 want "diagnostic records" "$(argv_lines_with "$home/baseline_argv" "--record --run-class diagnostic")" 8
 want "gate records" "$(argv_lines_with "$home/baseline_argv" "--record --run-class gate")" 1
-st_verdict canary_identity_sha "$why" "the canary files the identity's commit and records 8 diagnostic runs and 1 gate run"
+st_verdict canary_identity_sha "$why" "the canary files the identity's commit, reads the codec from the probe's log, and records 8 diagnostic runs and 1 gate run"
 
 home="$(new_home canary_same_second_log)"
 control "$home" shared_log 20260903-000000-9.9.9.jsonl
@@ -260,6 +298,7 @@ printf '%s\n' '{"timestamp":"2026-09-03T00:00:00Z","level":"INFO","fields":{"mes
 	>"$home/logs/20260903-000000-9.9.9.jsonl"
 run_tool "$home" "$FAKE" --preset canary --models-root "$MODELS"
 why="$(st_check 0)"
+want "csv git_sha" "$(csv_rows "$home" | head -1 | cut -d, -f1)" "$HEAD_SHA"
 want "csv kv_quant" "$(csv_rows "$home" | head -1 | cut -d, -f3)" stubq
 st_verdict canary_same_second_log "$why" "a probe that appends to an earlier process's log is attributed by pid"
 

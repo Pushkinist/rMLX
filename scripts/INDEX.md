@@ -8,7 +8,6 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
-| `bench_identity_selftest.sh` | make bench-identity-selftest | bench_identity_selftest.sh — mutation check for the commit and run-log sources |
 | `run_class_selftest.sh` | make run-class-selftest | run_class_selftest.sh — the producers that run `rmlx` record their runs under |
 
 ## scripts/bench/
@@ -107,7 +106,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/bench_server.sh` | bench/baseline_cells.sh, bench/cross_backend.sh, bench/serve_bench.sh, +1 more scripts | Start, wait for and identify one rmlx server, for bench harnesses; source it. |
 | `lib/busiest_between.awk` | bench/ab.sh, bench/ab_selftest.sh, bench/llama_ab.sh, +2 more scripts | Which process burned the most CPU between two cpu_snapshot files. |
 | `lib/cpu_snapshot.sh` | bench/ab.sh, bench/ab_selftest.sh, bench/llama_ab.sh, +2 more scripts | Per-process cumulative CPU seconds, for interference gates; source it. |
-| `lib/identity.sh` | bench/ab.sh, bench/baseline_cells.sh, bench/codec_matrix/niah_long_context.sh, +14 more scripts | Shared §8.5 run-identity for rMLX bench scripts. |
+| `lib/identity.sh` | bench/ab.sh, bench/baseline_cells.sh, bench/codec_matrix/niah_long_context.sh, +13 more scripts | Shared §8.5 run-identity for rMLX bench scripts. |
 | `lib/kv_boundary_default.py` | ingest/ingest.py | The engine's default KV boundary-layer counts, read from the engine. |
 | `lib/metal_dirs.sh` | check/kernel_dispatch.sh, check/metal_kernels.sh, check/metal_kernels_selftest.sh, +1 more scripts | The directories holding gated .metal kernels; sourced by the metal gates. |
 | `lib/mlx_pin.sh` | crates/rmlx-mlx/src/pin_tests.rs, host/mlx_restore_pin.sh | Read the validated MLX / mlx-c pair from its one declaration. |
