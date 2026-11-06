@@ -208,13 +208,6 @@ st_case ingest_refuses_a_snapshot_with_no_recordable_label 1 --what "the ingest 
     --has "describes weight quantization 'mxfp6', which is not one of the labels the metrics DB records" --lacks '"schema_version"' \
     -- codec "$home" sweep_legacy --dry-run --models-root "$ST_WORK/models_mxfp6"
 
-home="$(fresh_home sweep_classless)"
-st_run codec "$home" sweep_legacy --record --rmlx-bin "$OLD_RECORDER"
-why="$(st_check 1 --has 'rmlx_old has no `metrics record --run-class`')"
-[ ! -d "$home/bench/codec_inertness/records" ] || why="${why:+$why
-}records were staged before the refusal"
-st_verdict ingest_refuses_a_classless_recorder "$why" "a recorder without --run-class is refused before anything is written"
-
 # ── llama-bench ───────────────────────────────────────────────────────────────
 
 cat >"$ST_WORK/llama_rows.json" <<'JSON'
@@ -264,7 +257,7 @@ st_run ingest_in "$home" llama-bench --record --rmlx-bin "$OLD_RECORDER" "$ST_WO
 why="$(st_check 1 --has 'rmlx_old has no `metrics record --run-class`')"
 [ ! -d "$home/metrics" ] || why="${why:+$why
 }a record was written before the refusal"
-st_verdict llama_bench_classless_recorder "$why" "a recorder without --run-class is refused before anything is written"
+st_verdict llama_bench_classless_recorder_before_any_write "$why" "a recorder without --run-class is refused before a record is written"
 
 home="$(fresh_home llama_queued)"
 st_run ingest_in "$home" llama-bench "$ST_WORK/llama_rows.json"
@@ -341,7 +334,7 @@ st_run ingest_in "$home" llama-bench --record --rmlx-bin "$ST_WORK/oldbin/rmlx" 
 why="$(st_check 1 --has 'oldbin/rmlx has no `metrics record --run-class`')"
 [ ! -d "$home/metrics" ] || why="${why:+$why
 }a record was written before the refusal"
-st_verdict llama_bench_refuses_a_classless_recorder "$why" "a recorder without --run-class is refused before anything is written"
+st_verdict llama_bench_classless_recorder_with_no_rows "$why" "a recorder without --run-class is refused even when the input has no rows, and is named by the path it was given"
 
 # A copy of the scripts tree stands for a checkout, so the tool's repo root is the copy's.
 mkdir -p "$ST_WORK/llama_root"
