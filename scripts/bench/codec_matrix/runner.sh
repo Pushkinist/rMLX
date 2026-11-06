@@ -466,7 +466,7 @@ while IFS=$'\t' read -r CODEC MODEL CTX EXPECTED PROMPTS_CSV SKIP CLI_ARGS NIAH_
 
         # The log echoes the prompt, which can satisfy a validate_regex; only the decoded text is judged.
         DECODED_FILE="$(mktemp -t rmlx-smoke-decoded.XXXXXX)"
-        if ! python3 "$REPO_ROOT/scripts/bench/codec_matrix/decoded_field.py" <"$OUTPUT_FILE" >"$DECODED_FILE"; then
+        if ! "$PYTHON3" "$REPO_ROOT/scripts/bench/codec_matrix/decoded_field.py" <"$OUTPUT_FILE" >"$DECODED_FILE"; then
             SMOKE_VERDICT="fail"
             SMOKE_FAIL_PROMPT="$PNAME:no_decoded_field"
             log_evt error "smoke_fail codec=$CODEC model=$MODEL prompt=$PNAME reason=no_decoded_field"

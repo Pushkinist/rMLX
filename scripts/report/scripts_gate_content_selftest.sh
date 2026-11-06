@@ -987,6 +987,14 @@ EOF
 verdict env_knob_not_a_read 0 "lower case, a parameter, a comment, a heredoc and the system names" "$root" \
     --has "check-scripts: ok (5 files"
 
+root=$(sg_fresh env_awk_field)
+sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
+last="$(awk '{ print $NF }' /dev/null)"
+: "${KNOB_A:-x}"
+EOF
+verdict env_knob_awk_field_is_not_a_read 1 "an awk field in single quotes inside a double-quoted substitution is no read; a real read beside it is" "$root" \
+    --has "env-knob: check/y.sh:11: reads the environment variable KNOB_A" --lacks "variable NF"
+
 root=$(sg_fresh env_assigned)
 sh_entry "$root" check/y.sh 'set -euo pipefail' <<'EOF'
 KNOB_A=1

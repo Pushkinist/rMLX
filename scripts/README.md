@@ -147,7 +147,8 @@ comment):
   `dead-path` reads it as the repository's (section 7): at the start of the word
   or behind a repository-root expression, so `/opt/x/scripts/check/c.sh` and
   `../scripts/check/c.sh` run no file of this tree. Text in single quotes is no command, and a `$( )` inside
-  single quotes runs nothing. A Python file runs a file through a command vector passed
+  single quotes runs nothing. A variable in command position given a `.py` path
+  (`"$PYTHON3" x.py`) runs that file. A Python file runs a file through a command vector passed
   to a call, or through a name bound to the path (a string, or `Path(__file__)`
   arithmetic) and passed as the program of a `subprocess` call; a name that is
   only printed is no caller. It imports a module with `import`. A hosted-CI
@@ -470,7 +471,7 @@ accepts every violation of that rule in that file and can only shrink. [gate]
   `fail 9`). No file in the tree uses the second form today; a new one hides
   its exits from `exit-undeclared`.
 * A script run through a path the gate cannot read: an interpreter held in a
-  variable, `python3 -m`, a Rust path built from `.join("scripts").join(..)`
+  variable and given no `.py` path, `python3 -m`, a Rust path built from `.join("scripts").join(..)`
   pieces or held in a `const` or a variable and passed to `Command::new`, a
   shell path assembled from fragments. A file only such a path runs reads as
   having no caller, which fails closed.

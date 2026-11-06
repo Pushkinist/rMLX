@@ -74,6 +74,8 @@ def clean_shell(text: str, blank_strings: bool, join: bool = False, blank_single
         if quote == '"' and c == "$" and text[i + 1 : i + 2] == "(":
             end = skip_substitution(text, i)
             segment = text[i:end].replace("\\\n", " ") if join else text[i:end]
+            if blank_single:
+                segment = blank_single_quoted(segment)
             for ch in segment:
                 if ch != "\n":
                     out.append(" " if blank_strings else ch)
@@ -156,6 +158,31 @@ def arithmetic_spans(line: str) -> list[tuple[int, int]]:
             spans.append((i, end))
         i = line.find("((", max(end, i + 1))
     return spans
+
+
+def blank_single_quoted(segment: str) -> str:
+    """`segment` with the bodies of its single-quoted strings blanked, newlines
+    kept. A single quote inside a double-quoted string is text."""
+    out: list[str] = []
+    quote = ""
+    escaped = False
+    for ch in segment:
+        if quote == "'":
+            out.append(ch if ch in "'\n" else " ")
+            if ch == "'":
+                quote = ""
+            continue
+        out.append(ch)
+        if escaped:
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "'\"":
+            quote = ch
+    return "".join(out)
 
 
 def skip_substitution(text: str, i: int) -> int:
@@ -413,6 +440,8 @@ def command_words(words: list[str]) -> tuple[list[str], list[str], list[str], li
             (source if base in SOURCING else run).extend(interpreter_target(words[i + 1 :], base))
         else:
             run.append(w)
+            if VAR_RE.match(w):
+                run.extend(t for t in interpreter_target(words[i + 1 :], base) if t.endswith(".py"))
         break
     return run, source, list(words), assigned
 

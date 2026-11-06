@@ -226,6 +226,17 @@ trace_cargo escaped_quote 'INFO baseline: decoded preview decoded="it was \"red\
 GATE_BIN="$FAKE/bin_escaped_quote" gate_case gate_smoke_escaped_quote 0 "a decoded text is read past an escaped quote" \
     true "$WORK/g_smoke_seed.toml" "" "niah_pass" "!smoke_fail"
 
+# A host with a versioned python on PATH and no `python3`: the smoke reads the log with the interpreter the runner chose.
+for REAL_PYTHON in python3.14 python3.13 python3.12 python3.11; do
+    REAL_PYTHON="$(command -v "$REAL_PYTHON")" && break
+done
+trace_cargo no_python3 'INFO baseline: decoded preview decoded="it was \"red\" indeed"'
+printf '#!/bin/sh\nexit 127\n' >"$FAKE/bin_no_python3/python3"
+chmod +x "$FAKE/bin_no_python3/python3"
+ln -s "$REAL_PYTHON" "$FAKE/bin_no_python3/python3.11"
+GATE_BIN="$FAKE/bin_no_python3" gate_case gate_smoke_without_python3 0 "the smoke reads the decoded text with the runner's interpreter when PATH has no python3" \
+    true "$WORK/g_smoke_seed.toml" "" "niah_pass" "!smoke_fail"
+
 trace_cargo empty_text 'INFO baseline: decoded preview decoded=""'
 GATE_BIN="$FAKE/bin_empty_text" gate_case gate_smoke_empty_text 1 "an empty decoded text fails the smoke as empty output" \
     true "$WORK/g_smoke_seed.toml" "" "smoke_fail" "reason=validate" "fail: empty output" "!niah_pass"

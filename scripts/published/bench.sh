@@ -262,7 +262,9 @@ SAMPLES_ROOT=""
 ALLOW_BUSY_HOST=false
 GREEDY_PASS=false
 GREEDY_AGAINST=""
-LONGCTX_SIZES=(); SERVER_PID=""; MEMORY_PID=""
+LONGCTX_SIZES=()
+SERVER_PID=""
+MEMORY_PID=""
 SYNTHETIC_ARMS=false
 # Which clock times the stream at the client. `client` is the only value a
 # measurement can have; `--server-stamps` is for a stub that stamps its chunks.
@@ -721,7 +723,9 @@ else
     echo ""
 fi
 
-HOST_WINDOWS=(); KV_QUANT_SEEN=""; SAMPLING_SEEN=""
+HOST_WINDOWS=()
+KV_QUANT_SEEN=""
+SAMPLING_SEEN=""
 FIXED_FILES=()
 
 for (( pass = 1; pass <= PASSES; pass++ )); do

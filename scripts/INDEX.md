@@ -17,7 +17,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `bench/cross_backend_selftest.sh` | make cross-backend-selftest | Recall test for the cross-backend cell tool: the codec name it files, where its files go, its exits |
 | `bench/llama_ab.sh` | bench/llama_ab_selftest.sh | bench/llama_ab.sh — ABBA-interleaved A/B comparison of two `llama-server` arms. |
 | `bench/llama_ab_selftest.sh` | make llama-ab-selftest | bench/llama_ab_selftest.sh — mutation check for `scripts/bench/llama_ab.sh`. |
-| `bench/prefill_chunk_sweep.sh` | bench/prefill_chunk_sweep_selftest.sh | prefill_chunk_sweep.sh — Latin-square sweep of one architecture's prefill |
+| `bench/prefill_chunk_sweep.sh` | bench/prefill_chunk_sweep_selftest.sh | Latin-square sweep of one architecture's prefill chunk over levels and prompt lengths |
 | `bench/prefill_chunk_sweep_selftest.sh` | make prefill-chunk-sweep-selftest | Recall test for the prefill-chunk sweep: slot order, env name, records, paired verdict, exits |
 | `bench/schema_constraint_canary.sh` | make schema-constraint-canary | Real-model proof for the json_schema constrained-decoding path: two probes, two architectures. |
 | `bench/sdpa_headdim.py` | none | What MLX's SDPA dispatch costs as a function of `head_dim`. |

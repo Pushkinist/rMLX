@@ -2073,6 +2073,20 @@ sg_reindex "$root"
 st_case module_of_through_another_module 0 --what "the tool imports mid, mid imports leaf: both are its modules" \
     --has "check-scripts: ok (6 files" -- sg_gate "$root"
 
+root=$(sg_fresh modof_variable_interpreter)
+mod_py check/ok.sh | sg_put "$root" report/m.py
+printf '%s\n' 'PY=python3' '"$PY" scripts/report/m.py' >>"$root/scripts/check/ok.sh"
+sg_reindex "$root"
+st_case module_of_run_by_interpreter_variable 0 --what "an interpreter held in a variable that is given the module's path runs it" \
+    --has "check-scripts: ok (" -- sg_gate "$root"
+
+root=$(sg_fresh modof_variable_command)
+mod_py check/ok.sh | sg_put "$root" report/m.py
+printf '%s\n' 'CMD=ls' '"$CMD" scripts/report' >>"$root/scripts/check/ok.sh"
+sg_reindex "$root"
+st_case module_of_variable_command_not_given_a_python_file 1 --what "a variable command given no .py path runs no module" \
+    --has "module-of: report/m.py:3: check/ok.sh does not run, source or import it" -- sg_gate "$root"
+
 root=$(sg_fresh modof_directory)
 mod_py report | sg_put "$root" report/m.py
 sg_reindex "$root"
@@ -2616,9 +2630,9 @@ END {
 }' "$REPO_ROOT/scripts/report/scripts_gate_pins.txt"
 }
 st_case real_tree_pin_totals 0 --what "the checked-in pin file holds exactly these member totals and figure sums" \
-    --is "$(printf '%s\n%s' 'members: exit-undeclared 32, recall-missing 2, silenced 3, lib-run 11, dead-path 0, name 5, lib-shadow 0, env-knob 35, unguarded-array 0' 'figures: size 14912, heredoc 1145, twin 780, binary-literal 2')" -- pin_totals
+    --is "$(printf '%s\n%s' 'members: exit-undeclared 30, recall-missing 2, silenced 3, lib-run 11, dead-path 0, name 5, lib-shadow 0, env-knob 35, unguarded-array 0' 'figures: size 14916, heredoc 1145, twin 780, binary-literal 2')" -- pin_totals
 st_case real_tree 0 --what "the checked-in tree passes with exactly these pins" \
-    --has "pinned: purpose 3, usage 24, exit-undeclared 19, caller 5, recall-missing 2, silenced 2, lib-consumers 1, lib-run 7, shebang 2, exec-bit 1, set-mode 11, name 5, size 10, heredoc 12, twin 9, binary-literal 1, env-knob 19" \
-    --has "133 pinned)" -- sg_gate "$REPO_ROOT"
+    --has "pinned: purpose 2, usage 23, exit-undeclared 18, caller 5, recall-missing 2, silenced 2, lib-consumers 1, lib-run 7, shebang 2, exec-bit 1, set-mode 11, name 5, size 10, heredoc 12, twin 9, binary-literal 1, env-knob 19" \
+    --has "130 pinned)" -- sg_gate "$REPO_ROOT"
 
 st_done

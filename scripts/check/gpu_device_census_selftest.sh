@@ -20,6 +20,8 @@ GATE="$REPO_ROOT/scripts/check/gpu_device_census.sh"
 # shellcheck source=scripts/lib/selftest_support.sh
 . "$REPO_ROOT/scripts/lib/selftest_support.sh"
 st_init check-gpu-device-census-selftest
+# The gate prints a path under the repository relative to it, so a scratch dir inside the tree is labelled so too.
+LABEL="${ST_WORK#"$REPO_ROOT"/}"
 
 # fresh <name> [none]: a scan root holding the one legitimate site, or, with
 # `none`, the same file with the site removed.
@@ -152,17 +154,17 @@ lib_root() {
 
 # name ~ x.rs body ~ want-exit ~ needle
 LIB_CASES=(
-    "lib_let_value~use rmlx_mlx::Device;\n    let d = Device::Gpu;\n~1~gpu-value: $ST_WORK/lib_lib_let_value/x.rs:2:"
-    "lib_argument~    let w = w.transpose(&[0, 2, 1], Device::Gpu)?;\n~1~gpu-value: $ST_WORK/lib_lib_argument/x.rs:1:"
-    "lib_full_path~    let device = rmlx_mlx::Device::Gpu;\n~1~gpu-value: $ST_WORK/lib_lib_full_path/x.rs:1:"
-    "lib_field~    Cfg {\n        device: Device::Gpu,\n    }\n~1~gpu-value: $ST_WORK/lib_lib_field/x.rs:2:"
-    "lib_argument_list~    run_smoke_probe(\n        path,\n        rmlx_mlx::Device::Gpu,\n    )\n~1~gpu-value: $ST_WORK/lib_lib_argument_list/x.rs:3:"
+    "lib_let_value~use rmlx_mlx::Device;\n    let d = Device::Gpu;\n~1~gpu-value: $LABEL/lib_lib_let_value/x.rs:2:"
+    "lib_argument~    let w = w.transpose(&[0, 2, 1], Device::Gpu)?;\n~1~gpu-value: $LABEL/lib_lib_argument/x.rs:1:"
+    "lib_full_path~    let device = rmlx_mlx::Device::Gpu;\n~1~gpu-value: $LABEL/lib_lib_full_path/x.rs:1:"
+    "lib_field~    Cfg {\n        device: Device::Gpu,\n    }\n~1~gpu-value: $LABEL/lib_lib_field/x.rs:2:"
+    "lib_argument_list~    run_smoke_probe(\n        path,\n        rmlx_mlx::Device::Gpu,\n    )\n~1~gpu-value: $LABEL/lib_lib_argument_list/x.rs:3:"
     "lib_value_beside_compare~    let d = if x == Device::Gpu { Device::Gpu } else { Device::Cpu };\n~1~1 value site(s)"
-    "lib_cfg_test_fn_in_source~#[cfg(test)]\nfn gpu() -> Device {\n    Device::Gpu\n}\n~1~gpu-value: $ST_WORK/lib_lib_cfg_test_fn_in_source/x.rs:3:"
+    "lib_cfg_test_fn_in_source~#[cfg(test)]\nfn gpu() -> Device {\n    Device::Gpu\n}\n~1~gpu-value: $LABEL/lib_lib_cfg_test_fn_in_source/x.rs:3:"
     "lib_value_after_closed_matches~    let g = matches!(d, Device::Cpu); run(Device::Gpu);\n~1~1 value site(s)"
-    "lib_alias~use rmlx_mlx::Device::*;\n~1~device-alias: $ST_WORK/lib_lib_alias/x.rs:1:"
-    "lib_operator_on_line_above~    if device ==\n        Device::Gpu\n    {\n~1~gpu-value: $ST_WORK/lib_lib_operator_on_line_above/x.rs:2:"
-    "lib_wrapped_matches~    let g = matches!(\n        d,\n        Device::Gpu\n    );\n~1~gpu-value: $ST_WORK/lib_lib_wrapped_matches/x.rs:3:"
+    "lib_alias~use rmlx_mlx::Device::*;\n~1~device-alias: $LABEL/lib_lib_alias/x.rs:1:"
+    "lib_operator_on_line_above~    if device ==\n        Device::Gpu\n    {\n~1~gpu-value: $LABEL/lib_lib_operator_on_line_above/x.rs:2:"
+    "lib_wrapped_matches~    let g = matches!(\n        d,\n        Device::Gpu\n    );\n~1~gpu-value: $LABEL/lib_lib_wrapped_matches/x.rs:3:"
     "lib_split_compare~    if device\n        == Device::Gpu\n    {\n~0~0 value site(s)"
     "lib_eq~    if device == Device::Gpu {\n~0~0 value site(s)"
     "lib_ne~    if d != rmlx_mlx::Device::Gpu {\n~0~0 value site(s)"
@@ -195,9 +197,9 @@ st_case "lib_tests_files" 0 --what "values in *_tests.rs and tests.rs" \
 clean="$(lib_root two_clean '    if device == Device::Gpu {\n')"
 dirty="$(lib_root two_dirty '    let d = Device::Gpu;\n')"
 st_case "lib_two_roots_first_clean" 1 --what "the value is in the second root" \
-    --has "$dirty: 1 value site(s)" -- bash "$GATE" --library "$clean" "$dirty"
+    --has "${dirty#"$REPO_ROOT"/}: 1 value site(s)" -- bash "$GATE" --library "$clean" "$dirty"
 st_case "lib_two_roots_count_clean" 1 --what "the clean root reports zero" \
-    --has "$clean: 0 value site(s)" -- bash "$GATE" --library "$clean" "$dirty"
+    --has "${clean#"$REPO_ROOT"/}: 0 value site(s)" -- bash "$GATE" --library "$clean" "$dirty"
 st_case "lib_missing_root" 2 --what "one of two roots does not exist" \
     --has "is not a directory" -- bash "$GATE" --library "$clean" "$ST_WORK/does-not-exist"
 mkdir -p "$ST_WORK/lib_empty/bin"

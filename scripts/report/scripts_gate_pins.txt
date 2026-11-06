@@ -12,7 +12,6 @@
 #
 # pinnable: class purpose usage exit-undeclared caller recall-missing silenced lib-consumers lib-run shebang exec-bit dead-path set-mode name size heredoc twin lib-shadow binary-literal env-knob unguarded-array
 purpose bench/codec_matrix/runner_selftest.sh
-purpose bench/prefill_chunk_sweep.sh
 purpose lib/record_pending.sh
 usage bench/llama_ab.sh
 usage bench/llama_ab_selftest.sh
@@ -28,7 +27,6 @@ usage lib/server_sampling.py
 usage lib/snapshot_identity.py
 usage lib/spec_round_log.py
 usage bench/ab.sh
-usage bench/prefill_chunk_sweep.sh
 usage release/release_cpu.py
 usage release/release_cpu_selftest.sh
 usage suite/run_gpu_tests.sh
@@ -48,7 +46,6 @@ exit-undeclared bench/wikitext2_ppl.py 1
 exit-undeclared suite/eval_lock_stress.sh 1
 exit-undeclared gen/lloyd_codebook.py 1
 exit-undeclared bench/ab.sh 0,1,125
-exit-undeclared bench/prefill_chunk_sweep.sh 0,125
 exit-undeclared bench/codec_matrix/runner.sh 0,1,2,3
 exit-undeclared bench/codec_matrix/niah_long_context.sh 1,2
 exit-undeclared suite/run_gpu_tests.sh 0,1
@@ -99,7 +96,7 @@ size report/debt_report_selftest.sh 1598
 size report/kv_census_selftest.sh 1212
 size suite/run_gpu_tests.sh 1325
 size bench/serve_bench.sh 1225
-size published/bench.sh 1165
+size published/bench.sh 1169
 size published/bench_selftest.sh 2830
 size bench/serve_bench_selftest.sh 2121
 size bench/ssd_canary.sh 1268

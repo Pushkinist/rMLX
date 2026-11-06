@@ -151,11 +151,17 @@ mkdir -p "$root/docs"
 st_case empty_docs_unmeasurable 2 --what "a docs/ with no doc is exit 2, never a clean pass" \
     --has "unavailable (no docs/**/*.md under" -- doc_size_gate "$root"
 
+# doc_size_gate_no_repo <root>: the gate with git barred from looking above the scratch dir, so a
+# scratch dir inside a work tree is still outside any repository.
+doc_size_gate_no_repo() {
+    GIT_CEILING_DIRECTORIES="$ST_WORK" doc_size_gate "$1"
+}
+
 root="$ST_WORK/not_git"
 mkdir -p "$root/docs"
 bytes "$root/docs/LARGE.md" 50000
 st_case outside_git_unmeasurable 2 --what "outside a git work tree the ignored set is unknown: exit 2" \
-    --has "unavailable (git check-ignore exit 128" -- doc_size_gate "$root"
+    --has "unavailable (git check-ignore exit 128" -- doc_size_gate_no_repo "$root"
 
 st_case missing_root_unmeasurable 2 --what "a root that does not exist is exit 2" \
     --has "is not a directory" -- doc_size_gate "$ST_WORK/does-not-exist"

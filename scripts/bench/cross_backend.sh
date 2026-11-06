@@ -74,8 +74,8 @@ LOG_DIR="${RMLX_HOME}/logs"
 SCRATCH_DIR="${RMLX_HOME}/tmp"
 mkdir -p "$(dirname "$PROGRESS")" "$LOG_DIR" "$SCRATCH_DIR"
 
-  _PROMPT_ID_EFF="longctx_8k"
-  _CTX_MAX_EFF=16384
+_PROMPT_ID_EFF="longctx_8k"
+_CTX_MAX_EFF=16384
 
 export CBB_CTX_MAX="${_CTX_MAX_EFF}"
 export CBB_PROMPT_NAME="${_PROMPT_ID_EFF}"

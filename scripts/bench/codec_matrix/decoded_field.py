@@ -5,10 +5,10 @@ Module of: bench/codec_matrix/runner.sh
 
 from __future__ import annotations
 
-import os
 import sys
+from pathlib import Path
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "lib"))
 from decoded_text import decoded_text  # noqa: E402
 
 

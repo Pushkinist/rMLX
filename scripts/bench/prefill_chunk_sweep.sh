@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
-# prefill_chunk_sweep.sh — Latin-square sweep of one architecture's prefill
-# chunk over a set of levels and prompt lengths, recorded to the metrics DB.
+# Latin-square sweep of one architecture's prefill chunk over levels and prompt lengths
+#
+# Usage:  bash scripts/bench/prefill_chunk_sweep.sh --model <snapshot> --arch-key <key> [options]
+# Exit:   0 ran cleanly, the verdict is on stdout; 1 correctness failure, two levels of one cell
+#         produced different tokens; 75 measured, but a record was refused, the refused file
+#         stays under `--out`; 125 not usable: busy host, missing binary/model/prompt, bad arguments
+# Not a mode of: bench/ab.sh — its ingest takes two arms and files one; this files a record per
+#         level, and the engine names the chunk it used only in a debug event.
+#
+# Every other exit ends the run before any record is filed, so 75 is only reached
+# by a run that passed every gate and ended without a stronger failure.
 #
 # WHY THIS EXISTS
 #
@@ -41,17 +50,6 @@
 # `$RMLX_HOME/logs/<run-id>.jsonl`; point RMLX_HOME at a scratch directory when
 # that matters. Slots run with `--metrics off` so the only rows that reach the
 # DB are the aggregated ones, after the gates have passed.
-#
-# Exit codes:
-#   0   — ran cleanly; the verdict is on stdout
-#   1   — correctness failure: two levels of one cell produced different tokens
-#   75  — measured, but a record was refused; the refused file stays under `--out`
-#   125 — not usable: busy host, missing binary/model/prompt, bad arguments
-# Every other exit ends the run before any record is filed, so 75 is only reached
-# by a run that passed every gate and ended without a stronger failure.
-#
-# Not a mode of: bench/ab.sh — its ingest takes two arms and files one; this files a record per
-# level, and the engine names the chunk it used only in a debug event.
 
 # No `pipefail`: several parses here end in `| head -1`, which SIGPIPEs its
 # producer once it has what it needs. Every value parsed is checked for

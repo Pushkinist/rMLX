@@ -69,13 +69,14 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from recorder_check import require_run_class_recorder
-from rmlx_home import rmlx_home
-from snapshot_identity import split_model_dir
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "scripts" / "lib"))
+from recorder_check import require_run_class_recorder  # noqa: E402
+from rmlx_home import rmlx_home  # noqa: E402
+from snapshot_identity import split_model_dir  # noqa: E402
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 # Runtime state lives under a single root (CLAUDE.md). `RMLX_HOME` wins; the
 # in-repo `.rmlx/` is the dev default. The recorder resolves the DB itself.
 _BUFFER_PENDING = rmlx_home(REPO_ROOT) / "metrics" / "buffer" / "pending"
