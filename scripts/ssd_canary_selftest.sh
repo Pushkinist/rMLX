@@ -140,7 +140,7 @@ EOF
 # ── Fixture tree ──────────────────────────────────────────────────────────────
 
 # make_tree <dir> [seed-hydrate=1] [revisit-spill-us=STUB_SPILL_US]
-# [hydrate-bytes=524288] — the script, its helpers, the prompts, the
+# [hydrate-bytes=524288] [refused-tag=] — the script, its helpers, the prompts, the
 # Makefile, a stub binary and an empty Cargo.lock (so a workspace walk-up
 # stops here). seed-hydrate=0 makes the stub server never record an
 # 'ssd_hydrate' event, matching a run that never hydrates anything from SSD.
@@ -153,19 +153,22 @@ EOF
 # number, not just a present/absent key. hydrate-bytes=0 seeds a hydrate
 # whose duration is real but whose throughput rounds to 0.000 mb/s, so a
 # measured-but-implausible rate is distinguishable from an unmeasured one.
+# refused-tag makes the stub's `metrics record` refuse the record of that tag
+# and leave its file in the buffer.
 make_tree() {
     local t="$1" seed_hydrate="${2:-1}" revisit_spill_us="${3:-$STUB_SPILL_US}" \
-        hydrate_bytes="${4:-524288}"
+        hydrate_bytes="${4:-524288}" refused_tag="${5:-}"
     mkdir -p "$t/scripts/lib" "$t/prompts" "$t/target/release-perf" "$t/models/stub-ns__stub-model-8bit"
     cp "$SCRIPT" "$t/scripts/ssd_canary.sh"
-    cp "$REPO_ROOT/scripts/lib/identity.sh" "$REPO_ROOT/scripts/lib/server_kv_quant.py" "$t/scripts/lib/"
+    cp "$REPO_ROOT/scripts/lib/identity.sh" "$REPO_ROOT/scripts/lib/server_kv_quant.py" \
+        "$REPO_ROOT/scripts/lib/server_wait.sh" "$REPO_ROOT/scripts/lib/record_pending.sh" "$t/scripts/lib/"
     cp -R "$REPO_ROOT/prompts/ssd_bench" "$t/prompts/ssd_bench"
     cp "$MAKEFILE" "$t/Makefile"
     : >"$t/Cargo.lock"
     {
         printf '#!/usr/bin/env bash\n'
-        printf 'WORK=%q\nKV=%q\nSPILL_US=%q\nREVISIT_SPILL_US=%q\nBLOCK=%q\nSEED_HYDRATE=%q\nHYDRATE_BYTES=%q\n' \
-            "$WORK" "$STUB_KV_QUANT" "$STUB_SPILL_US" "$revisit_spill_us" "$STUB_BLOCK_BYTES" "$seed_hydrate" "$hydrate_bytes"
+        printf 'WORK=%q\nKV=%q\nSPILL_US=%q\nREVISIT_SPILL_US=%q\nBLOCK=%q\nSEED_HYDRATE=%q\nHYDRATE_BYTES=%q\nREFUSED_TAG=%q\n' \
+            "$WORK" "$STUB_KV_QUANT" "$STUB_SPILL_US" "$revisit_spill_us" "$STUB_BLOCK_BYTES" "$seed_hydrate" "$hydrate_bytes" "$refused_tag"
         cat <<'EOF'
 LOG="$SELFTEST_LOG"
 inside() {
@@ -260,6 +263,10 @@ if [[ "${1:-}" == "metrics" ]]; then
         record)
             inside "$db"
             [[ -n "$file" ]] || { echo "stub rmlx: record needs --file" >&2; exit 2; }
+            if [[ -n "$REFUSED_TAG" && "$file" == *"-$REFUSED_TAG.json" ]]; then
+                echo "stub rmlx: refusing $file" >&2
+                exit 1
+            fi
             # Mirrors crates/rmlx-metrics's plausible-value bounds
             # (docs/METRICS_SCHEMA.md §4.1) for the metrics ssd_canary.sh
             # emits: a rate's floor excludes 0, a counter/duration/gauge's
@@ -851,6 +858,54 @@ run_zero_byte_hydrate_case() {
     fi
 }
 
+# run_refused_record_case — the recorder refuses the POPULATE record, the first
+# of the three. The refused file is named and stays in the buffer, the other two
+# records are still filed, the summary is still written, and the run ends 75.
+run_refused_record_case() {
+    local name="refused-record"
+    local cdir="$WORK/$name"
+    local tree="$cdir/tree"
+    mkdir -p "$cdir/home" "$cdir/tmp" "$cdir/log"
+    make_tree "$tree" 1 "$STUB_SPILL_US" 524288 ssd-canary-populate
+    local root="$cdir/data-root"
+    seed_root "$root"
+
+    local rc
+    run_env "$cdir" "$cdir" "RMLX_HOME=$root" \
+        "VERIFIER_MODEL=$tree/models/stub-ns__stub-model-8bit" "PORT=$(free_port)" -- \
+        bash "$tree/scripts/ssd_canary.sh" --ssd-gb 100 >"$cdir/run.out" 2>&1
+    rc=$?
+    if [[ $rc -eq 75 ]]; then
+        pass "$name: a refused record ends the run with 75"
+    else
+        fail "$name: exited $rc, want 75 (tail: $(tail -3 "$cdir/run.out" | tr '\n' ' '))"
+    fi
+
+    local refused
+    refused="$(sed -n 's/^  ERROR: ssd-canary-populate: the record did not land; it is kept at \(.*\); file it again.*/\1/p' "$cdir/run.out")"
+    if [[ -n "$refused" && -e "$refused" ]] && ! grep -qF "[ingest] done: $refused" "$cdir/run.out"; then
+        pass "$name: the refused record is named, still in the buffer and not reported done"
+    else
+        fail "$name: no ERROR line names a refused record that is still in the buffer: [$refused]"
+    fi
+
+    local tag missing=""
+    for tag in ssd-canary-revisit ssd-canary-evict; do
+        grep -q "tag=$tag " "$cdir/log/records.jsonl" 2>/dev/null || missing="$missing $tag"
+    done
+    if [[ -z "$missing" ]]; then
+        pass "$name: the records after the refused one are still filed"
+    else
+        fail "$name: no record for:$missing"
+    fi
+
+    if grep -qF 'Summary written to' "$cdir/run.out" && grep -qF 'Validation: pass=true' "$cdir/run.out"; then
+        pass "$name: the summary and the validation still ran"
+    else
+        fail "$name: the run stopped before its summary and validation"
+    fi
+}
+
 echo "==> ssd-canary-selftest"
 
 # A relative RMLX_HOME is refused by the binary, so `make ssd-canary` fails
@@ -908,6 +963,7 @@ run_null_hydrate_case
 run_revisit_hydrate_case
 run_populate_only_hydrate_case
 run_zero_byte_hydrate_case
+run_refused_record_case
 
 # A missing binary exits 125, as documented, before anything else asks it.
 nobin="$WORK/no-binary"

@@ -696,12 +696,7 @@ PYEOF
     echo "  [ingest] buffer: ${buf_file}" >&2
 
     echo "${buf_file}"
-    if ! RMLX_HOME="${RMLX_HOME}" "${BINARY}" metrics record --file "${buf_file}" >&2; then
-        echo "  ERROR: ${config}: the record did not land; it is kept at ${buf_file} for" \
-             "\`rmlx metrics record --replay-pending\`" >&2
-        return "${RECORD_PENDING_EXIT}"
-    fi
-    echo "  [ingest] done: ${buf_file}" >&2
+    RMLX_HOME="${RMLX_HOME}" rmlx_record_file "${BINARY}" "${buf_file}" "${config}"
 }
 
 # The tool's exit status once every arm has run: RECORD_PENDING_EXIT if a record did not land.

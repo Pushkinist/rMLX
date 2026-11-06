@@ -44,7 +44,9 @@ by the size cap.
 
 Each phase's server takes the Metal claim, and the script stops only the
 server it started. When another process holds the claim, the phase server
-exits 11 and names the holder, and the canary stops with that status.
+exits 11 and names the holder, and the canary stops with that status. A
+server that does not answer `/v1/models` within 180 seconds stops the canary
+with 1.
 
 ## Phases
 
@@ -68,7 +70,9 @@ server.
 
 ## Checks
 
-The run exits 1 when any FAIL check fails. WARN checks only print a note.
+The run exits 1 when any FAIL check fails. WARN checks only print a note. A run
+whose checks held but whose records the recorder refused exits 75
+(docs/METRICS_DB.md § 13, rule 24); a FAIL check wins over it.
 
 | Check | Level |
 |---|---|
@@ -93,7 +97,10 @@ a whole-run figure or another phase's. A phase that measured no spill or no
 hydrate omits that figure (`null`) rather than sending a `0`: the duration
 would misread as the best ever seen, and the metrics registry's
 plausible-value bounds refuse a `0` rate outright (docs/METRICS_SCHEMA.md
-§4.1). The EVICT record carries bytes used and evictions only.
+§4.1). The EVICT record carries bytes used and evictions only. A record the
+recorder refuses stays in `<run directory>/metrics/buffer/pending/`, its file
+is named in an `ERROR` line, and the other phases' records and the checks still
+run; file it again with `rmlx metrics record --file <that file>`.
 
 ## Output
 

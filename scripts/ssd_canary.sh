@@ -10,6 +10,9 @@
 # Usage:
 #   VERIFIER_MODEL=/path/to/snapshot bash scripts/ssd_canary.sh [--port N] \
 #     [--ssd-gb N] [--dry-run]
+# Exit:   0 every check held; 1 a FAIL check failed or the setup was refused; 11 passthrough of
+#         rmlx serve (the Metal claim is held); 75 a phase record was refused, the run went on;
+#         125 no built binary
 #
 # Requires:
 #   - Built binary at target/release-perf/rmlx  (run: make build-perf)
@@ -61,6 +64,7 @@ EVICT_SSD_GB=0.05          # initial 50 MB; overridden dynamically after POPULAT
 POPULATE_MAX_TOKENS=64
 TEMPERATURE=0
 SEED=42
+SERVER_WAIT_S=180
 
 DRY_RUN=false
 
@@ -87,6 +91,8 @@ fi
 # Run identity (backend / version / git sha / build profile / hardware tag)
 # comes from the measured binary — never hard-coded here.
 source "$(dirname "${BASH_SOURCE[0]}")/lib/identity.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/server_wait.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/record_pending.sh"
 rmlx_export_identity "${BINARY}"
 PROMPT_DIR="${REPO_ROOT}/prompts/ssd_bench"
 GIT_SHA="$(rmlx_git_sha "${REPO_ROOT}")"
@@ -172,37 +178,6 @@ if [[ "${NUM_PROMPTS}" -lt 20 ]]; then
 fi
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-# Wait for the server with PID $1 to be ready by polling /v1/models. A server
-# that exits first returns its own exit status: a Metal claim another process
-# holds (exit 11, holder named in the server's output) stops the canary. Each
-# phase stops only the server it started.
-wait_for_server() {
-    local pid="$1"
-    local url="http://127.0.0.1:${PORT}/v1/models"
-    local attempts=0
-    local max_attempts=90
-    echo "  [wait] polling ${url} ..." >&2
-    while true; do
-        if curl -sf "${url}" > /dev/null 2>&1; then
-            echo "  [wait] server ready." >&2
-            return 0
-        fi
-        if ! kill -0 "${pid}" 2>/dev/null; then
-            local status=0
-            wait "${pid}" || status=$?
-            echo "ERROR: server (pid ${pid}) exited with status ${status} before it was ready" >&2
-            [[ ${status} -eq 0 ]] && status=1
-            return "${status}"
-        fi
-        attempts=$((attempts + 1))
-        if [[ ${attempts} -ge ${max_attempts} ]]; then
-            echo "ERROR: server did not become ready within $((max_attempts * 2))s" >&2
-            return 1
-        fi
-        sleep 2
-    done
-}
 
 # Query /v1/models and return the cumulative ssd_hits for the loaded model.
 # Prints 0 on any error.
@@ -331,7 +306,7 @@ bounce_if_stuck() {
     eval "${pid_ref}=${new_pid}"
     LIVE_PID="${new_pid}"
     echo "  [bounce] new server pid=${new_pid}" >&2
-    wait_for_server "${new_pid}"
+    wait_for_server "${new_pid}" "${SERVER_WAIT_S}"
     CONSECUTIVE_ERRORS=0
     # New server starts with cumulative ssd_hits=0; reset delta baseline.
     _PREV_CUMULATIVE_SSD_HITS=0
@@ -471,7 +446,9 @@ print(f'{mbps:.3f}' if round(mbps, 3) > 0 else 'None')
     printf '%s %s\n' "${ms_json}" "${mbps_json}"
 }
 
-# Emit a §8.5 RunRecord JSON and ingest it into runs.db.
+RECORD_STATUS=0
+# Emit a §8.5 RunRecord JSON and ingest it into runs.db. A record the recorder
+# refuses stays in the buffer and sets RECORD_STATUS; the run goes on.
 # Args: tag notes_str metrics_json
 emit_and_ingest() {
     local tag="$1"
@@ -566,8 +543,7 @@ PYEOF
 
     echo "${record_json}" > "${buf_file}"
     echo "  [ingest] buffer: ${buf_file}" >&2
-    "${BINARY}" metrics --db "${INGEST_DB}" record --file "${buf_file}" >&2
-    echo "  [ingest] done." >&2
+    rmlx_record_file "${BINARY}" "${buf_file}" "${tag}" --db "${INGEST_DB}" || RECORD_STATUS=$?
 }
 
 # ── SSD index path ────────────────────────────────────────────────────────────
@@ -604,7 +580,7 @@ RMLX_LOG_CAP_MB=500 \
 POPULATE_PID=$!
 LIVE_PID="${POPULATE_PID}"
 echo "  [server] pid=${POPULATE_PID}" >&2
-wait_for_server "${POPULATE_PID}"
+wait_for_server "${POPULATE_PID}" "${SERVER_WAIT_S}"
 
 # CSV header.
 POPULATE_CSV="${RUN_DIR}/phase_populate.csv"
@@ -757,7 +733,7 @@ RMLX_LOG_CAP_MB=500 \
 REVISIT_PID=$!
 LIVE_PID="${REVISIT_PID}"
 echo "  [server] pid=${REVISIT_PID}" >&2
-wait_for_server "${REVISIT_PID}"
+wait_for_server "${REVISIT_PID}" "${SERVER_WAIT_S}"
 
 REVISIT_CSV="${RUN_DIR}/phase_revisit.csv"
 echo "seq,prompt_name,ssd_hits,ssd_bytes_used,ssd_evict_total,spill_count,hydrate_count,spill_sum_us,hydrate_sum_us" \
@@ -869,7 +845,7 @@ RMLX_LOG_CAP_MB=500 \
 EVICT_PID=$!
 LIVE_PID="${EVICT_PID}"
 echo "  [server] pid=${EVICT_PID}" >&2
-wait_for_server "${EVICT_PID}"
+wait_for_server "${EVICT_PID}" "${SERVER_WAIT_S}"
 
 # index.db for the ssd-canary namespace (shared with POPULATE).
 EVICT_INDEX_DB="${RUN_DIR}/cache/kv/ssd-canary/index.db"
@@ -1282,3 +1258,4 @@ echo "Done."
 if [[ "${VALIDATION_PASS}" == "false" ]]; then
     exit 1
 fi
+exit "${RECORD_STATUS}"

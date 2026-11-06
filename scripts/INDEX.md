@@ -105,13 +105,14 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/metal_dirs.sh` | check/kernel_dispatch.sh, check/metal_kernels.sh, check/metal_kernels_selftest.sh, +1 more scripts | The directories holding gated .metal kernels; sourced by the metal gates. |
 | `lib/mlx_pin.sh` | crates/rmlx-mlx/src/pin_tests.rs, host/mlx_restore_pin.sh | Read the validated MLX / mlx-c pair from its one declaration. |
 | `lib/published_run_log.py` | profile/prefill_ms.py, published/bench.sh, published/binary_identity.py, +1 more scripts | Read one rmlx run log back as a per-request table. |
-| `lib/record_pending.sh` | crates/rmlx-cli/src/exit_tests.rs, bench/ab.sh, bench/baseline_cells.sh, bench/prefill_chunk_sweep.sh, +3 more scripts | The exit code `rmlx baseline --record` and `rmlx eval ppl --corpus` give a |
+| `lib/record_pending.sh` | crates/rmlx-cli/src/exit_tests.rs, bench/ab.sh, bench/baseline_cells.sh, bench/prefill_chunk_sweep.sh, +4 more scripts | The exit code `rmlx baseline --record` and `rmlx eval ppl --corpus` give a |
 | `lib/recorder_check.py` | ingest/ingest.py, ingest/llama_bench.py | Refuse a recorder that cannot state a run class. |
 | `lib/rmlx_home.py` | ingest/ingest.py, ingest/llama_bench.py | Resolve the runtime home the way the binary does. |
 | `lib/run_log_for_pid.py` | lib/bench_server.sh | Pick the run log a given process wrote, out of the candidates on stdin. |
 | `lib/selftest_support.sh` | bench/baseline_cells_selftest.sh, bench/cross_backend_selftest.sh, bench/llama_ab_selftest.sh, +22 more scripts | The case runner and shims the self-tests share; source it. |
 | `lib/server_kv_quant.py` | lib/bench_server.sh, published/binary_identity.py, ssd_canary.sh | Read the KV codec a run resolved out of its rmlx run log. |
 | `lib/server_sampling.py` | crates/rmlx-server/src/engine/sampler_event_tests.rs, bench/serve_bench.sh, lib/published_run_log.py | Read whether a run's requests were sampled, out of its rmlx run log. |
+| `lib/server_wait.sh` | lib/bench_server.sh, schema_constraint_canary.sh, ssd_canary.sh | Wait for one rmlx server to answer /v1/models, for a time the caller gives; source it. |
 | `lib/skip_notice_patterns.sh` | check/gpu_tests.sh, suite/run_gpu_tests.sh | The SKIP and WAIVED stand-down notice patterns, defined once for the runner and the gate. |
 | `lib/snapshot_identity.py` | bench/serve_bench.sh, ingest/ingest.py, ingest/llama_bench.py, +2 more scripts | Read a model snapshot's identity columns out of the snapshot itself. |
 | `lib/spec_round_log.py` | bench/serve_bench.sh, lib/published_run_log.py, published/binary_identity.py | Read a speculative round loop's own numbers back out of an rmlx run log. |

@@ -271,6 +271,8 @@ section 3); that a code means what this table says is the reviewer's. [review]
 |---|---|
 | run identity for a §8.5 record | `lib/identity.sh` (`rmlx_export_identity`) |
 | start, wait for and attribute one `rmlx serve` | `lib/bench_server.sh` |
+| wait for one `rmlx serve` to answer, for a time you give (`wait_for_server`) | `lib/server_wait.sh` |
+| file a record already in the pending buffer, exit 75 on refusal (`rmlx_record_file`) | `lib/record_pending.sh` |
 | host CPU interference, and the verdict on a window (`classify_window`) | `lib/cpu_snapshot.sh` + `lib/busiest_between.awk` |
 | a flag given without its value (`need_value`, exit 125) | `lib/args.sh` |
 | a recall-test case runner | `lib/selftest_support.sh` (`st_init`, `st_case`, `st_run`, `st_check`, `st_verdict`, `st_bounded`, `st_done`) |
@@ -326,7 +328,7 @@ site count; one more site, or a larger count, fails `binary-literal-pin`. [gate:
   anywhere, since a function may use what code below it sets. A name a file it
   sources assigns, directly or through the files that one sources, is assigned.
   A file that other files source reads what they set: a name that is not assigned
-  by every file that sources it is that file's knob (`lib/bench_server.sh` reads
+  by every file that sources it is that file's knob (`lib/server_wait.sh` reads
   `PORT`, which `bench/baseline_cells.sh` does not set).
   A file pins the set of names it reads; a name outside the set fails, and
   `pin-new` refuses a name added to a pin. `RMLX_BIN`,

@@ -2024,6 +2024,59 @@ print(len(choice["logprobs"]["content"][0]["top_logprobs"]) if "logprobs" in cho
 unstreamed_request_contract
 verdict
 
+# ── The shared wait ───────────────────────────────────────────────────────────
+
+# wait_in_child <label> <limit> <ready|die|hang> — runs lib/server_wait.sh's
+# wait_for_server with that limit on a child the shell itself started: a sleeper
+# (a stub server may already answer), a process that exits 11, or a sleeper that
+# never answers. Prints the wait's status; its stderr is $CASE_HOME/<label>.err.
+wait_in_child() {
+	local label="$1" limit="$2" mode="$3" got=0
+	env -i PATH=/usr/bin:/bin PORT="$PORT" LIB="$REPO_ROOT/scripts/lib/server_wait.sh" LIMIT="$limit" MODE="$mode" \
+		bash -c '. "$LIB"
+			case "$MODE" in
+			die) (exit 11) & ;;
+			*) sleep 30 & ;;
+			esac
+			pid=$!
+			wait_for_server "$pid" "$LIMIT"
+			rc=$?
+			kill "$pid" 2>/dev/null
+			wait "$pid" 2>/dev/null
+			exit "$rc"' >/dev/null 2>"$CASE_HOME/$label.err" || got=$?
+	echo "$got"
+}
+
+wait_for_server_contract() {
+	CASE_NAME="wait_for_server_limit_and_status"
+	CASE_WHAT="the shared wait returns 0 when ready, the server's own status when it dies, 1 at the limit it was given"
+	CASE_HOME="$WORK/home_$CASE_NAME"
+	CASE_OUT="$WORK/$CASE_NAME.log"
+	CASE_BAD=""
+	mkdir -p "$CASE_HOME"
+	: >"$CASE_OUT"
+	local got
+
+	start_stub "$CASE_HOME/ready" plain
+	got="$(wait_in_child ready 20 ready)"
+	stop_stub
+	note_survivors "$CASE_HOME/ready/stub_bound"
+	stop_stubs "$CASE_HOME/ready/stub_bound"
+	[ "$got" = "0" ] || note_bad "a server that answers: the wait returned $got (want 0)"
+
+	got="$(wait_in_child died 20 die)"
+	[ "$got" = "11" ] || note_bad "a server that exited 11: the wait returned $got (want 11)"
+	grep -qF 'exited with status 11 before it was ready' "$CASE_HOME/died.err" ||
+		note_bad "the wait did not say the server exited with status 11"
+
+	got="$(wait_in_child hung 3 hang)"
+	[ "$got" = "1" ] || note_bad "a server that never answers: the wait returned $got (want 1)"
+	grep -qF 'did not start within 3s' "$CASE_HOME/hung.err" ||
+		note_bad "the wait did not name the 3 s limit it was given"
+}
+wait_for_server_contract
+verdict
+
 echo
 echo "passed=$PASSED failed=$FAILED"
 [ "$FAILED" -eq 0 ] || exit 1

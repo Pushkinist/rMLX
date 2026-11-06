@@ -133,6 +133,7 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BINARY="${REPO_ROOT}/target/release-perf/rmlx"
 PORT="${PORT:-62265}"
+source "${REPO_ROOT}/scripts/lib/server_wait.sh"
 ROOT_DIR="${REPO_ROOT}/.rmlx/proofs/schema-constraint"
 
 O_MODELS_ROOT="${RMLX_O_MODELS_ROOT:-}"
@@ -208,23 +209,6 @@ print(json.dumps({
     },
 }, indent=2))
 PY
-}
-
-wait_for_server() {
-    local pid="$1" attempts=0
-    while (( attempts < 180 )); do
-        if ! kill -0 "${pid}" 2>/dev/null; then
-            echo "ERROR: server pid ${pid} exited during startup" >&2
-            return 1
-        fi
-        if curl -sf "http://127.0.0.1:${PORT}/v1/models" >/dev/null 2>&1; then
-            return 0
-        fi
-        attempts=$((attempts + 1))
-        sleep 2
-    done
-    echo "ERROR: server not ready after 360s" >&2
-    return 1
 }
 
 # ── Verdict evaluation ───────────────────────────────────────────────────────
@@ -406,7 +390,7 @@ run_probe() {
         > "${art}/serve.log" 2>&1 &
     local pid=$!
 
-    if ! wait_for_server "${pid}"; then
+    if ! wait_for_server "${pid}" 360; then
         tail -40 "${art}/serve.log" >&2
         kill "${pid}" 2>/dev/null || true
         wait "${pid}" 2>/dev/null || true
