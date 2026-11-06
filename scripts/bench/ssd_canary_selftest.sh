@@ -25,9 +25,9 @@
 #            ceiling the servers were given
 #   ingest   the three phase records went to the DB the binary resolves
 #   gate     the gate read that same DB, scoped to the canary's prompts
-# Single cases: a missing binary exits 125, `--tag` is refused, `--binary` names
-# the binary to run (absolute or relative), and one that is no executable file
-# exits 125.
+# Single cases: a missing binary exits 125, `--tag` is refused, a flag given
+# without its value exits 1, `--binary` names the binary to run (absolute or
+# relative), and one that is no executable file exits 125.
 #
 # The stub resolves its data root and DB the way the binary does (an absolute
 # RMLX_HOME, else the checkout found by walking up for Cargo.lock, else
@@ -39,7 +39,7 @@
 #
 # Usage: ssd_canary_selftest.sh [--script <path>] [--makefile <path>]
 #   (defaults: the tree's own scripts/bench/ssd_canary.sh and Makefile)
-# Exit 0 — every case behaved; 1 — at least one did not; 2 — cannot run.
+# Exit 0 — every case behaved; 1 — at least one did not; 2 — a usage error or it cannot run.
 # Set:    -uo — a non-zero status inside a case ends the run under -e, before the cases after it
 
 set -uo pipefail
@@ -49,10 +49,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT="$REPO_ROOT/scripts/bench/ssd_canary.sh"
 MAKEFILE="$REPO_ROOT/Makefile"
 
+source "$REPO_ROOT/scripts/lib/args.sh"
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --script)   SCRIPT="${2:?--script requires a path}"; shift 2 ;;
-        --makefile) MAKEFILE="${2:?--makefile requires a path}"; shift 2 ;;
+        --script)   need_value "$1" $# 2; SCRIPT="$2"; shift 2 ;;
+        --makefile) need_value "$1" $# 2; MAKEFILE="$2"; shift 2 ;;
         *) echo "ssd-canary-selftest: unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -164,7 +165,7 @@ make_tree() {
         hydrate_bytes="${4:-524288}" refused_tag="${5:-}"
     mkdir -p "$t/scripts/bench" "$t/scripts/lib" "$t/prompts" "$t/target/release-perf" "$t/models/stub-ns__stub-model-8bit"
     cp "$SCRIPT" "$t/scripts/bench/ssd_canary.sh"
-    cp "$REPO_ROOT/scripts/lib/identity.sh" "$REPO_ROOT/scripts/lib/server_kv_quant.py" \
+    cp "$REPO_ROOT/scripts/lib/args.sh" "$REPO_ROOT/scripts/lib/identity.sh" "$REPO_ROOT/scripts/lib/server_kv_quant.py" \
         "$REPO_ROOT/scripts/lib/server_wait.sh" "$REPO_ROOT/scripts/lib/record_pending.sh" "$t/scripts/lib/"
     cp -R "$REPO_ROOT/prompts/ssd_bench" "$t/prompts/ssd_bench"
     cp "$MAKEFILE" "$t/Makefile"
@@ -1048,6 +1049,19 @@ if [[ $rc -eq 1 ]] && grep -q 'Unknown flag: --tag' "$tag_dir/out"; then
     pass "tag: --tag is refused as an unknown flag"
 else
     fail "tag: --tag exited $rc: $(head -1 "$tag_dir/out")"
+fi
+
+# A flag given last without its value is a usage error, on the bash 3.2 that macOS ships.
+novalue_dir="$WORK/novalue"
+mkdir -p "$novalue_dir/home" "$novalue_dir/tmp" "$novalue_dir/log"
+make_tree "$novalue_dir/tree"
+run_env "$novalue_dir" "$novalue_dir/tree" -- /bin/bash "$novalue_dir/tree/scripts/bench/ssd_canary.sh" --port \
+    >"$novalue_dir/out" 2>&1
+rc=$?
+if [[ $rc -eq 1 ]] && grep -q -- '--port requires a value' "$novalue_dir/out"; then
+    pass "no-value: --port with no value exits 1 naming the flag"
+else
+    fail "no-value: --port exited $rc: $(head -1 "$novalue_dir/out")"
 fi
 
 echo "ssd-canary-selftest: $PASSED passed, $FAILED failed"

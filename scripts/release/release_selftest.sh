@@ -50,7 +50,7 @@ place_tools() {
         cp "$REPO_ROOT/scripts/release/$f" "$REL/" || st_die "cannot copy $f"
     done
     mkdir -p "$REPO/scripts/lib"
-    cp "$REPO_ROOT/scripts/lib/identity.sh" "$REPO/scripts/lib/" || st_die "cannot copy identity.sh"
+    cp "$REPO_ROOT/scripts/lib/args.sh" "$REPO_ROOT/scripts/lib/identity.sh" "$REPO/scripts/lib/" || st_die "cannot copy the lib helpers"
 }
 
 tool_package() { st_bounded 120 bash "$REL/release.sh" package "$@"; }
@@ -549,7 +549,7 @@ fresh
 plant_bottle any
 st_run tool_bottle --root-url
 expect_argv brew
-finish bottle_root_url_without_value 1 --has "--root-url requires a URL argument"
+finish bottle_root_url_without_value 2 --has "ERROR: --root-url requires a value"
 
 fresh
 plant_bottle any

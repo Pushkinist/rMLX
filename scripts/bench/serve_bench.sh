@@ -85,6 +85,7 @@ usage_error() {
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+source "${REPO_ROOT}/scripts/lib/args.sh"
 source "${REPO_ROOT}/scripts/lib/identity.sh"
 source "${REPO_ROOT}/scripts/lib/record_pending.sh"
 BINARY="$(rmlx_default_binary "${REPO_ROOT}" release-perf)"
@@ -148,27 +149,27 @@ while [[ $# -gt 0 ]]; do
         --dry-run) DRY_RUN=true; shift ;;
         --server-stamps) SERVER_STAMPS_ARG=(--server-stamps); CLIENT_CLOCK=server_stamps; shift ;;
         --model=*) VERIFIER_MODEL="${1#--model=}"; shift ;;
-        --model) shift; VERIFIER_MODEL="${1:?--model requires a value}"; shift ;;
+        --model) need_value "$1" $# 1; VERIFIER_MODEL="$2"; shift 2 ;;
         --draft-model=*) DRAFTER_MODEL="${1#--draft-model=}"; shift ;;
-        --draft-model) shift; DRAFTER_MODEL="${1:?--draft-model requires a value}"; shift ;;
+        --draft-model) need_value "$1" $# 1; DRAFTER_MODEL="$2"; shift 2 ;;
         --prompt-file=*) PROMPT_FILE="${1#--prompt-file=}"; shift ;;
-        --prompt-file) shift; PROMPT_FILE="${1:?--prompt-file requires a value}"; shift ;;
+        --prompt-file) need_value "$1" $# 1; PROMPT_FILE="$2"; shift 2 ;;
         --binary=*) BINARY="${1#--binary=}"; shift ;;
-        --binary) shift; BINARY="${1:?--binary requires a value}"; shift ;;
+        --binary) need_value "$1" $# 1; BINARY="$2"; shift 2 ;;
         --port=*) PORT="${1#--port=}"; shift ;;
-        --port) shift; PORT="${1:?--port requires a value}"; shift ;;
+        --port) need_value "$1" $# 1; PORT="$2"; shift 2 ;;
         --tag=*) BENCH_TAG="${1#--tag=}"; shift ;;
-        --tag) shift; BENCH_TAG="${1:?--tag requires a value}"; shift ;;
+        --tag) need_value "$1" $# 1; BENCH_TAG="$2"; shift 2 ;;
         --kv-quant=*) KV_QUANT="${1#--kv-quant=}"; shift ;;
-        --kv-quant) shift; KV_QUANT="${1:?--kv-quant requires a value}"; shift ;;
+        --kv-quant) need_value "$1" $# 1; KV_QUANT="$2"; shift 2 ;;
         --max-ctx=*) MAX_CTX="${1#--max-ctx=}"; shift ;;
-        --max-ctx) shift; MAX_CTX="${1:?--max-ctx requires a value}"; shift ;;
+        --max-ctx) need_value "$1" $# 1; MAX_CTX="$2"; shift 2 ;;
         --draft-kind=*) DRAFT_KIND="${1#--draft-kind=}"; DRAFT_KIND_SET=true; shift ;;
-        --draft-kind) shift; DRAFT_KIND="${1:?--draft-kind requires a value}"; DRAFT_KIND_SET=true; shift ;;
+        --draft-kind) need_value "$1" $# 1; DRAFT_KIND="$2"; DRAFT_KIND_SET=true; shift 2 ;;
         --draft-block-size=*) DRAFT_BLOCK_SIZE="${1#--draft-block-size=}"; DRAFT_BLOCK_SIZE_SET=true; shift ;;
-        --draft-block-size) shift; DRAFT_BLOCK_SIZE="${1:?--draft-block-size requires a value}"; DRAFT_BLOCK_SIZE_SET=true; shift ;;
+        --draft-block-size) need_value "$1" $# 1; DRAFT_BLOCK_SIZE="$2"; DRAFT_BLOCK_SIZE_SET=true; shift 2 ;;
         --record=*) RECORD_CLASS="${1#--record=}"; shift ;;
-        --record) shift; RECORD_CLASS="${1:?--record requires a value}"; shift ;;
+        --record) need_value "$1" $# 1; RECORD_CLASS="$2"; shift 2 ;;
         *) echo "Unknown flag: $1" >&2; exit 1 ;;
     esac
 done

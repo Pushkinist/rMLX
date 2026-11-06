@@ -114,6 +114,9 @@
 #   bash scripts/bench/schema_constraint_canary.sh --model bonsai   # one model only
 #   bash scripts/bench/schema_constraint_canary.sh --binary PATH    # another rmlx than the build-perf one
 #
+# Exit:   0 every cell met its expectation; 1 a cell did not; 2 a usage error (an unknown flag, a
+#         flag given without its value, a bad --expect), the binary missing, or no model ran
+#
 # Requires:
 #   - target/release-perf/rmlx  (make build-perf), or --binary PATH
 #   - RMLX_O_MODELS_ROOT pointing at the snapshot root (resolve via LOCAL.md),
@@ -132,6 +135,7 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+source "${REPO_ROOT}/scripts/lib/args.sh"
 source "${REPO_ROOT}/scripts/lib/identity.sh"
 BINARY="$(rmlx_default_binary "${REPO_ROOT}" release-perf)"
 PORT="${PORT:-62265}"
@@ -147,10 +151,10 @@ ONLY_MODEL="all"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --expect) EXPECT="$2"; shift 2 ;;
-        --model)  ONLY_MODEL="$2"; shift 2 ;;
-        --port)   PORT="$2"; shift 2 ;;
-        --binary) BINARY="$2"; shift 2 ;;
+        --expect) need_value "$1" $# 2; EXPECT="$2"; shift 2 ;;
+        --model)  need_value "$1" $# 2; ONLY_MODEL="$2"; shift 2 ;;
+        --port)   need_value "$1" $# 2; PORT="$2"; shift 2 ;;
+        --binary) need_value "$1" $# 2; BINARY="$2"; shift 2 ;;
         -h|--help) sed -n '1,126p' "$0"; exit 0 ;;
         *) echo "unknown flag: $1" >&2; exit 2 ;;
     esac

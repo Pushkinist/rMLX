@@ -86,6 +86,7 @@ new_case() {
     local root="${CASE_ROOT}"
     mkdir -p "${root}/scripts/lib" "${root}/scripts/check" "${root}/scripts/suite" "${root}/bin" "${root}/logs" || return 1
     cp "${RUNNER}" "${root}/scripts/suite/run_gpu_tests.sh" || return 1
+    cp "${ROOT}/scripts/lib/args.sh" "${root}/scripts/lib/args.sh" || return 1
     # Symlinked, not copied: the runner reads the stand-down notice's shape from
     # this file and so does the source gate, and a fixture carrying its own copy
     # would keep passing after the real shape moved.
@@ -2929,6 +2930,14 @@ waived_log "${CASE_ROOT}" "WAIVED kv_gpu_unlisted:" kv_gpu_unlisted
 run_case "${CASE_ROOT}"
 expect_no_out "waived — these selected"
 expect_out "1 further notice(s) named no test"
+
+# ---------------------------------------------------------------------------
+# A flag given last without its value is a usage error, on the bash 3.2 that macOS ships.
+new_case flag_without_value_is_a_usage_error || exit 1
+OUT="$(/bin/bash "${CASE_ROOT}/scripts/suite/run_gpu_tests.sh" --half 2>&1)"
+STATUS=$?
+expect_status 1
+expect_out "ERROR: --half requires a value"
 
 # ---------------------------------------------------------------------------
 # The harness's own positive control: with nothing wrong, the same stubs produce

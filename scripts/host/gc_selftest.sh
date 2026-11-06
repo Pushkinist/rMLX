@@ -47,6 +47,8 @@ export PATH="$ST_WORK/stubs:$PATH"
 
 place_tool() {
     cp "$REPO_ROOT/scripts/host/gc.sh" "$SCRATCH_TOOLS/" || st_die "cannot copy gc.sh"
+    mkdir -p "$SCRATCH_REPO/scripts/lib"
+    cp "$REPO_ROOT/scripts/lib/args.sh" "$SCRATCH_REPO/scripts/lib/" || st_die "cannot copy args.sh"
 }
 
 # tool_target [args]: prune stale target/ profiles.
@@ -59,6 +61,12 @@ tool_target() {
 tool_traces() {
     place_tool
     st_bounded 60 bash "$SCRATCH_TOOLS/gc.sh" traces ${1+"$@"}
+}
+
+# tool_traces_system_bash [args]: tool_traces under the bash 3.2 that macOS ships.
+tool_traces_system_bash() {
+    place_tool
+    st_bounded 60 /bin/bash "$SCRATCH_TOOLS/gc.sh" traces ${1+"$@"}
 }
 
 # tool_env_age: tool_target with a non-numeric MAX_AGE_DAYS in the environment.
@@ -209,7 +217,7 @@ disk_case "target: a negative --max-age-days is a usage error and deletes nothin
 disk_case "target: an empty --max-age-days is a usage error and deletes nothing" 2 left_target "$ALL_PROFILES" \
     --has "--max-age-days must be a whole number (got '')" -- tool_target --apply --max-age-days ""
 disk_case "target: --max-age-days with no value is a usage error and deletes nothing" 2 left_target "$ALL_PROFILES" \
-    --has "--max-age-days needs a value" -- tool_target --apply --max-age-days
+    --has "--max-age-days requires a value" -- tool_target --apply --max-age-days
 disk_case "target: a --max-age-days past nine digits is a usage error and deletes nothing" 2 left_target "$ALL_PROFILES" \
     --has "--max-age-days is too large (got '1234567890')" -- tool_target --apply --max-age-days 1234567890
 disk_case "target: a flag of the traces mode is a usage error and deletes nothing" 2 left_target "$ALL_PROFILES" \
@@ -351,7 +359,9 @@ plant_traces
 disk_case "traces: an unknown argument is a usage error and deletes nothing" 2 left_traces "$ALL_BUNDLES" \
     --has "unknown argument: --bogus" --has "usage:" -- tool_traces --apply --bogus
 disk_case "traces: a flag with no value is a usage error" 2 left_traces "$ALL_BUNDLES" \
-    --has "--max-count needs a value" -- tool_traces --apply --max-count
+    --has "--max-count requires a value" -- tool_traces --apply --max-count
+disk_case "traces: a flag with no value is a usage error on the system bash" 2 left_traces "$ALL_BUNDLES" \
+    --has "--max-count requires a value" -- tool_traces_system_bash --apply --max-count
 disk_case "traces: a value that is not a whole number is a usage error" 2 left_traces "$ALL_BUNDLES" \
     --has "--max-total-gb must be a whole number (got 'x')" -- tool_traces --apply --max-total-gb x
 disk_case "traces: a negative number is a usage error and deletes nothing" 2 left_traces "$ALL_BUNDLES" \

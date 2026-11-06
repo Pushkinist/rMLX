@@ -26,6 +26,8 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=scripts/lib/args.sh
+. "$REPO_ROOT/scripts/lib/args.sh"
 
 MODE=""
 APPLY=0
@@ -44,10 +46,6 @@ refuse() {
 	echo "$1" >&2
 	usage_text >&2
 	exit 2
-}
-
-need_arg() {
-	[ "$2" -ge 2 ] || refuse "$1 needs a value"
 }
 
 need_number() {
@@ -82,34 +80,34 @@ while [ $# -gt 0 ]; do
 		shift
 		;;
 	--max-age-days)
-		need_arg "$1" $#
+		need_value "$1" $# 2
 		need_number "$1" "$2"
 		MAX_AGE_DAYS=$((10#$2))
 		shift 2
 		;;
 	--max-count)
 		only_in traces "$1"
-		need_arg "$1" $#
+		need_value "$1" $# 2
 		need_number "$1" "$2"
 		MAX_COUNT=$((10#$2))
 		shift 2
 		;;
 	--max-total-gb)
 		only_in traces "$1"
-		need_arg "$1" $#
+		need_value "$1" $# 2
 		need_number "$1" "$2"
 		MAX_TOTAL_GB=$((10#$2))
 		shift 2
 		;;
 	--dir)
 		only_in traces "$1"
-		need_arg "$1" $#
+		need_value "$1" $# 2
 		DIR="$2"
 		shift 2
 		;;
 	--warn-gb)
 		only_in target "$1"
-		need_arg "$1" $#
+		need_value "$1" $# 2
 		need_number "$1" "$2"
 		WARN_GB=$((10#$2))
 		shift 2

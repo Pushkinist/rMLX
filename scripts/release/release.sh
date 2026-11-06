@@ -187,6 +187,7 @@ sha() {
 # bottle, and a published GitHub Release for the tag so the root_url is valid. No release step runs
 # this (docs/RELEASING.md § "No Homebrew bottle").
 bottle() {
+  [ "${1:-}" != "--root-url" ] || need_value "$1" $# 2
   command -v brew >/dev/null 2>&1 || { echo "error: brew not found" >&2; exit 1; }
   command -v jq  >/dev/null 2>&1 || { echo "error: jq not found (brew install jq)" >&2; exit 1; }
 
@@ -197,7 +198,7 @@ bottle() {
 
   ROOT_URL="https://github.com/${OWNER_REPO}/releases/download/v${VER}"
   if [ "${1:-}" = "--root-url" ]; then
-    ROOT_URL="${2:?error: --root-url requires a URL argument}"
+    ROOT_URL="$2"
   fi
 
   echo "==> building bottle for rmlx v${VER}"
@@ -352,6 +353,8 @@ case "$MODE" in
 esac
 
 cd "$(dirname "$0")/../.." || exit 2
+# shellcheck source=scripts/lib/args.sh
+. scripts/lib/args.sh
 # shellcheck source=scripts/lib/identity.sh
 . scripts/lib/identity.sh
 

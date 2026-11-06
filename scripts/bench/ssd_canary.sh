@@ -71,15 +71,16 @@ DRY_RUN=false
 
 # ── Arg parsing ───────────────────────────────────────────────────────────────
 
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/args.sh"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run)         DRY_RUN=true; shift ;;
         --port=*)          PORT="${1#--port=}"; shift ;;
-        --port)            shift; PORT="${1:?--port requires a value}"; shift ;;
+        --port)            need_value "$1" $# 1; PORT="$2"; shift 2 ;;
         --ssd-gb=*)        SSD_GB="${1#--ssd-gb=}"; shift ;;
-        --ssd-gb)          shift; SSD_GB="${1:?--ssd-gb requires a value}"; shift ;;
+        --ssd-gb)          need_value "$1" $# 1; SSD_GB="$2"; shift 2 ;;
         --binary=*)        BINARY="${1#--binary=}"; shift ;;
-        --binary)          shift; BINARY="${1:?--binary requires a value}"; shift ;;
+        --binary)          need_value "$1" $# 1; BINARY="$2"; shift 2 ;;
         *) echo "Unknown flag: $1" >&2; exit 1 ;;
     esac
 done

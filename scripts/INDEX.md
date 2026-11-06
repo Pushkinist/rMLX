@@ -96,7 +96,7 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
-| `lib/args.sh` | bench/ab.sh, bench/llama_ab.sh, bench/prefill_chunk_sweep.sh | Argument-parsing helpers shared by the bench harnesses; source it. |
+| `lib/args.sh` | bench/ab.sh, bench/llama_ab.sh, bench/prefill_chunk_sweep.sh, +7 more scripts | Argument-parsing helpers shared by the option parsers of the scripts; source it. |
 | `lib/awk_text.sh` | crates/rmlx-models/tests/common/stop_scan.rs, check/gpu_device_census.sh, check/gpu_tests.sh, check/kernel_dispatch.sh, +2 more scripts | Line readers for Rust-scanning gates: code without comments, without string bodies, bodiless fns. |
 | `lib/bench_server.sh` | bench/baseline_cells.sh, bench/cross_backend.sh, bench/serve_bench.sh, +1 more scripts | Start, wait for and identify one rmlx server, for bench harnesses; source it. |
 | `lib/busiest_between.awk` | bench/ab.sh, bench/ab_selftest.sh, bench/llama_ab.sh, +2 more scripts | Which process burned the most CPU between two cpu_snapshot files. |

@@ -274,7 +274,7 @@ section 3); that a code means what this table says is the reviewer's. [review]
 | wait for one `rmlx serve` to answer, for a time you give (`wait_for_server`) | `lib/server_wait.sh` |
 | file a record already in the pending buffer, exit 75 on refusal (`rmlx_record_file`) | `lib/record_pending.sh` |
 | host CPU interference, and the verdict on a window (`classify_window`) | `lib/cpu_snapshot.sh` + `lib/busiest_between.awk` |
-| a flag given without its value (`need_value`, exit 125) | `lib/args.sh` |
+| a flag given without its value (`need_value <flag> $# [exit]`, exit 125 unless the tool's header declares another usage exit) | `lib/args.sh` |
 | a recall-test case runner | `lib/selftest_support.sh` (`st_init`, `st_case`, `st_run`, `st_check`, `st_verdict`, `st_bounded`, `st_done`) |
 | the planted `scripts/` trees of the gate's recall tests | `lib/selftest_support.sh` (`sg_init`, `sg_fresh`, `sg_put`, `sg_gate`, ...) |
 | comment and literal blanking in a Rust scanner | `lib/awk_text.sh` |

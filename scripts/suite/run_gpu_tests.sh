@@ -183,7 +183,8 @@
 # Exit 0 = every selected GPU test passed in both runs, and every
 # shader-validation hit was one the census pin accounts for. Exit 1 = a failing
 # test, a test that failed under the instrument alone, a hit the pin does not
-# account for, or a run that executed nothing. A stand-down is not an exit code
+# account for, a run that executed nothing, or a usage error (an unknown argument, a flag
+# given without its value, a value that is not a half). A stand-down is not an exit code
 # — a developer without the weights must not be blocked — but it is on the
 # final line, marked INCOMPLETE.
 
@@ -225,11 +226,13 @@ HALF=""
 SHADER_VALIDATION=1
 PREFLIGHT=0
 BUILD_ONLY=0
+# shellcheck source=scripts/lib/args.sh
+. "${REPO_ROOT}/scripts/lib/args.sh"
 while [ $# -gt 0 ]; do
     case "$1" in
-        --crate)  ONLY_CRATE="${2:?--crate needs a value}"; shift 2 ;;
-        --filter) FILTER="${2:?--filter needs a value}"; shift 2 ;;
-        --half)   HALF="${2:?--half needs a value}"; shift 2 ;;
+        --crate)  need_value "$1" $# 1; ONLY_CRATE="$2"; shift 2 ;;
+        --filter) need_value "$1" $# 1; FILTER="$2"; shift 2 ;;
+        --half)   need_value "$1" $# 1; HALF="$2"; shift 2 ;;
         --shader-validation)    SHADER_VALIDATION=1; shift ;;
         --no-shader-validation) SHADER_VALIDATION=0; shift ;;
         --preflight) PREFLIGHT=1; shift ;;

@@ -2099,6 +2099,23 @@ wait_for_server_contract() {
 wait_for_server_contract
 verdict
 
+# A flag given last without its value is a usage error, on the bash 3.2 that macOS ships.
+flag_without_value_contract() {
+	CASE_NAME="flag_without_value_refused"
+	CASE_WHAT="a flag given last without its value exits 1 naming the flag, under /bin/bash"
+	CASE_HOME="$WORK/home_$CASE_NAME"
+	CASE_OUT="$WORK/$CASE_NAME.log"
+	CASE_BAD=""
+	mkdir -p "$CASE_HOME"
+	local got=0
+	env -i PATH=/usr/bin:/bin RMLX_HOME="$CASE_HOME" \
+		/bin/bash "$FAKE_ROOT/scripts/bench/serve_bench.sh" --model "$VERIFIER_DIR" --tag >"$CASE_OUT" 2>&1 || got=$?
+	[ "$got" = "1" ] || note_bad "exit=$got (want 1)"
+	grep -qF -- '--tag requires a value' "$CASE_OUT" || note_bad "the refusal does not name --tag"
+}
+flag_without_value_contract
+verdict
+
 echo
 echo "passed=$PASSED failed=$FAILED"
 [ "$FAILED" -eq 0 ] || exit 1

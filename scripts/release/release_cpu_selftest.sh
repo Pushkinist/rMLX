@@ -277,7 +277,7 @@ package_root() {
     release="$(dirname "$TOOL")"
     mkdir -p "$root/scripts/release" "$root/scripts/lib" "$root/.cargo" "$root/bin"
     cp "$release/release.sh" "$release/release_cpu.py" "$root/scripts/release/"
-    cp "$release/../lib/identity.sh" "$root/scripts/lib/"
+    cp "$release/../lib/args.sh" "$release/../lib/identity.sh" "$root/scripts/lib/"
     printf '[workspace.package]\nversion = "0.0.0"\n' >"$root/Cargo.toml"
     printf '[build]\nrustflags = %s\n' "$CONFIG_FLAGS" >"$root/.cargo/config.toml"
     printf 'licence\n' >"$root/LICENSE-MIT"
