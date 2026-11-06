@@ -10,7 +10,7 @@
 
 Measured by `scripts/published/bench.sh` under the protocol
 third-party on-device speculative-decoding posts report, so these numbers
-can sit beside theirs. Bounds by `scripts/perf_ceiling.py`.
+can sit beside theirs. Bounds by `scripts/profile/perf_ceiling.py`.
 
 ## The protocol, and the parts of it we chose
 
@@ -49,7 +49,7 @@ assume.
 ## Where the bounds come from
 
 Every measured figure is printed beside the figure it cannot exceed. The
-bounds are `scripts/perf_ceiling.py` — a static census over the snapshot's
+bounds are `scripts/profile/perf_ceiling.py` — a static census over the snapshot's
 `config.json` and safetensors headers, no GPU and no model — at
 614 GB/s on `m5_max_128gb`, with the KV
 priced at `none` and a ring preallocated to `--max-ctx 8192`. Its KV byte model is held to the engine's own by

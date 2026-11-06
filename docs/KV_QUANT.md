@@ -625,7 +625,7 @@ fused-decode work builds on them.
 
 `kv_frac` is the KV share of the bytes a decode step reads:
 `kv_bytes_step / (weight_bytes_step + kv_bytes_step)`. It is the ceiling on the
-part of decode that a KV codec can change. `scripts/perf_ceiling.py` prints it
+part of decode that a KV codec can change. `scripts/profile/perf_ceiling.py` prints it
 in the last column of every row. It reads `config.json` and the safetensors
 index and runs no model. `make check-kv-byte-model-parity` holds its KV byte
 model to the engine's.
@@ -649,7 +649,7 @@ unless `--allow-truncate` or `--max-prompt-tokens` is given.
 
 A decode result for one K bit width is not a result for another. The K bit
 width sets the bytes of the store: `kb + 32/kg` bits per value for `mixed_*`.
-`kv_frac`, from `scripts/perf_ceiling.py --kv-quant <codec>`, bounds the share
+`kv_frac`, from `scripts/profile/perf_ceiling.py --kv-quant <codec>`, bounds the share
 of a decode step those bytes can change. Both depend on the model and the
 context. So state the codec, its K bit width and `kv_frac` with every cell.
 

@@ -8,7 +8,7 @@
 #      ssd_evict_total populate runs.db and /metrics.
 #
 # Usage:
-#   VERIFIER_MODEL=/path/to/snapshot bash scripts/ssd_canary.sh [--port N] \
+#   VERIFIER_MODEL=/path/to/snapshot bash scripts/bench/ssd_canary.sh [--port N] \
 #     [--ssd-gb N] [--dry-run] [--binary PATH]
 # Exit:   0 every check held; 1 a FAIL check failed or the setup was refused; 11 passthrough of
 #         rmlx serve (the Metal claim is held); 75 a phase record was refused, the run went on;
@@ -53,7 +53,7 @@ trap on_exit EXIT
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 source "${REPO_ROOT}/scripts/lib/identity.sh"
 BINARY="$(rmlx_default_binary "${REPO_ROOT}" release-perf)"
 
@@ -97,8 +97,8 @@ fi
 
 # Run identity (backend / version / git sha / build profile / hardware tag)
 # comes from the measured binary — never hard-coded here.
-source "$(dirname "${BASH_SOURCE[0]}")/lib/server_wait.sh"
-source "$(dirname "${BASH_SOURCE[0]}")/lib/record_pending.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/server_wait.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/record_pending.sh"
 rmlx_export_identity "${BINARY}"
 PROMPT_DIR="${REPO_ROOT}/prompts/ssd_bench"
 GIT_SHA="$(rmlx_git_sha "${REPO_ROOT}")"
@@ -121,7 +121,7 @@ ERROR: VERIFIER_MODEL env var is required.
 Resolve concrete absolute paths from LOCAL.md (gitignored). Example:
 
   VERIFIER_MODEL=/path/to/mlx-community__gemma-4-e2b-it-mxfp8 \\
-    bash scripts/ssd_canary.sh
+    bash scripts/bench/ssd_canary.sh
 
 USAGE
     exit 1

@@ -498,7 +498,7 @@ supplies:
   (`rmlx_git_sha` in `scripts/lib/identity.sh`). A hex sha that resolves in
   that repo is filed in the short form HEAD is filed in; any other value is
   filed as given, and an `unknown...` value counts as none. This covers
-  `bench/serve_bench.sh`, `ssd_canary.sh` and `bench/baseline_cells.sh`.
+  `bench/serve_bench.sh`, `bench/ssd_canary.sh` and `bench/baseline_cells.sh`.
 - `rmlx baseline --git-sha <sha>` and `rmlx eval ppl --git-sha <sha>` stamp
   it. Without the flag it is `NULL`.
 
@@ -754,7 +754,7 @@ change to what `bests` publishes, such as a `METRICS_SCHEMA.md` §4.1 bounds cha
       cache-types` cell, and the `rmlx bench` slots of
       `scripts/bench/prefill_chunk_sweep.sh`: each set is recorded once, as the
       aggregate the script computes.
-    - `scripts/schema_constraint_canary.sh`: a correctness proof run under
+    - `scripts/bench/schema_constraint_canary.sh`: a correctness proof run under
       `--log verbose` in a hermetic `RMLX_HOME` per probe, so that probe's
       log holds its own records only. It measures no rate.
     - A `scripts/profile/capture.sh mst` run its `--time-limit` stops: `baseline`

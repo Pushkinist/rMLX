@@ -527,7 +527,7 @@ check-kv-codec-disposition: ## CI gate: fail if the --kv-quant/--kv-bits help or
 check-kv-codec-disposition-fixtures: ## CI gate: recall test for the above — synthetic scan roots, each asserting which rule fired
 	@bash scripts/check/engine_parity_selftest.sh kv-codec-disposition
 
-check-kv-byte-model-parity: ## CI gate: fail if scripts/perf_ceiling.py's KV byte model disagrees with the engine's
+check-kv-byte-model-parity: ## CI gate: fail if scripts/profile/perf_ceiling.py's KV byte model disagrees with the engine's
 	@bash scripts/check/engine_parity.sh kv-byte-model
 
 check-kv-byte-model-parity-fixtures: ## CI gate: recall test for the above — synthetic manifests and the two usage errors, each asserting which check fired
@@ -997,7 +997,7 @@ canary-ab-selftest: ## mutation-check the A/B harness against stub binaries (no 
 	bash scripts/bench/ab_selftest.sh logic
 
 codec-smoke-runner-selftest: ## recall-check the codec-matrix runner verdict (ran, skipped, INCOMPLETE, exit codes) over --dry-run and throwaway roots (no GPU, no model)
-	bash scripts/codec_smoke_runner_selftest.sh
+	bash scripts/bench/codec_matrix/runner_selftest.sh
 
 canary-ab-host-gate-fixtures: ## recall-check the A/B harness's host gates against shimmed hosts (no GPU, no model)
 	bash scripts/bench/ab_selftest.sh host-gate
@@ -1097,7 +1097,7 @@ spec-canary-gate:   ## gate spec-decode regressions (decode_tps_warm + accept_ra
 
 # ---- SSD-tier canary (POPULATE / REVISIT / EVICT) -------------------------
 #
-# `make ssd-canary` — runs scripts/ssd_canary.sh end-to-end against VERIFIER_MODEL.
+# `make ssd-canary` — runs scripts/bench/ssd_canary.sh end-to-end against VERIFIER_MODEL.
 #                     Spawns three server phases (POPULATE, REVISIT, EVICT) in a new
 #                     run directory under <data root>/proofs/, writes CSVs +
 #                     iteration_summary.json there, and ingests per-phase observations
@@ -1123,10 +1123,10 @@ spec-canary-gate:   ## gate spec-decode regressions (decode_tps_warm + accept_ra
 ssd-canary: build-perf  ## run SSD canary (POPULATE/REVISIT/EVICT) against VERIFIER_MODEL
 	@test -n "$$VERIFIER_MODEL" || { echo "ERROR: VERIFIER_MODEL= required (resolve via LOCAL.md)"; exit 125; }
 	@echo "==> ssd-canary: populate + revisit + evict"
-	bash scripts/ssd_canary.sh --ssd-gb $${SSD_GB:-100}
+	bash scripts/bench/ssd_canary.sh --ssd-gb $${SSD_GB:-100}
 
 ssd-canary-selftest: ## check ssd-canary and ssd-canary-gate against a stub binary and server (no GPU, no model, no real data root)
-	bash scripts/ssd_canary_selftest.sh
+	bash scripts/bench/ssd_canary_selftest.sh
 
 # ---- json_schema constraint canary ---------------------------------------
 #
@@ -1137,7 +1137,7 @@ ssd-canary-selftest: ## check ssd-canary and ssd-canary-gate against a stub bina
 #                     never engaged. Two probes per model (plain key / spaced
 #                     key); decision rule R1..R5 and the per-cell baseline
 #                     expectation table are stated at the top of
-#                     scripts/schema_constraint_canary.sh; artifacts land under
+#                     scripts/bench/schema_constraint_canary.sh; artifacts land under
 #                     .rmlx/proofs/schema-constraint/. One server process per
 #                     probe (four model loads) so no cell's log needs filtering
 #                     — a filter keyed on request-id propagation would depend on
@@ -1158,7 +1158,7 @@ ssd-canary-selftest: ## check ssd-canary and ssd-canary-gate against a stub bina
 #               BONSAI_MODEL / GEMMA_E2B_MODEL. Needs an idle GPU.
 
 schema-constraint-canary: build-perf  ## prove json_schema enforcement on Bonsai + gemma-4-e2b (EXPECT=fixed|baseline)
-	bash scripts/schema_constraint_canary.sh --expect $${EXPECT:-fixed}
+	bash scripts/bench/schema_constraint_canary.sh --expect $${EXPECT:-fixed}
 
 ssd-canary-gate:   ## gate SSD-tier regressions; SHA= required, THRESHOLD_PCT=3 default
 	@test -n "$(SHA)" || { echo "ERROR: SHA= required. Usage: make ssd-canary-gate SHA=<last-green-sha>"; exit 125; }
@@ -1198,7 +1198,7 @@ bench-codec-cell: ## bench one codec × one model cell (CODEC= MODEL= required);
 	bash scripts/bench/baseline_cells.sh --model $(MODEL) --kv-quant $(CODEC) --record diagnostic
 
 # ---- Codec smoke + NIAH gate matrix -------------------------------------
-# Drive scripts/release_e2e/stage6_perf/codec_smoke_runner.sh over
+# Drive scripts/bench/codec_matrix/runner.sh over
 # kv_codec_matrix.toml. Honours single-MLX-process discipline (CLAUDE.md
 # hard rule 8) via the runner's preflight. Self-hosted Metal required.
 #
@@ -1218,7 +1218,7 @@ smoke-codec-matrix:  ## codec smoke + NIAH gate matrix (CODEC= MATRIX_MODEL= REC
 		if [ -n "$(CODEC)" ]; then args="$$args --filter codec_name=$(CODEC)"; fi; \
 		if [ -n "$(MATRIX_MODEL)" ]; then args="$$args --filter model=$(MATRIX_MODEL)"; fi; \
 		if [ -n "$(RECORD)" ]; then args="$$args --record-baseline"; fi; \
-		bash scripts/release_e2e/stage6_perf/codec_smoke_runner.sh $$args
+		bash scripts/bench/codec_matrix/runner.sh $$args
 
 # ---- asm inspection (on-demand; requires cargo-asm: cargo install cargo-asm) --
 # Usage: make asm  (shows dequant_to_f32 in rmlx-quant by default)

@@ -14,7 +14,7 @@
 # right, only that there is effectively one copy of the fact.
 #
 # kv-byte-model [MANIFEST]
-#   `scripts/perf_ceiling.py` prices a codec without building the workspace, so it carries a second
+#   `scripts/profile/perf_ceiling.py` prices a codec without building the workspace, so it carries a second
 #   copy of `estimated_resident_bytes_per_layer`, `packed_side_bytes`, `feeds_bf16_{k,v}_at_decode`
 #   and `boundary_floor`. That copy drifted twice (a 4-byte ring sideband after the store narrowed
 #   to 2; two bf16 mirrors for the Mixed family on architectures that stopped keeping them), and
@@ -136,10 +136,10 @@ load_manifest() {
 # ── kv-byte-model ────────────────────────────────────────────────────────────
 
 mode_kv_byte_model() {
-    local manifest_src="${1:-}" perf_ceiling="${REPO_ROOT}/scripts/perf_ceiling.py"
+    local manifest_src="${1:-}" perf_ceiling="${REPO_ROOT}/scripts/profile/perf_ceiling.py"
     local actual codecs topologies shapes py_rows
 
-    [ -f "${perf_ceiling}" ] || die_env "missing scripts/perf_ceiling.py"
+    [ -f "${perf_ceiling}" ] || die_env "missing scripts/profile/perf_ceiling.py"
     command -v python3 >/dev/null 2>&1 ||
         die_env "python3 not on PATH — the second byte model is a python script"
     new_work
@@ -177,10 +177,10 @@ sideband width from a wrong per-row term"
 dropped rows rather than disagreeing with them, so a diff would under-report"
 
     if ! diff -u "${WORK}/rust.tsv" "${WORK}/py.tsv" >"${WORK}/parity.diff"; then
-        echo "ERROR: scripts/perf_ceiling.py disagrees with the engine's byte model." >&2
+        echo "ERROR: scripts/profile/perf_ceiling.py disagrees with the engine's byte model." >&2
         echo >&2
         echo "  '-' is the engine (crates/rmlx-kv-quant, crates/rmlx-models)." >&2
-        echo "  '+' is scripts/perf_ceiling.py." >&2
+        echo "  '+' is scripts/profile/perf_ceiling.py." >&2
         echo "  Columns: kind, codec, shares_kv, then the shape, then the value." >&2
         echo >&2
         grep -E '^[-+]KV' "${WORK}/parity.diff" >&2
@@ -191,7 +191,7 @@ dropped rows rather than disagreeing with them, so a diff would under-report"
 
     echo "OK: ${actual} byte-model rows (${codecs} KV codecs x ${topologies} \
 topologies x ${shapes} shapes) agree between the engine and \
-scripts/perf_ceiling.py."
+scripts/profile/perf_ceiling.py."
 }
 
 # ── kv-codec-disposition ─────────────────────────────────────────────────────

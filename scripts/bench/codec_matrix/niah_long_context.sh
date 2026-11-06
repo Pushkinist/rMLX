@@ -23,7 +23,7 @@
 # holder; nothing is stopped for it.
 #
 # Usage:
-#   bash scripts/release_e2e/stage6_perf/niah_long_context.sh \
+#   bash scripts/bench/codec_matrix/niah_long_context.sh \
 #     [--mode {turbo|pflash|both}] [--off-only|--on-only] [--filter <substr>]
 #
 #   --mode MODE   `turbo` (default) — TurboFlash cells; sets RMLX_TURBO_FLASH.

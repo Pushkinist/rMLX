@@ -49,9 +49,9 @@ Preconditions:
     tensor). Drop 32768 from `--lengths` on a smaller machine.
 
 Usage:
-    python3 scripts/sdpa_headdim_bench.py                 # all three sections
-    python3 scripts/sdpa_headdim_bench.py --json out.json
-    python3 scripts/sdpa_headdim_bench.py --sections prefill --lengths 2048,8192
+    python3 scripts/bench/sdpa_headdim.py                 # all three sections
+    python3 scripts/bench/sdpa_headdim.py --json out.json
+    python3 scripts/bench/sdpa_headdim.py --sections prefill --lengths 2048,8192
 """
 
 import argparse

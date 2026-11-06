@@ -8,7 +8,7 @@ Exit:   0 rendered; 1 an input could not be read, or the inputs do not describe 
 
 Reads one `published/bench.sh` result file per engine mode — plain, and
 each speculative arm — and prints Markdown. Writes no DB row, serves nothing,
-never launches a model. The only thing it runs is `scripts/perf_ceiling.py`,
+never launches a model. The only thing it runs is `scripts/profile/perf_ceiling.py`,
 itself a static census over the snapshot's `config.json` and safetensors
 headers.
 
@@ -92,12 +92,12 @@ from pathlib import Path
 
 _SCRIPTS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_SCRIPTS / "lib"))
-sys.path.insert(0, str(_SCRIPTS))
+sys.path.insert(0, str(_SCRIPTS / "profile"))
 
 from perf_ceiling import HOST_BW_BYTES_PER_S, HOST_BW_HARDWARE_TAG  # noqa: E402
 from snapshot_identity import split_model_dir  # noqa: E402
 
-PERF_CEILING = _SCRIPTS / "perf_ceiling.py"
+PERF_CEILING = _SCRIPTS / "profile" / "perf_ceiling.py"
 
 # Datasets in the order a reader expects, ahead of any cell a run adds.
 DATASET_ORDER = ("mt_bench", "math_500", "humaneval")
@@ -318,7 +318,7 @@ def ceiling_block(result: dict, meta: dict) -> list[str]:
         "## Where the bounds come from",
         "",
         "Every measured figure is printed beside the figure it cannot exceed. The",
-        "bounds are `scripts/perf_ceiling.py` — a static census over the snapshot's",
+        "bounds are `scripts/profile/perf_ceiling.py` — a static census over the snapshot's",
         "`config.json` and safetensors headers, no GPU and no model — at",
         f"{meta['bandwidth_gbs']:.0f} GB/s on `{meta['hardware_tag']}`, with the KV",
         f"priced at `{result['kv_quant']}` and a ring preallocated to `--max-ctx "
@@ -815,7 +815,7 @@ def render(results: list[dict], snapshot: Path, bounds: dict, meta: dict,
     lines += [
         "Measured by `scripts/published/bench.sh` under the protocol",
         "third-party on-device speculative-decoding posts report, so these numbers",
-        "can sit beside theirs. Bounds by `scripts/perf_ceiling.py`.",
+        "can sit beside theirs. Bounds by `scripts/profile/perf_ceiling.py`.",
         "",
     ]
     lines += protocol_block(results[0])

@@ -422,7 +422,7 @@ pub(crate) fn reject_nan_prefill(
 
 /// Decode-loop timing accumulators, returned for arch-side `decode_profile`
 /// emission. Nanoseconds; the arch converts to the milliseconds field shapes
-/// `scripts/aggregate_decode_profile.py` parses.
+/// `scripts/profile/aggregate_decode_profile.py` parses.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct DecodeStats {
     pub forward_total_ns: u128,

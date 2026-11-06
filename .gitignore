@@ -81,7 +81,6 @@ __pycache__/
 
 # Generated champions table (regenerate via `make metrics-export`; not tracked).
 /BENCHMARK_CHAMPIONS.md
-scripts/release_e2e/stage6_perf/last_run.json
 
 # Repo-local model-snapshot dir (RMLX_O_MODELS_ROOT fallback). Drop snapshots here.
 /models/

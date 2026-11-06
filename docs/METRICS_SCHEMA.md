@@ -663,7 +663,7 @@ kinds. The rows are inside their bounds, so a predicate names each.
 Read a recorded rate through `bests` or a `query::*` function; both apply
 the bound. A consumer that needs the raw distribution, such as a median over
 a cell, carries the predicate itself and cites this section.
-`scripts/perf_ceiling.py`'s `prefill_anchor` is the one such consumer.
+`scripts/profile/perf_ceiling.py`'s `prefill_anchor` is the one such consumer.
 
 **Backend coverage.** `rmlx_metrics::registry::COVERAGE_MATRIX` states which
 backend can emit which metric. A pair it does not list reads as `No`. Its

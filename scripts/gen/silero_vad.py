@@ -6,7 +6,7 @@ crates/rmlx-audio/assets/silero_vad_16k.safetensors and loaded at runtime
 by the rmlx-audio VAD engine. Do NOT run at server startup.
 
 Usage:
-    uv run scripts/convert_silero_vad.py <silero_vad.onnx> <output.safetensors>
+    uv run scripts/gen/silero_vad.py <silero_vad.onnx> <output.safetensors>
 Exit:   0 converted; 1 onnx is not installed, or a weight the model must hold is missing
 Caller: by hand
 

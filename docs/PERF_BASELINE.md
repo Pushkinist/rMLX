@@ -12,7 +12,7 @@ default. `auto` is unquantised bf16 on every architecture (`docs/KV_QUANT.md`
 with the `release-perf` profile, by `make canary`.
 
 Hardware: M5 Max, bandwidth ceiling 614 GB/s. That is the host constant
-`scripts/perf_ceiling.py` divides by; `--bandwidth-gbs` overrides it.
+`scripts/profile/perf_ceiling.py` divides by; `--bandwidth-gbs` overrides it.
 
 | model | kv_quant | decode_tps | stddev |
 |---|---|---:|---:|
@@ -248,13 +248,13 @@ reaches no champion and no gate. The binary is `--binary`, else
 
 ## Reading a decode rate against the bandwidth ceiling
 
-`scripts/perf_ceiling.py` computes the bytes one decode step must stream. It
+`scripts/profile/perf_ceiling.py` computes the bytes one decode step must stream. It
 reads `config.json` and the safetensors headers, adds the KV bytes of the
 codec at the given context, and divides by the host bandwidth. It reads no
 tensor data and launches no model.
 
 ```sh
-scripts/perf_ceiling.py --model "$RMLX_O_MODELS_ROOT/<snapshot>" \
+scripts/profile/perf_ceiling.py --model "$RMLX_O_MODELS_ROOT/<snapshot>" \
     --kv-quant <codec> --ctx 4096 --max-ctx 8192 --no-db --json
 ```
 

@@ -419,7 +419,7 @@ Both engines refuse raw C0 control bytes inside any string, keys included
 before the root value. The `json_object` engine accepts it there, under the
 same cap.
 
-`make schema-constraint-canary` (`scripts/schema_constraint_canary.sh`) is the
+`make schema-constraint-canary` (`scripts/bench/schema_constraint_canary.sh`) is the
 real-model check, on Bonsai and gemma-4-e2b with two probes each. Its PASS and
 FAIL rule is fixed at the top of the script. `EXPECT=baseline` asserts a
 per-cell table, so a harness too weak to see a defect fails too. Each probe

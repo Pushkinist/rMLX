@@ -1,6 +1,6 @@
 # SSD Canary
 
-`scripts/ssd_canary.sh` drives a live `rmlx serve` through three server
+`scripts/bench/ssd_canary.sh` drives a live `rmlx serve` through three server
 processes. It checks that a new process serves prompts from blocks an
 earlier process spilled to SSD, and that startup eviction holds the budget.
 
@@ -8,7 +8,7 @@ earlier process spilled to SSD, and that startup eviction holds the budget.
 
 ```bash
 make build-perf
-VERIFIER_MODEL=/path/to/snapshot bash scripts/ssd_canary.sh \
+VERIFIER_MODEL=/path/to/snapshot bash scripts/bench/ssd_canary.sh \
   [--port 62265] [--ssd-gb 100] [--dry-run]
 ```
 
@@ -128,7 +128,7 @@ without the DB, or when no canary cell has a value at the SHA — which is every
 cell on the first run after the per-phase prompts were introduced, since the
 earlier runs filed all three phases under one prompt.
 
-`scripts/ssd_canary_selftest.sh` (`make ssd-canary-selftest`, in `make ci`)
+`scripts/bench/ssd_canary_selftest.sh` (`make ssd-canary-selftest`, in `make ci`)
 runs `make ssd-canary` and the gate against a stub binary and a stub server,
 with `RMLX_HOME` exported, unset, and beside an exported `RMLX_METRICS_DB`,
 and checks that a relative `RMLX_HOME` is refused before a phase server starts. It checks that a data root survives the run byte for byte,

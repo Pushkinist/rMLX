@@ -588,7 +588,7 @@ Snapshot in use: `mlx-community__Laguna-XS.2-mxfp8`.
 - `tie_word_embeddings` must be true: the embedding is the LM head.
 - `head_dim` is `hidden_size / num_attention_heads`. Full RoPE, no scaling.
 - `max_position_embeddings` is required and is the positional capacity.
-- `scripts/perf_ceiling.py` cannot size this model: it reads the packed `u8`
+- `scripts/profile/perf_ceiling.py` cannot size this model: it reads the packed `u8`
   headers, while the loader holds BF16. See `docs/PERF_BASELINE.md`
   "What the census cannot size".
 
@@ -711,7 +711,7 @@ audio file with a sibling `*.transcript.vtt` in the git-ignored
 
 Silero VAD v4 (16 kHz branch) is vendored as
 `crates/rmlx-audio/assets/silero_vad_16k.safetensors`, converted by
-`scripts/convert_silero_vad.py` (licence: `crates/rmlx-audio/assets/NOTICE`).
+`scripts/gen/silero_vad.py` (licence: `crates/rmlx-audio/assets/NOTICE`).
 It is exported as `rmlx_audio::vad`, and nothing calls it: the server and the
 CLI use the 30 s window walk above.
 

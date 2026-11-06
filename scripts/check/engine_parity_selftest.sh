@@ -42,7 +42,7 @@ all) st_init engine-parity-selftest ;;
     ;;
 esac
 
-PERF_CEILING="$REPO_ROOT/scripts/perf_ceiling.py"
+PERF_CEILING="$REPO_ROOT/scripts/profile/perf_ceiling.py"
 CODEC_BASE="$REPO_ROOT/scripts/fixtures/kv_codec_disposition/base"
 ENGINE_PARITY="$REPO_ROOT/scripts/check/engine_parity.sh"
 

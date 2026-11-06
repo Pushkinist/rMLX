@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# scripts/codec_smoke_runner_selftest.sh — recall test for the verdict of
-# `scripts/release_e2e/stage6_perf/codec_smoke_runner.sh`.
+# scripts/bench/codec_matrix/runner_selftest.sh — recall test for the verdict of
+# `scripts/bench/codec_matrix/runner.sh`.
 #
 # doc-refs: fixture
 #
@@ -15,8 +15,8 @@
 
 set -uo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUNNER="$REPO_ROOT/scripts/release_e2e/stage6_perf/codec_smoke_runner.sh"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+RUNNER="$REPO_ROOT/scripts/bench/codec_matrix/runner.sh"
 NIAH="$REPO_ROOT/crates/rmlx-models/tests/niah_long_context.rs"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -128,9 +128,9 @@ run_case root_not_a_directory 1 "a root that is not a directory fails the row" \
 FAKE="$WORK/fake"
 . "$REPO_ROOT/scripts/lib/identity.sh"
 FAKE_RMLX="$(rmlx_default_binary "$FAKE" release-perf)"
-mkdir -p "$FAKE/scripts/release_e2e/stage6_perf" "$(dirname "$FAKE_RMLX")" "$FAKE/bin"
-cp "$RUNNER" "$REPO_ROOT/scripts/release_e2e/stage6_perf/smoke_prompts.toml" \
-    "$FAKE/scripts/release_e2e/stage6_perf/"
+mkdir -p "$FAKE/scripts/bench/codec_matrix" "$(dirname "$FAKE_RMLX")" "$FAKE/bin"
+cp "$RUNNER" "$REPO_ROOT/scripts/bench/codec_matrix/smoke_prompts.toml" \
+    "$FAKE/scripts/bench/codec_matrix/"
 mkdir -p "$FAKE/scripts/lib"
 cp "$REPO_ROOT/scripts/lib/record_pending.sh" "$REPO_ROOT/scripts/lib/identity.sh" "$FAKE/scripts/lib/"
 printf '#!/bin/sh\nfor i in 1 2 3 4 5; do echo "needle_found=$STUB_FOUND"; done\nexit ${STUB_RC:-0}\n' >"$FAKE_RMLX"
@@ -148,7 +148,7 @@ gate_case() {
     shift 6
     local out="$WORK/$name.log"
     PATH="${GATE_BIN:-$FAKE/bin}:$PATH" STUB_FOUND="$found" RMLX_O_MODELS_ROOT="$ROOT_GEMMA" \
-        bash "$FAKE/scripts/release_e2e/stage6_perf/codec_smoke_runner.sh" \
+        bash "$FAKE/scripts/bench/codec_matrix/runner.sh" \
         --manifest "$manifest" --out "$WORK/$name.json" $flag >"$out" 2>&1
     got=$?
     [ "$got" = "$want" ] || ok=0
@@ -203,6 +203,21 @@ json_has gate_smoke_record_pending "the result file counts the pending record" '
 
 STUB_RC=7 gate_case gate_niah_fails 1 "a NIAH pass that exits non-zero fails the row with its own status" \
     true "$WORK/g_one.toml" "" "niah_fail" "rc=7" "!niah_pass" "!niah_no_pct"
+
+# Without --out the result file lands under RMLX_HOME and nowhere under the runner's tree.
+HOME_CASE="$WORK/home_case"
+PATH="$FAKE/bin:$PATH" STUB_FOUND=true RMLX_HOME="$HOME_CASE" RMLX_O_MODELS_ROOT="$ROOT_GEMMA" \
+    bash "$FAKE/scripts/bench/codec_matrix/runner.sh" --manifest "$WORK/g_one.toml" \
+    >"$WORK/last_run_home.log" 2>&1
+if [ -s "$HOME_CASE/bench/codec_matrix/last_run.json" ] && [ -z "$(find "$FAKE/scripts" -name last_run.json)" ] \
+    && [ ! -e "$FAKE/.rmlx" ]; then
+    PASSED=$((PASSED + 1))
+    printf '  ok   %-30s — the result file is under RMLX_HOME and not under scripts/\n' last_run_under_rmlx_home
+else
+    FAILED=$((FAILED + 1))
+    printf '  FAIL %-30s — the result file is not under RMLX_HOME alone\n' last_run_under_rmlx_home
+    sed 's/^/       | /' "$WORK/last_run_home.log" | tail -15
+fi
 
 # The runner and the NIAH cells each list the slugs; they must be the same set.
 runner_slugs="$(sed -n '/^model_slug()/,/^}/p' "$RUNNER" | grep -o "printf '[^']*'" | sed "s/printf '//; s/'$//" | grep -v '^$' | sort)"

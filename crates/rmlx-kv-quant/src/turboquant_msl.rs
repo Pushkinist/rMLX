@@ -20,7 +20,7 @@
 //! centroids from the Python fork's dead `_compute_gaussian_codebook` function. GPU constants are
 //! bit-exact with the CPU path in `turboquant.rs::CODEBOOK_*`.
 //!
-//! Derivation script: `scripts/gen_lloyd_codebook.py`.
+//! Derivation script: `scripts/gen/lloyd_codebook.py`.
 //!
 //! # Algorithm (matches CPU path)
 //!
@@ -99,7 +99,7 @@ const CB_MAX: f32 = 2.717_667;
 /// different bit pattern than `(-1.2399590f + -0.9282447f) * 0.5f`, causing
 /// quantization index differences on boundary-crossing values.
 ///
-/// Bit patterns derived from `scripts/gen_lloyd_codebook.py` and verified
+/// Bit patterns derived from `scripts/gen/lloyd_codebook.py` and verified
 /// against `turboquant.rs::CODEBOOK_4BIT` via `struct.pack('!f', ...)`.
 ///
 /// # 256-entry dual LUT

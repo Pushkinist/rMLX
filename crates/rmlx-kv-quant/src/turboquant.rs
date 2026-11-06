@@ -19,7 +19,7 @@
 //!
 //! The values are *pre-computed* at build time and hardcoded here (no runtime
 //! Python dependency). The derivation script is at
-//! `scripts/gen_lloyd_codebook.py` (call `python3 scripts/gen_lloyd_codebook.py`
+//! `scripts/gen/lloyd_codebook.py` (call `python3 scripts/gen/lloyd_codebook.py`
 //! to regenerate if the target distribution changes).
 //!
 //! ## Why dimension-independent
@@ -73,7 +73,7 @@ pub const GROUP_SIZE: usize = 32;
 //
 // Derived by: `turboquant_plus/turboquant/codebook.py::_lloyds_gaussian`
 // with sigma=1.0, n_iter=100. Hardcoded as f32 (no runtime Python dep).
-// Regenerate via `python3 scripts/gen_lloyd_codebook.py` if needed.
+// Regenerate via `python3 scripts/gen/lloyd_codebook.py` if needed.
 //
 // Prior codebook: N(0,1) *quantile* centroids (dead code path from
 // mlx-lm-turboquant `_compute_gaussian_codebook`). Replaced by true Lloyd-Max.
@@ -198,7 +198,7 @@ fn err_bits_unsupported(b: u8) -> Error {
 /// fork's `_compute_gaussian_codebook` dead-code path). The current values are
 /// MSE-optimal for scalar quantization of a standard normal source.
 ///
-/// Derivation script: `scripts/gen_lloyd_codebook.py`.
+/// Derivation script: `scripts/gen/lloyd_codebook.py`.
 ///
 /// # Performance note
 ///

@@ -1336,7 +1336,7 @@ fn emit_kv_codec_disposition_manifest() {
 // ── Store-cadence gate: the byte model against the real allocation ────────────
 //
 // `KvQuant::estimated_resident_bytes_per_layer` is the instrument the
-// resolve-time net-benefit warn reads, and `scripts/perf_ceiling.py` mirrors it.
+// resolve-time net-benefit warn reads, and `scripts/profile/perf_ceiling.py` mirrors it.
 // A cadence that drifts from the store it models does not fail anything on its
 // own — it just reports a saving the store never delivers. These tests close
 // that by measuring each store's bytes from its own encoder over one shared

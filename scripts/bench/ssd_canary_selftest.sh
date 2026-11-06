@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Recall test for ssd_canary.sh and its make targets, against a stub rmlx and a stub HTTP server.
 #
-# Recall test for: ssd_canary.sh
+# Recall test for: bench/ssd_canary.sh
 #
 # No GPU, no model, no metrics DB outside a throwaway directory.
 #
@@ -38,15 +38,15 @@
 # outside the fixture.
 #
 # Usage: ssd_canary_selftest.sh [--script <path>] [--makefile <path>]
-#   (defaults: the tree's own scripts/ssd_canary.sh and Makefile)
+#   (defaults: the tree's own scripts/bench/ssd_canary.sh and Makefile)
 # Exit 0 — every case behaved; 1 — at least one did not; 2 — cannot run.
 # Set:    -uo — a non-zero status inside a case ends the run under -e, before the cases after it
 
 set -uo pipefail
 export LC_ALL=C
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SCRIPT="$REPO_ROOT/scripts/ssd_canary.sh"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT="$REPO_ROOT/scripts/bench/ssd_canary.sh"
 MAKEFILE="$REPO_ROOT/Makefile"
 
 while [[ $# -gt 0 ]]; do
@@ -162,8 +162,8 @@ EOF
 make_tree() {
     local t="$1" seed_hydrate="${2:-1}" revisit_spill_us="${3:-$STUB_SPILL_US}" \
         hydrate_bytes="${4:-524288}" refused_tag="${5:-}"
-    mkdir -p "$t/scripts/lib" "$t/prompts" "$t/target/release-perf" "$t/models/stub-ns__stub-model-8bit"
-    cp "$SCRIPT" "$t/scripts/ssd_canary.sh"
+    mkdir -p "$t/scripts/bench" "$t/scripts/lib" "$t/prompts" "$t/target/release-perf" "$t/models/stub-ns__stub-model-8bit"
+    cp "$SCRIPT" "$t/scripts/bench/ssd_canary.sh"
     cp "$REPO_ROOT/scripts/lib/identity.sh" "$REPO_ROOT/scripts/lib/server_kv_quant.py" \
         "$REPO_ROOT/scripts/lib/server_wait.sh" "$REPO_ROOT/scripts/lib/record_pending.sh" "$t/scripts/lib/"
     cp -R "$REPO_ROOT/prompts/ssd_bench" "$t/prompts/ssd_bench"
@@ -473,7 +473,7 @@ run_case() {
     if [[ "$mode" == unset ]]; then
         run_how="ssd_canary.sh run from outside the tree"
         run_env "$cdir" "$cdir" "VERIFIER_MODEL=$tree/models/stub-ns__stub-model-8bit" "PORT=$port" -- \
-            bash "$tree/scripts/ssd_canary.sh" --ssd-gb 100 >"$cdir/run.out" 2>&1
+            bash "$tree/scripts/bench/ssd_canary.sh" --ssd-gb 100 >"$cdir/run.out" 2>&1
         rc=$?
     else
         run_how="make ssd-canary"
@@ -877,7 +877,7 @@ run_refused_record_case() {
     local rc
     run_env "$cdir" "$cdir" "RMLX_HOME=$root" \
         "VERIFIER_MODEL=$tree/models/stub-ns__stub-model-8bit" "PORT=$(free_port)" -- \
-        bash "$tree/scripts/ssd_canary.sh" --ssd-gb 100 >"$cdir/run.out" 2>&1
+        bash "$tree/scripts/bench/ssd_canary.sh" --ssd-gb 100 >"$cdir/run.out" 2>&1
     rc=$?
     if [[ $rc -eq 75 ]]; then
         pass "$name: a refused record ends the run with 75"
@@ -975,7 +975,7 @@ mkdir -p "$nobin/home" "$nobin/tmp" "$nobin/log"
 make_tree "$nobin/tree"
 /bin/rm -f "$nobin/tree/target/release-perf/rmlx"
 run_env "$nobin" "$nobin/tree" "VERIFIER_MODEL=$nobin/tree/models/stub-ns__stub-model-8bit" -- \
-    bash "$nobin/tree/scripts/ssd_canary.sh" >"$nobin/out" 2>&1
+    bash "$nobin/tree/scripts/bench/ssd_canary.sh" >"$nobin/out" 2>&1
 rc=$?
 if [[ $rc -eq 125 ]] && grep -q 'binary not found' "$nobin/out"; then
     pass "no-binary: exits 125 naming the missing binary"
@@ -1001,7 +1001,7 @@ binary_flag_case() {
     : >"$cdir/elsewhere/not_executable"
     seed_root "$tree/.rmlx"
     run_env "$cdir" "$cdir" "VERIFIER_MODEL=$tree/models/stub-ns__stub-model-8bit" "PORT=$(free_port)" -- \
-        bash "$tree/scripts/ssd_canary.sh" --ssd-gb 100 "$@" >"$cdir/run.out" 2>&1
+        bash "$tree/scripts/bench/ssd_canary.sh" --ssd-gb 100 "$@" >"$cdir/run.out" 2>&1
     rc=$?
     if [[ $rc -ne $want ]]; then
         fail "$name: exited $rc, want $want (tail: $(tail -3 "$cdir/run.out" | tr '\n' ' '))"
@@ -1026,7 +1026,7 @@ fi
 tag_dir="$WORK/tag"
 mkdir -p "$tag_dir/home" "$tag_dir/tmp" "$tag_dir/log"
 make_tree "$tag_dir/tree"
-run_env "$tag_dir" "$tag_dir/tree" -- bash "$tag_dir/tree/scripts/ssd_canary.sh" --tag x \
+run_env "$tag_dir" "$tag_dir/tree" -- bash "$tag_dir/tree/scripts/bench/ssd_canary.sh" --tag x \
     >"$tag_dir/out" 2>&1
 rc=$?
 if [[ $rc -eq 1 ]] && grep -q 'Unknown flag: --tag' "$tag_dir/out"; then

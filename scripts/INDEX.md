@@ -8,17 +8,8 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
-| `aggregate_decode_profile.py` | none | Aggregate per-model decode_profile lines from profile_<MODEL>.txt into one CSV row per model. |
 | `bench_identity_selftest.sh` | make bench-identity-selftest | bench_identity_selftest.sh — mutation check for the commit and run-log sources |
-| `codec_smoke_runner_selftest.sh` | make codec-smoke-runner-selftest | scripts/codec_smoke_runner_selftest.sh — recall test for the verdict of |
-| `convert_silero_vad.py` | by hand | Convert Silero VAD v4 ONNX weights (16kHz branch only) to safetensors. |
-| `gen_lloyd_codebook.py` | none | Generate Lloyd-Max optimal N(0,1) centroids for TurboQuant codebook. |
-| `perf_ceiling.py` | check/engine_parity_selftest.sh, published/table.py | Theoretical decode/prefill ceiling calculator for rMLX on Apple Silicon. |
 | `run_class_selftest.sh` | make run-class-selftest | run_class_selftest.sh — the producers that run `rmlx` record their runs under |
-| `schema_constraint_canary.sh` | make schema-constraint-canary | Real-model proof for the json_schema constrained-decoding path: two probes, two architectures. |
-| `sdpa_headdim_bench.py` | none | What MLX's SDPA dispatch costs as a function of `head_dim`. |
-| `ssd_canary.sh` | make ssd-canary, ssd_canary_selftest.sh | ssd_canary.sh — end-to-end long-session SSD prompt-cache tier canary. |
-| `ssd_canary_selftest.sh` | make ssd-canary-selftest | Recall test for ssd_canary.sh and its make targets, against a stub rmlx and a stub HTTP server. |
 
 ## scripts/bench/
 
@@ -35,9 +26,24 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `bench/llama_ab_selftest.sh` | make llama-ab-selftest | bench/llama_ab_selftest.sh — mutation check for `scripts/bench/llama_ab.sh`. |
 | `bench/prefill_chunk_sweep.sh` | bench/prefill_chunk_sweep_selftest.sh | prefill_chunk_sweep.sh — Latin-square sweep of one architecture's prefill |
 | `bench/prefill_chunk_sweep_selftest.sh` | make prefill-chunk-sweep-selftest | Recall test for the prefill-chunk sweep: slot order, env name, records, paired verdict, exits |
+| `bench/schema_constraint_canary.sh` | make schema-constraint-canary | Real-model proof for the json_schema constrained-decoding path: two probes, two architectures. |
+| `bench/sdpa_headdim.py` | none | What MLX's SDPA dispatch costs as a function of `head_dim`. |
 | `bench/serve_bench.sh` | make perf-iter, make spec-canary, bench/serve_bench_selftest.sh | serve_bench.sh — bench one model through rmlx serve, alone or against a drafter |
 | `bench/serve_bench_selftest.sh` | make spec-bench-selftest | Mutation check for serve_bench.sh: a stub rmlx server, asserting recorded values and refusals. |
 | `bench/server_decode_tps.py` | bench/serve_bench.sh | Read one request's decode rate off a running rmlx server. |
+| `bench/ssd_canary.sh` | make ssd-canary, bench/ssd_canary_selftest.sh | ssd_canary.sh — end-to-end long-session SSD prompt-cache tier canary. |
+| `bench/ssd_canary_selftest.sh` | make ssd-canary-selftest | Recall test for ssd_canary.sh and its make targets, against a stub rmlx and a stub HTTP server. |
+| `bench/wikitext2_ppl.py` | crates/rmlx-cli/src/exit_tests.rs, run_class_selftest.sh | Wikitext-2 perplexity harness for rMLX. |
+
+## scripts/bench/codec_matrix/
+
+| path | caller (derived) | purpose (header line 1) |
+|---|---|---|
+| `bench/codec_matrix/kv_codec_matrix.toml` | bench/codec_matrix/runner.sh | KV-codec smoke + NIAH gate matrix. |
+| `bench/codec_matrix/niah_long_context.sh` | none | Needle-in-a-haystack long-context validation driver: a kernel-gate off pass, then an on pass. |
+| `bench/codec_matrix/runner.sh` | make smoke-codec-matrix, bench/codec_matrix/runner_selftest.sh, run_class_selftest.sh | KV-codec smoke + NIAH gate matrix runner. |
+| `bench/codec_matrix/runner_selftest.sh` | make codec-smoke-runner-selftest | scripts/bench/codec_matrix/runner_selftest.sh — recall test for the verdict of |
+| `bench/codec_matrix/smoke_prompts.toml` | bench/codec_matrix/runner.sh, bench/codec_matrix/runner_selftest.sh | KV-codec smoke prompts. |
 
 ## scripts/check/
 
@@ -64,11 +70,12 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `check/tree_lines.sh` | make check-claim-bypass, make check-personal-data, check/tree_lines_selftest.sh | CI gate: forbidden lines in the files git does not ignore, one rule set per mode. |
 | `check/tree_lines_selftest.sh` | make check-claim-bypass-selftest, make check-personal-data-selftest | Recall test for the tree-line gate: planted git work trees, asserting exit code and file:line. |
 
-## scripts/eval/
+## scripts/gen/
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
-| `eval/wikitext2_ppl.py` | crates/rmlx-cli/src/exit_tests.rs, run_class_selftest.sh | Wikitext-2 perplexity harness for rMLX. |
+| `gen/lloyd_codebook.py` | none | Generate Lloyd-Max optimal N(0,1) centroids for TurboQuant codebook. |
+| `gen/silero_vad.py` | by hand | Convert Silero VAD v4 ONNX weights (16kHz branch only) to safetensors. |
 
 ## scripts/host/
 
@@ -100,19 +107,19 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `lib/bench_server.sh` | bench/baseline_cells.sh, bench/cross_backend.sh, bench/serve_bench.sh, +1 more scripts | Start, wait for and identify one rmlx server, for bench harnesses; source it. |
 | `lib/busiest_between.awk` | bench/ab.sh, bench/ab_selftest.sh, bench/llama_ab.sh, +2 more scripts | Which process burned the most CPU between two cpu_snapshot files. |
 | `lib/cpu_snapshot.sh` | bench/ab.sh, bench/ab_selftest.sh, bench/llama_ab.sh, +2 more scripts | Per-process cumulative CPU seconds, for interference gates; source it. |
-| `lib/identity.sh` | bench/ab.sh, bench/baseline_cells.sh, bench/cross_backend.sh, +14 more scripts | Shared §8.5 run-identity for rMLX bench scripts. |
+| `lib/identity.sh` | bench/ab.sh, bench/baseline_cells.sh, bench/codec_matrix/niah_long_context.sh, +14 more scripts | Shared §8.5 run-identity for rMLX bench scripts. |
 | `lib/kv_boundary_default.py` | ingest/ingest.py | The engine's default KV boundary-layer counts, read from the engine. |
 | `lib/metal_dirs.sh` | check/kernel_dispatch.sh, check/metal_kernels.sh, check/metal_kernels_selftest.sh, +1 more scripts | The directories holding gated .metal kernels; sourced by the metal gates. |
 | `lib/mlx_pin.sh` | crates/rmlx-mlx/src/pin_tests.rs, host/mlx_restore_pin.sh | Read the validated MLX / mlx-c pair from its one declaration. |
 | `lib/published_run_log.py` | profile/prefill_ms.py, published/bench.sh, published/binary_identity.py, +1 more scripts | Read one rmlx run log back as a per-request table. |
-| `lib/record_pending.sh` | crates/rmlx-cli/src/exit_tests.rs, bench/ab.sh, bench/baseline_cells.sh, bench/prefill_chunk_sweep.sh, +4 more scripts | The exit code `rmlx baseline --record` and `rmlx eval ppl --corpus` give a |
+| `lib/record_pending.sh` | crates/rmlx-cli/src/exit_tests.rs, bench/ab.sh, bench/baseline_cells.sh, bench/codec_matrix/runner.sh, +4 more scripts | The exit code `rmlx baseline --record` and `rmlx eval ppl --corpus` give a |
 | `lib/recorder_check.py` | ingest/ingest.py, ingest/llama_bench.py | Refuse a recorder that cannot state a run class. |
 | `lib/rmlx_home.py` | ingest/ingest.py, ingest/llama_bench.py | Resolve the runtime home the way the binary does. |
 | `lib/run_log_for_pid.py` | lib/bench_server.sh | Pick the run log a given process wrote, out of the candidates on stdin. |
 | `lib/selftest_support.sh` | bench/baseline_cells_selftest.sh, bench/cross_backend_selftest.sh, bench/llama_ab_selftest.sh, +22 more scripts | The case runner and shims the self-tests share; source it. |
-| `lib/server_kv_quant.py` | lib/bench_server.sh, published/binary_identity.py, ssd_canary.sh | Read the KV codec a run resolved out of its rmlx run log. |
+| `lib/server_kv_quant.py` | bench/ssd_canary.sh, lib/bench_server.sh, published/binary_identity.py | Read the KV codec a run resolved out of its rmlx run log. |
 | `lib/server_sampling.py` | crates/rmlx-server/src/engine/sampler_event_tests.rs, bench/serve_bench.sh, lib/published_run_log.py | Read whether a run's requests were sampled, out of its rmlx run log. |
-| `lib/server_wait.sh` | lib/bench_server.sh, schema_constraint_canary.sh, ssd_canary.sh | Wait for one rmlx server to answer /v1/models, for a time the caller gives; source it. |
+| `lib/server_wait.sh` | bench/schema_constraint_canary.sh, bench/ssd_canary.sh, lib/bench_server.sh | Wait for one rmlx server to answer /v1/models, for a time the caller gives; source it. |
 | `lib/skip_notice_patterns.sh` | check/gpu_tests.sh, suite/run_gpu_tests.sh | The SKIP and WAIVED stand-down notice patterns, defined once for the runner and the gate. |
 | `lib/snapshot_identity.py` | bench/serve_bench.sh, ingest/ingest.py, ingest/llama_bench.py, +2 more scripts | Read a model snapshot's identity columns out of the snapshot itself. |
 | `lib/spec_round_log.py` | bench/serve_bench.sh, lib/published_run_log.py, published/binary_identity.py | Read a speculative round loop's own numbers back out of an rmlx run log. |
@@ -123,10 +130,12 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 
 | path | caller (derived) | purpose (header line 1) |
 |---|---|---|
+| `profile/aggregate_decode_profile.py` | none | Aggregate per-model decode_profile lines from profile_<MODEL>.txt into one CSV row per model. |
 | `profile/capture.sh` | make build-capture, make gputrace-preflight, make profile-gputrace, make profile-mst, profile/capture_selftest.sh | Launch rmlx under a GPU instrument: a Metal capture, a Metal System Trace, or the host preflight |
 | `profile/capture_selftest.sh` | make profile-capture-selftest | Recall test for the GPU-instrument launcher: both captures and the host preflight, against shims |
 | `profile/gputrace.sh` | profile/gputrace_selftest.sh | Read a .gputrace bundle offline: the Metal functions it names, a diff of two, or a summary. |
 | `profile/gputrace_selftest.sh` | make gputrace-selftest | Recall test for the .gputrace readers: synthetic bundles, no trace, no Xcode tool, no GPU. |
+| `profile/perf_ceiling.py` | check/engine_parity_selftest.sh, published/table.py | Theoretical decode/prefill ceiling calculator for rMLX on Apple Silicon. |
 | `profile/prefill_ms.py` | profile/capture.sh | Read the prefill time of an rmlx run out of its log: `generate: prefill{prefill_ms}`. |
 | `profile/rmlx-capture.entitlements` | make build-capture | Debug-only entitlement for the GPU-capture binary (`make build-capture`). |
 
@@ -157,15 +166,6 @@ differs. Never edit it by hand. The rules are in [README.md](README.md).
 | `release/release_cpu.py` | release/release.sh, release/release_cpu_selftest.sh | The CPU target of the release tarball binary. |
 | `release/release_cpu_selftest.sh` | make release-cpu-selftest | Recall test for release_cpu.py: throwaway repo roots and a stub cargo, asserting exit and reason. |
 | `release/release_selftest.sh` | make release-selftest | Recall test for the release tool's six modes: a scratch repo, stub external tools, no network. |
-
-## scripts/release_e2e/stage6_perf/
-
-| path | caller (derived) | purpose (header line 1) |
-|---|---|---|
-| `release_e2e/stage6_perf/codec_smoke_runner.sh` | make smoke-codec-matrix, codec_smoke_runner_selftest.sh, run_class_selftest.sh | KV-codec smoke + NIAH gate matrix runner. |
-| `release_e2e/stage6_perf/kv_codec_matrix.toml` | release_e2e/stage6_perf/codec_smoke_runner.sh | KV-codec smoke + NIAH gate matrix. |
-| `release_e2e/stage6_perf/niah_long_context.sh` | none | Needle-in-a-haystack long-context validation driver: a kernel-gate off pass, then an on pass. |
-| `release_e2e/stage6_perf/smoke_prompts.toml` | codec_smoke_runner_selftest.sh, release_e2e/stage6_perf/codec_smoke_runner.sh | KV-codec smoke prompts. |
 
 ## scripts/report/
 

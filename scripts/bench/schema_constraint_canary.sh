@@ -109,10 +109,10 @@
 # ─────────────────────────────────────────────────────────────────────────────
 #
 #   make build-perf
-#   bash scripts/schema_constraint_canary.sh                  # --expect fixed
-#   bash scripts/schema_constraint_canary.sh --expect baseline
-#   bash scripts/schema_constraint_canary.sh --model bonsai   # one model only
-#   bash scripts/schema_constraint_canary.sh --binary PATH    # another rmlx than the build-perf one
+#   bash scripts/bench/schema_constraint_canary.sh                  # --expect fixed
+#   bash scripts/bench/schema_constraint_canary.sh --expect baseline
+#   bash scripts/bench/schema_constraint_canary.sh --model bonsai   # one model only
+#   bash scripts/bench/schema_constraint_canary.sh --binary PATH    # another rmlx than the build-perf one
 #
 # Requires:
 #   - target/release-perf/rmlx  (make build-perf), or --binary PATH
@@ -131,7 +131,7 @@
 
 set -uo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 source "${REPO_ROOT}/scripts/lib/identity.sh"
 BINARY="$(rmlx_default_binary "${REPO_ROOT}" release-perf)"
 PORT="${PORT:-62265}"

@@ -568,7 +568,7 @@ survive the default prune.
 | `Last Level Cache Limiter` | memory-bound |
 | `Instruction Throughput Limiter` | issue-bound |
 | `Kernel Occupancy` | resident threadgroups; falls as allocated registers rise |
-| `Device Memory Bandwidth` | achieved GB/s, against the ceiling `scripts/perf_ceiling.py` assumes |
+| `Device Memory Bandwidth` | achieved GB/s, against the ceiling `scripts/profile/perf_ceiling.py` assumes |
 
 Group encoders by their top limiter. Dispatch counts identify the kernel: 26
 codec layers over 8 steps is 208 encoders. Store exports under

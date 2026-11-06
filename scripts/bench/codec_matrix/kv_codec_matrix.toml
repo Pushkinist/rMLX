@@ -2,7 +2,7 @@
 #
 # One row per (codec_name, model) cell. Primary key = (codec_name, model).
 #
-# Rows are consumed by `scripts/release_e2e/stage6_perf/codec_smoke_runner.sh`
+# Rows are consumed by `scripts/bench/codec_matrix/runner.sh`
 # (see docs/TESTING.md "Codec smoke + NIAH matrix"). Each row drives:
 #   1. Smoke prompts (`smoke_prompts.toml`) via `rmlx baseline` per-prompt.
 #   2. The NIAH `cargo test -p rmlx-models --test niah_long_context`

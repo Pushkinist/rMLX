@@ -7,9 +7,9 @@ a compute-bound prefill projection per context length. Never launches a model,
 never touches the GPU, never takes the MLX claim.
 
 Usage:
-    scripts/perf_ceiling.py --model <snapshot> --kv-quant k8v8 \
+    scripts/profile/perf_ceiling.py --model <snapshot> --kv-quant k8v8 \
         --ctx 4096 --ctx 8192 --ctx 32768
-    scripts/perf_ceiling.py --model <snapshot> --kv-quant none --ctx 4096 --json
+    scripts/profile/perf_ceiling.py --model <snapshot> --kv-quant none --ctx 4096 --json
 
 --------------------------------------------------------------------------
 Provenance of every constant (verify before trusting; see "rule zero")

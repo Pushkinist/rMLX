@@ -8,7 +8,7 @@
 #   - bench/baseline_cells.sh --measure inertness records each run as diagnostic,
 #     and keeps a measured run's status apart from its record's (`landed` or
 #     `pending`).
-#   - eval/wikitext2_ppl.py keeps a reading whose record did not land (exit 75).
+#   - bench/wikitext2_ppl.py keeps a reading whose record did not land (exit 75).
 #   - ingest/ingest.py codec-inertness skips a row the sweep already recorded,
 #     refuses a snapshot with no recordable label, and refuses a recorder built
 #     before the run class before writing anything.
@@ -231,7 +231,7 @@ used="$(sort -u "$WORK/llama_recorder.log" | tr '\n' ' ')"
 [ "$used" = "checkout " ] || bad="the recorder that ran: ${used:-none} (want the checkout's build only); $(tail -2 "$WORK/llama_record.out" | tr '\n' ' ')"
 verdict llama_bench_records_through_the_checkout "an rmlx on PATH is not chosen over the checkout's build" "$bad"
 
-# ── codec_smoke_runner.sh ────────────────────────────────────────────────────
+# ── bench/codec_matrix/runner.sh ─────────────────────────────────────────────
 #
 # The codec smoke runner reaches `rmlx baseline` through `cargo run`; a stub
 # `cargo` logs what it was handed and builds nothing.
@@ -256,7 +256,7 @@ ARGV_LOG="$WORK/smoke.argv"
 : >"$ARGV_LOG"
 set +e
 PATH="$WORK/cargobin:$PATH" ARGV_LOG="$ARGV_LOG" RMLX_O_MODELS_ROOT="$SMOKE_ROOT" RMLX_HOME="$WORK/home" \
-	bash "$REPO_ROOT/scripts/release_e2e/stage6_perf/codec_smoke_runner.sh" \
+	bash "$REPO_ROOT/scripts/bench/codec_matrix/runner.sh" \
 	--manifest "$WORK/smoke.toml" --out "$WORK/smoke.json" >"$WORK/smoke.out" 2>&1
 set -e
 bad=""
@@ -279,7 +279,7 @@ grep -q 'metrics record --help` failed (exit 2): dyld: library not loaded' <<<"$
 ! grep -q 'built before the run class' <<<"$out" || bad="${bad:+$bad; }a failing recorder is called an old one"
 verdict recorder_whose_help_fails_is_reported_as_failing "a recorder whose --help exits non-zero is reported as failing" "$bad"
 
-# ── eval/wikitext2_ppl.py ─────────────────────────────────────────────────────
+# ── bench/wikitext2_ppl.py ─────────────────────────────────────────────────────
 #
 # A PPL run that measured and whose record did not land keeps its number,
 # names the buffer file and ends 75; one that failed to measure ends 1.
@@ -295,7 +295,7 @@ exit 75
 STUB
 chmod +x "$WORK/rmlx_ppl"
 ppl_case() { # <crash>
-	STUB_PPL_CRASH="$1" python3 "$REPO_ROOT/scripts/eval/wikitext2_ppl.py" --model "$MODEL" \
+	STUB_PPL_CRASH="$1" python3 "$REPO_ROOT/scripts/bench/wikitext2_ppl.py" --model "$MODEL" \
 		--run-class diagnostic --rmlx-binary "$WORK/rmlx_ppl" --cache-dir "$WORK/wikitext_cache" \
 		>"$WORK/ppl.out" 2>"$WORK/ppl.err"
 }

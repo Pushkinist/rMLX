@@ -22,9 +22,9 @@
 #         `unrecorded` and the run ends INCOMPLETE.
 #       * otherwise -> measured >= expected - 2pp passes; else fails.
 #
-# Aggregated rows are emitted to
-# `scripts/release_e2e/stage6_perf/last_run.json` with `ran`, `skipped_known`,
-# `skipped_absent`, `unrecorded` and `incomplete`.
+# Aggregated rows are emitted to `<RMLX_HOME>/bench/codec_matrix/last_run.json`
+# (`--out` names another file) with `ran`, `skipped_known`, `skipped_absent`,
+# `unrecorded` and `incomplete`.
 #
 # Exit codes:
 #   0  at least one row ran, every row that ran passed, no row skipped for an
@@ -44,7 +44,7 @@
 # older (script will error and print install hint).
 #
 # Usage:
-#   bash scripts/release_e2e/stage6_perf/codec_smoke_runner.sh \
+#   bash scripts/bench/codec_matrix/runner.sh \
 #       [--manifest <path>] \
 #       [--filter codec_name=<x>] [--filter model=<m>] \
 #       [--record-baseline] \
@@ -63,9 +63,10 @@ cd "$REPO_ROOT"
 # shellcheck source=scripts/lib/identity.sh
 . "$REPO_ROOT/scripts/lib/identity.sh"
 
-MANIFEST="$REPO_ROOT/scripts/release_e2e/stage6_perf/kv_codec_matrix.toml"
-PROMPTS="$REPO_ROOT/scripts/release_e2e/stage6_perf/smoke_prompts.toml"
-LAST_RUN="$REPO_ROOT/scripts/release_e2e/stage6_perf/last_run.json"
+MANIFEST="$REPO_ROOT/scripts/bench/codec_matrix/kv_codec_matrix.toml"
+PROMPTS="$REPO_ROOT/scripts/bench/codec_matrix/smoke_prompts.toml"
+RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
+LAST_RUN="${RMLX_HOME}/bench/codec_matrix/last_run.json"
 
 FILTER_CODEC=""
 FILTER_MODEL=""
@@ -601,6 +602,7 @@ done <<<"$ROWS_TSV"
 SKIPPED=$((SKIPPED_KNOWN + SKIPPED_ABSENT))
 INCOMPLETE=false
 [[ $SKIPPED_ABSENT -gt 0 || $UNRECORDED -gt 0 || $RECORDS_PENDING -gt 0 ]] && INCOMPLETE=true
+mkdir -p "$(dirname "$LAST_RUN")"
 {
     printf '{"run_id":"%s","ran":%s,"skipped_known":%s,"skipped_absent":%s,"unrecorded":%s,"records_pending":%s,"incomplete":%s,"rows":[' \
         "$RUN_ID" "$RAN" "$SKIPPED_KNOWN" "$SKIPPED_ABSENT" "$UNRECORDED" "$RECORDS_PENDING" "$INCOMPLETE"

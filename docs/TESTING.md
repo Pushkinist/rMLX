@@ -547,14 +547,14 @@ the Qwen3.6 snapshot they panic in `generate_greedy`. Unless
 `RMLX_NIAH_KV_QUANT` replaces the codec, every driver run that selects them
 fails, the default `--mode turbo` run included.
 
-`scripts/release_e2e/stage6_perf/niah_long_context.sh` runs the cells in two
+`scripts/bench/codec_matrix/niah_long_context.sh` runs the cells in two
 fresh processes, with the kernel off and then on:
 
 ```bash
-bash scripts/release_e2e/stage6_perf/niah_long_context.sh                # TurboFlash
-bash scripts/release_e2e/stage6_perf/niah_long_context.sh --mode pflash  # niah_pflash_ cells
-bash scripts/release_e2e/stage6_perf/niah_long_context.sh --mode both
-bash scripts/release_e2e/stage6_perf/niah_long_context.sh --on-only --filter niah_gemma4_32k
+bash scripts/bench/codec_matrix/niah_long_context.sh                # TurboFlash
+bash scripts/bench/codec_matrix/niah_long_context.sh --mode pflash  # niah_pflash_ cells
+bash scripts/bench/codec_matrix/niah_long_context.sh --mode both
+bash scripts/bench/codec_matrix/niah_long_context.sh --on-only --filter niah_gemma4_32k
 ```
 
 `--mode turbo` runs every cell unless `--filter` narrows it. The driver sets
@@ -572,7 +572,7 @@ to 32k tokens. The NIAH driver and `make smoke-codec-matrix` run them.
 ## Codec smoke + NIAH matrix
 
 `make smoke-codec-matrix` runs
-`scripts/release_e2e/stage6_perf/codec_smoke_runner.sh` over every
+`scripts/bench/codec_matrix/runner.sh` over every
 `(codec, model)` row of `kv_codec_matrix.toml`. For each row it runs the smoke
 prompts through `rmlx baseline`, then the row's NIAH cells.
 
@@ -581,12 +581,12 @@ make smoke-codec-matrix                                  # every row
 make smoke-codec-matrix CODEC=k8v4                       # one codec
 make smoke-codec-matrix MATRIX_MODEL=bonsai-8b           # one model
 make smoke-codec-matrix RECORD=1                         # record baselines
-bash scripts/release_e2e/stage6_perf/codec_smoke_runner.sh --dry-run
+bash scripts/bench/codec_matrix/runner.sh --dry-run
 ```
 
 The variable is `MATRIX_MODEL`, because the Makefile's `MODEL` has a default.
 The script also takes `--manifest <path>` and `--out <path>`. It writes
-`scripts/release_e2e/stage6_perf/last_run.json`, which git ignores, with
+`<RMLX_HOME>/bench/codec_matrix/last_run.json` with
 `ran`, `skipped_known`, `skipped_absent` and `incomplete`. It ends with
 `matrix_done ... ran=N skipped=M`. The exit code is 0 when at least one row ran,
 every row that ran passed and no row skipped for an absent snapshot or an unset
@@ -606,7 +606,7 @@ holds the claim, the row fails with exit 11 and the refusal names the holder.
 
 ### Manifest
 
-`scripts/release_e2e/stage6_perf/kv_codec_matrix.toml` holds one `[[entries]]`
+`scripts/bench/codec_matrix/kv_codec_matrix.toml` holds one `[[entries]]`
 table per `(codec_name, model)`:
 
 | Field | Meaning |
@@ -626,7 +626,7 @@ measured value into the manifest instead. A measured `0.0` is refused.
 
 ### Smoke prompts
 
-`scripts/release_e2e/stage6_perf/smoke_prompts.toml` holds three prompts with
+`scripts/bench/codec_matrix/smoke_prompts.toml` holds three prompts with
 no chat-template markup. A row fails if any prompt fails.
 
 | Name | Prompt | Validation |

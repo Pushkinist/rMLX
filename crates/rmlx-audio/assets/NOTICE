@@ -7,7 +7,7 @@ Source:  https://github.com/snakers4/silero-vad
 License: MIT License (https://github.com/snakers4/silero-vad/blob/master/LICENSE)
 
 The weights in this file were extracted from silero_vad.onnx (the 16kHz
-inference branch) using scripts/convert_silero_vad.py and stored in the
+inference branch) using scripts/gen/silero_vad.py and stored in the
 safetensors format for use by the rmlx-audio VAD engine.
 
 Original copyright holders: snakers4 and Silero Team contributors.

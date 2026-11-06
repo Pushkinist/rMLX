@@ -28,7 +28,7 @@
 //! off — it does NOT set the env var itself (the kernel uses an `OnceLock`
 //! and the value is latched on first read, so flipping mid-process is not
 //! supported). The shell driver
-//! `scripts/release_e2e/stage6_perf/niah_long_context.sh` runs the suite
+//! `scripts/bench/codec_matrix/niah_long_context.sh` runs the suite
 //! twice, once with `RMLX_TURBO_FLASH=0` and once with `RMLX_TURBO_FLASH=1`,
 //! each in a fresh process.
 //!
@@ -91,7 +91,7 @@ use rmlx_models::{Pcg32, PenaltyConfig, SamplerConfig};
 
 // ── Models ────────────────────────────────────────────────────────────────
 
-// `model_slug` in scripts/release_e2e/stage6_perf/codec_smoke_runner.sh lists the
+// `model_slug` in scripts/bench/codec_matrix/runner.sh lists the
 // same slugs; change both together.
 
 const GEMMA4_E4B: common::GoldenModel = common::GoldenModel {

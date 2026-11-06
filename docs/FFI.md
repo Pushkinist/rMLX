@@ -568,7 +568,7 @@ compiled):
   longer; the cause is not known.
 
 The composite path computes the whole causal score rectangle and then masks
-it, and it holds the score tensor in memory. `scripts/sdpa_headdim_bench.py` measures the cost against the metallib
+it, and it holds the score tensor in memory. `scripts/bench/sdpa_headdim.py` measures the cost against the metallib
 it reports.
 
 What rMLX pays on the composite path is bounded two ways:
