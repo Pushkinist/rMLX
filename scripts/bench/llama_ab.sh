@@ -83,6 +83,8 @@ RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
 AWK_BUSIEST="${REPO_ROOT}/scripts/lib/busiest_between.awk"
 # shellcheck source=scripts/lib/args.sh
 . "${REPO_ROOT}/scripts/lib/args.sh"
+# shellcheck source=scripts/lib/identity.sh
+. "${REPO_ROOT}/scripts/lib/identity.sh"
 
 BIN_A=""; BIN_B=""; ARGS_A=""; ARGS_B=""
 ENV_A=""; ENV_B=""
@@ -93,7 +95,7 @@ PORT=8199; BUSY_PCT=25; ALLOW_BUSY_HOST=false
 SYNTHETIC_ARMS=false
 READY_TIMEOUT=600
 OUT_DIR="${RMLX_HOME}/bench/llama_ab"
-CLAIM_RMLX="${REPO_ROOT}/target/release-perf/rmlx"
+CLAIM_RMLX="$(rmlx_default_binary "${REPO_ROOT}" release-perf)"
 RECORD_ARGS=""
 
 usage() {
@@ -123,7 +125,7 @@ bench/llama_ab.sh --bin-a P --bin-b P --model GGUF --prompt-file F [options]
   --out-dir PATH           JSON result directory (default $RMLX_HOME/bench/llama_ab)
   --claim-rmlx PATH        the rmlx binary each slot's server runs under, as
                            `rmlx claim run`, so it holds the Metal claim, and
-                           that records the run (default target/release-perf/rmlx)
+                           that records the run (default: the release-perf build)
   --record-args STR        identity flags for ingest/ingest.py, which
                            records both arms as ab_arm rows at the end of a real
                            run: --model, --weight-quant, --arm-a-backend,

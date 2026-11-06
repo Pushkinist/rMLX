@@ -71,7 +71,7 @@ source "${REPO_ROOT}/scripts/lib/identity.sh"
 # shellcheck source=scripts/lib/record_pending.sh
 source "${REPO_ROOT}/scripts/lib/record_pending.sh"
 
-BINARY="${REPO_ROOT}/target/release-perf/rmlx"
+BINARY="$(rmlx_default_binary "${REPO_ROOT}" release-perf)"
 MODEL=""
 ARCH_KEY=""
 LEVELS="256 512 1024 2048 4096"
@@ -106,7 +106,7 @@ Options:
   --warmup N             warmup runs per slot       (default: 1)
   --gen-tokens N         tokens generated per run   (default: 100)
   --kv-quant NAME        codec for every slot       (default: none)
-  --binary PATH          rmlx binary                (default: target/release-perf/rmlx)
+  --binary PATH          rmlx binary                (default: the release-perf build)
   --busy-pct N           foreign-CPU taint threshold, % of one core (default: 25)
   --out DIR              output directory
   --record               ingest the cells into runs.db through the §8.5 path

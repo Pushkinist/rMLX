@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # Drive one cross-backend bench cell through the Cross-Backend-Bench harness
 #
-# Usage:  bash scripts/bench/cross_backend.sh TAG MODEL_PATH BACKEND KV_QUANT BUDGET_MIN
-#             MODEL_DISK_GB WEIGHT_QUANT
+# Usage:  bash scripts/bench/cross_backend.sh [--binary PATH] TAG MODEL_PATH BACKEND KV_QUANT
+#             BUDGET_MIN MODEL_DISK_GB WEIGHT_QUANT
+#         --binary PATH  the rmlx binary: the server of an rmlx cell, the Metal claim holder of every
+#                        other cell, and the source of the run identity (default: the release build
+#                        of this checkout); first, before TAG
 #         TAG            cell label filed in the progress line (e2b, e4b, 26b, 31b, 31b-paro)
 #         MODEL_PATH     absolute path of the snapshot directory; the .gguf file for the llama.cpp arms
 #         BACKEND        rmlx | mlx-lm | mlx-lm-turboquant | omlx | paroquant | llama.cpp
@@ -15,8 +18,8 @@
 #         BUDGET_MIN     whole minutes for the server to come up and the harness to finish
 #         MODEL_DISK_GB  model size on disk in GB, for the harness's tps-per-gb
 #         WEIGHT_QUANT   weight format label filed with the cell (mxfp8, paro, ...)
-# Exit:   0 the cell ran (its success and coherence are in the progress line); 1 unknown backend or
-#         a missing argument; 2 the server did not become ready; 3 the budget ran out before the
+# Exit:   0 the cell ran (its success and coherence are in the progress line); 1 unknown backend,
+#         a missing argument or an rmlx binary that is not an executable file; 2 the server did not become ready; 3 the budget ran out before the
 #         harness started; 4 no codec name to file (an rmlx server's run log states none); 5 no
 #         llama-server binary; 6 bare mlx-lm given a quantised KV_QUANT
 # Not a mode of: bench/baseline_cells.sh — that one runs `rmlx baseline` in process; this one starts
@@ -28,6 +31,19 @@
 # go into <RMLX_HOME>/metrics/runs.db through RMLX_METRICS_DB.
 set -uo pipefail
 
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+source "${REPO_ROOT}/scripts/lib/identity.sh"
+RMLX_BIN="$(rmlx_default_binary "$REPO_ROOT" release)"
+if [ "${1:-}" = --binary ]; then
+  [ -n "${2:-}" ] || { echo "ERROR: --binary needs a path" >&2; exit 1; }
+  case "$2" in
+    /*) RMLX_BIN="$2" ;;
+    *) RMLX_BIN="$PWD/$2" ;;
+  esac
+  shift 2
+fi
+[ -x "$RMLX_BIN" ] || { echo "ERROR: binary not found / not executable: $RMLX_BIN" >&2; exit 1; }
+
 TAG="$1"
 MODEL_PATH="$2"
 BACKEND="$3"
@@ -36,18 +52,15 @@ BUDGET_MIN="$5"
 MODEL_DISK_GB="$6"
 WEIGHT_QUANT="$7"
 
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 CBB=${CROSS_BENCH_ROOT:-../Cross-Backend-Bench}
 # Read by the cross-backend harness to find this checkout's binary and metrics buffer.
 export RMLX_REPO_ROOT="${REPO_ROOT}"
 
+source "${REPO_ROOT}/scripts/lib/bench_server.sh"
 # Run identity (backend / version / git sha / build profile / hardware tag)
 # comes from the measured binary — never hard-coded here.
-source "${REPO_ROOT}/scripts/lib/identity.sh"
-source "${REPO_ROOT}/scripts/lib/bench_server.sh"
-rmlx_export_identity "$REPO_ROOT/target/release/rmlx"
+rmlx_export_identity "$RMLX_BIN"
 PORT=62265
-RMLX_BIN="$REPO_ROOT/target/release/rmlx"
 BUDGET_S=$((BUDGET_MIN * 60))
 
 # Runtime state lives under one root (CLAUDE.md): `RMLX_HOME`, else the
@@ -85,7 +98,7 @@ SERVER_PID=0
 case "$BACKEND" in
   rmlx)
     snapshot_logs
-    ( cd "$REPO_ROOT" && exec ./target/release/rmlx serve \
+    ( cd "$REPO_ROOT" && exec "$RMLX_BIN" serve \
         --model "$MODEL_PATH" \
         --port "$PORT" \
         --device gpu \

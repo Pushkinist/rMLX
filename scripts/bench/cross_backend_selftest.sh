@@ -31,6 +31,7 @@ make_stubs() {
 #!/usr/bin/env bash
 set -u
 echo "$*" >>"$RMLX_HOME/rmlx_argv"
+echo "$0" >>"$RMLX_HOME/rmlx_ran"
 case "$1" in
 metrics)
 	echo '{"backend":"rmlx","backend_version":"9.9.9","git_sha":"abc1234"}'
@@ -82,13 +83,21 @@ new_home() { # <name> — a fresh $RMLX_HOME
 }
 
 # run_cell <home> <tag> <backend> <kv-quant> — one cell of the tool, alone in an empty environment.
+# The words in CELL_OPTIONS come before the tag.
+CELL_OPTIONS=()
 run_cell() {
 	local home="$1" tag="$2"
 	shift 2
 	st_run env -i PATH="$FAKE/stubbin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$ST_WORK" \
 		RMLX_HOME="$home" CROSS_BENCH_ROOT="$FAKE/cbb" STUB_OUT="$home/harness_argv" \
 		LLAMA_CPP_ROOT="$ST_WORK/no_llama" \
-		bash "$FAKE/scripts/bench/cross_backend.sh" "$tag" "$ST_WORK/models/m-$tag" "$@" 5 3 mxfp8
+		bash "$FAKE/scripts/bench/cross_backend.sh" ${CELL_OPTIONS[@]+"${CELL_OPTIONS[@]}"} \
+		"$tag" "$ST_WORK/models/m-$tag" "$@" 5 3 mxfp8
+}
+
+# binaries_run <home> — the rmlx binaries the cell ran, each as a path from the checkout root, one per line.
+binaries_run() {
+	sort -u "$1/rmlx_ran" | sed -e "s|^\./||" -e "s|^$FAKE/||"
 }
 
 # filed_quant <home> — the `--quant` the harness was handed: the name the cell is filed under.
@@ -160,6 +169,51 @@ want "omlx models dir" "$(grep -c -- "--model-dir $home/tmp/omlx_models " "$home
 want "model link" "$(readlink "$home/tmp/omlx_models/gemma4-e2b" 2>/dev/null || true)" "$ST_WORK/models/m-e2b"
 want "stale entry" "$(ls "$home/tmp/omlx_models/stale" 2>/dev/null || true)" ""
 st_verdict omlx_models_dir_under_rmlx_home "$why" "the oMLX models directory is under RMLX_HOME and the launch clears it"
+
+# --- the rmlx binary ---
+
+home="$(new_home binary_default)"
+printf '%s' k8v4 >"$home/stated_codec"
+run_cell "$home" e2b rmlx k8v4
+why="$(st_check 0)"
+want "binaries run" "$(binaries_run "$home")" "target/release/rmlx"
+st_verdict default_binary_is_the_release_build "$why" "with no --binary the cell runs the checkout's release build, for the identity and for the server"
+
+home="$(new_home binary_flag)"
+printf '%s' k8v4 >"$home/stated_codec"
+cp "$FAKE/target/release/rmlx" "$ST_WORK/custom_rmlx"
+CELL_OPTIONS=(--binary "$ST_WORK/custom_rmlx")
+run_cell "$home" e2b rmlx k8v4
+CELL_OPTIONS=()
+why="$(st_check 0)"
+want "binaries run" "$(binaries_run "$home")" "$ST_WORK/custom_rmlx"
+st_verdict binary_flag_names_the_rmlx_that_runs "$why" "--binary before the positionals names the rmlx that serves the cell and gives its identity, over the checkout's build"
+
+home="$(new_home binary_flag_claim)"
+cp "$FAKE/target/release/rmlx" "$ST_WORK/custom_rmlx"
+CELL_OPTIONS=(--binary "$ST_WORK/custom_rmlx")
+run_cell "$home" e2b paroquant native
+CELL_OPTIONS=()
+why="$(st_check 0)"
+want "binaries run" "$(binaries_run "$home")" "$ST_WORK/custom_rmlx"
+st_verdict binary_flag_holds_the_claim_for_other_backends "$why" "--binary is the rmlx that holds the Metal claim for a backend that is not rmlx"
+
+home="$(new_home binary_not_executable)"
+: >"$ST_WORK/not_executable_rmlx"
+CELL_OPTIONS=(--binary "$ST_WORK/not_executable_rmlx")
+run_cell "$home" e2b rmlx k8v4
+CELL_OPTIONS=()
+why="$(st_check 1 --has "binary not found / not executable: $ST_WORK/not_executable_rmlx")"
+want "harness ran" "$(ls "$home/harness_argv" 2>/dev/null || true)" ""
+want "rmlx ran" "$(ls "$home/rmlx_ran" 2>/dev/null || true)" ""
+st_verdict exit_1_binary_not_executable "$why" "a --binary that is not an executable file ends 1 before any server starts"
+
+home="$(new_home binary_empty)"
+CELL_OPTIONS=(--binary "")
+run_cell "$home" e2b rmlx k8v4
+CELL_OPTIONS=()
+why="$(st_check 1 --has "ERROR: --binary needs a path")"
+st_verdict exit_1_binary_empty "$why" "a --binary given an empty path ends 1"
 
 # --- the other backends keep the alias table ---
 

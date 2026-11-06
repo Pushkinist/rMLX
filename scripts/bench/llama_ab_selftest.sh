@@ -18,6 +18,8 @@ AB="$ROOT/scripts/bench/llama_ab.sh"
 
 # shellcheck source=scripts/lib/selftest_support.sh
 . "$ROOT/scripts/lib/selftest_support.sh"
+# shellcheck source=scripts/lib/identity.sh
+. "$ROOT/scripts/lib/identity.sh"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/rmlx_llama_ab_selftest.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
@@ -145,6 +147,7 @@ done
 exit "\$status"
 STUB
 chmod +x "$CLAIM_STUB"
+CLAIM_ARGS=(--claim-rmlx "$CLAIM_STUB")
 
 # WHY EVERY CASE DECLARES ITS ARMS SYNTHETIC
 #
@@ -204,7 +207,7 @@ run_ab() { # [REALHOST:<shim-dir>] <extra args...> -> stdout+stderr in $OUT, cod
 		--model "$MODEL" --prompt-file "$PROMPT" \
 		--port "$PORT" --n-predict 4 --n-ctx 64 \
 		--out-dir "$WORK/home/run$RUN_SEQ/bench" --ready-timeout 25 \
-		--claim-rmlx "$CLAIM_STUB" \
+		${CLAIM_ARGS[@]+"${CLAIM_ARGS[@]}"} \
 		${boundary[@]+"${boundary[@]}"} \
 		"$@" 2>&1)"
 	CODE=$?
@@ -371,6 +374,38 @@ printf '#!/bin/sh\necho "claim held by PID 4242 (rmlx serve)" >&2\nexit 11\n' >"
 chmod +x "$HELD_CLAIM"
 run_ab --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host --claim-rmlx "$HELD_CLAIM"
 check "a held Metal claim fails the slot with exit 11" 125 "server-not-ready (exit 11"
+
+# --- the rmlx binary ----------------------------------------------------------
+: >"$WORK/not_executable_rmlx"
+run_ab --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host --claim-rmlx "$WORK/not_executable_rmlx"
+check "a --claim-rmlx that is no executable file is refused" 125 "no rmlx binary at $WORK/not_executable_rmlx"
+
+# A checkout of its own: with no --claim-rmlx the slots run under the release-perf
+# build of the checkout the harness runs from.
+DEFAULT_ROOT="$WORK/default_root"
+mkdir -p "$DEFAULT_ROOT"
+ln -s "$ROOT/scripts" "$DEFAULT_ROOT/scripts"
+REPO_AB="$AB"
+AB="$DEFAULT_ROOT/scripts/bench/llama_ab.sh"
+CLAIM_ARGS=()
+DEFAULT_BIN="$(rmlx_default_binary "$DEFAULT_ROOT" release-perf)"
+run_ab --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host
+check "with no --claim-rmlx the checkout's release-perf build is looked for" 125 "no rmlx binary at $DEFAULT_BIN"
+
+mkdir -p "$(dirname "$DEFAULT_BIN")"
+cp "$CLAIM_STUB" "$DEFAULT_BIN"
+: >"$WORK/claim_runs"
+run_ab --bin-a "$STUB_A" --bin-b "$STUB_B" --pairs 2 --allow-busy-host
+check_verdict "with no --claim-rmlx the slots run under the checkout's release-perf build" 0 "SEPARATED-WEAK n=2-per-arm"
+if [ "$(grep -c '' "$WORK/claim_runs")" -eq 4 ]; then
+	echo "  PASS  each of the 4 slots ran its server under the checkout's release-perf build"
+	PASS=$((PASS + 1))
+else
+	echo "  FAIL  each of the 4 slots ran its server under the checkout's release-perf build (saw $(grep -c '' "$WORK/claim_runs"))"
+	FAIL=$((FAIL + 1))
+fi
+AB="$REPO_AB"
+CLAIM_ARGS=(--claim-rmlx "$CLAIM_STUB")
 
 # --- a --synthetic-arms run records nothing ----------------------------------
 #

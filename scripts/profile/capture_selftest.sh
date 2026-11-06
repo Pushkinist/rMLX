@@ -604,6 +604,13 @@ run_mst --model "$MODEL"
 why="$(st_check 1 --has "target/release/rmlx not found" --has "make build")"
 st_verdict mst_capture_refuses_a_missing_binary "$why" "no release build ends 1 naming make build"
 
+make_root mst_binary_not_executable
+: >"$ST_WORK/not_executable_rmlx"
+run_mst --model "$MODEL" --binary "$ST_WORK/not_executable_rmlx"
+why="$(st_check 1 --has "ERROR: WORK/not_executable_rmlx not found or not executable.")"
+want "engine runs" "$(logged rmlx.argv)" ""
+st_verdict mst_capture_refuses_a_binary_that_is_not_executable "$why" "a --binary that is no executable file ends 1 before the engine runs"
+
 make_root mst_no_model_dir
 run_mst --model "$ST_WORK/models/absent"
 why="$(st_check 1 --has "ERROR: model snapshot not found: WORK/models/absent")"

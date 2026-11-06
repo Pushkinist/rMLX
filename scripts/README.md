@@ -270,6 +270,7 @@ section 3); that a code means what this table says is the reviewer's. [review]
 | Need | Use |
 |---|---|
 | run identity for a §8.5 record | `lib/identity.sh` (`rmlx_export_identity`) |
+| the default `rmlx` binary of a build profile (`rmlx_default_binary <root> <profile>`) | `lib/identity.sh` |
 | start, wait for and attribute one `rmlx serve` | `lib/bench_server.sh` |
 | wait for one `rmlx serve` to answer, for a time you give (`wait_for_server`) | `lib/server_wait.sh` |
 | file a record already in the pending buffer, exit 75 on refusal (`rmlx_record_file`) | `lib/record_pending.sh` |

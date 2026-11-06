@@ -438,6 +438,7 @@ STUB="$FAKE_ROOT/target/release-perf/rmlx"
 cat >"$STUB" <<STUBEOF
 #!/usr/bin/env bash
 set -eu
+[ -z "\${RMLX_HOME:-}" ] || echo "\$0" >>"\$RMLX_HOME/binary_ran"
 case "\$1" in
 metrics)
 	case "\$2" in
@@ -772,6 +773,27 @@ run_case engine_rate_is_ingested 0 \
 	"mtp row carries the engine's rate, not emitted/elapsed_ms"
 got="$(metric_of mtp value)"
 close_to "$got" 20.0 0.001 || note_bad "mtp decode_tps_warm=$got (want 20.0)"
+verdict
+
+run_case default_binary_is_release_perf 0 \
+	"with no --binary the checkout's release-perf build serves and gives the identity"
+[ "$(sort -u "$CASE_HOME/binary_ran")" = "$STUB" ] || note_bad "binaries run: $(sort -u "$CASE_HOME/binary_ran" | tr '\n' ' ')(want $STUB)"
+verdict
+
+cp "$STUB" "$WORK/custom_rmlx"
+run_case binary_flag_names_the_rmlx_that_runs 0 \
+	"--binary names the rmlx that serves and gives the identity, over the checkout's build" \
+	"ARGS:--binary" "ARGS:$WORK/custom_rmlx"
+[ "$(sort -u "$CASE_HOME/binary_ran")" = "$WORK/custom_rmlx" ] || note_bad "binaries run: $(sort -u "$CASE_HOME/binary_ran" | tr '\n' ' ')(want $WORK/custom_rmlx)"
+verdict
+
+: >"$WORK/not_executable_rmlx"
+run_case binary_not_executable_refused 125 \
+	"a --binary that is no executable file ends 125 before any server starts" \
+	"ARGS:--binary=$WORK/not_executable_rmlx" \
+	"GREP:ERROR: binary not found at $WORK/not_executable_rmlx"
+no_row normal
+no_row mtp
 verdict
 
 run_case window_is_declared 0 \

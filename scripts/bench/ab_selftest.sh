@@ -669,6 +669,42 @@ check missing_model 125 \
 	--binary-a "$SLOW" --binary-b "$FAST" --model "$WORK/nope" --slots 8 --max-tokens 5 \
 	"GREP:model path not found"
 
+# ---- the binaries ------------------------------------------------------------
+
+: >"$WORK/not_executable_rmlx"
+check binary_a_not_executable 125 \
+	"a --binary-a that is no executable file stops the run" \
+	--binary-a "$WORK/not_executable_rmlx" --binary-b "$FAST" "${COMMON[@]}" \
+	"GREP:not an executable binary: $WORK/not_executable_rmlx"
+
+# A checkout of its own: with no --binary-a the harness takes the release-perf
+# build of the checkout it runs from.
+DEFAULT_ROOT="$WORK/default_root"
+mkdir -p "$DEFAULT_ROOT"
+ln -s "$REPO_ROOT/scripts" "$DEFAULT_ROOT/scripts"
+REPO_AB="$AB"
+AB="$DEFAULT_ROOT/scripts/bench/ab.sh"
+
+check default_binary_missing 125 \
+	"with no --binary-a the harness looks for the checkout's release-perf build" \
+	--binary-b "$FAST" "${COMMON[@]}" \
+	"GREP:not an executable binary: $DEFAULT_ROOT/target/release-perf/rmlx"
+
+mkdir -p "$DEFAULT_ROOT/target/release-perf"
+cp "$(make_stub default_arm "100.0,100.5,101.0" 40.0 "$TOKENS_MAIN")" "$DEFAULT_ROOT/target/release-perf/rmlx"
+check default_binary_is_release_perf 0 \
+	"with no --binary-a arm A runs the checkout's release-perf build" \
+	--binary-b "$FAST" "${COMMON[@]}" \
+	"GREP:VERDICT: SEPARATED"
+if grep -q '^stub=default_arm ' "$STATE/slots.log"; then
+	PASSED=$((PASSED + 1))
+	printf '  ok   %-26s        — %s\n' "default_binary_ran" "the release-perf build of the checkout served arm A"
+else
+	FAILED=$((FAILED + 1))
+	printf '  FAIL %-26s        — no slot ran the release-perf build of the checkout\n' "default_binary_ran"
+fi
+AB="$REPO_AB"
+
 # ---- the host gates, against a machine this file supplies --------------------
 #
 # These are the only cases that leave the host gating on, and none of them looks

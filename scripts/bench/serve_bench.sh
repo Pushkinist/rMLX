@@ -4,17 +4,19 @@
 # Usage:  bash scripts/bench/serve_bench.sh --model DIR --record gate|diagnostic
 #             [--draft-model DIR [--draft-kind KIND] [--draft-block-size N]] [--prompt-file F]
 #             [--port N] [--dry-run] [--kv-quant Q] [--max-ctx N] [--tag T] [--server-stamps]
+#             [--binary PATH]
 # Exit:   0 every arm measured and filed; 1 a usage error, a missing model or prompt file, or a
 #         run the checks refused; 75 every arm measured and a record did not land (it stays in the
-#         queue named on stderr); 125 the release-perf binary is missing; passthrough of rmlx
-#         serve (11: another process holds the Metal claim)
+#         queue named on stderr); 125 the rmlx binary is missing or not executable; passthrough of
+#         rmlx serve (11: another process holds the Metal claim)
 #
 # --model is the verifier snapshot dir. Without --draft-model only the no-drafter arm runs and
 # one record is filed; with it (the assistant drafter snapshot dir) a drafter arm follows, is
 # judged against the first, and files a second. --record sets the `run_class` of every record
 # filed. --prompt-file is a canonical JSON prompt (prompts/spec_bench/*.json) whose
 # `messages[0].content` is sent and whose `name` is the registered prompt row name; without
-# it a short prose prompt is sent. The binary is target/release-perf/rmlx (make build-perf).
+# it a short prose prompt is sent. --binary PATH is the rmlx that serves and gives the run identity;
+# without it, the release-perf build of this checkout (make build-perf).
 #
 # `--server-stamps` is for a self-test. The client rate is then read from the stub server's own
 # stamps, which makes the cross-check compare the stub with itself, so the rows are written under
@@ -83,19 +85,14 @@ usage_error() {
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-BINARY="${REPO_ROOT}/target/release-perf/rmlx"
-
-# Run identity (backend / version / git sha / build profile / hardware tag)
-# comes from the measured binary — never hard-coded here.
 source "${REPO_ROOT}/scripts/lib/identity.sh"
 source "${REPO_ROOT}/scripts/lib/record_pending.sh"
-rmlx_export_identity "${BINARY}"
+BINARY="$(rmlx_default_binary "${REPO_ROOT}" release-perf)"
 RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
 LOG_DIR="${RMLX_HOME}/logs"
 BUFFER_DIR="${RMLX_HOME}/metrics/buffer/pending"
 DB_PATH="${RMLX_HOME}/metrics/runs.db"
 SCRATCH_DIR="${RMLX_HOME}/tmp"
-GIT_SHA="$(rmlx_git_sha "${REPO_ROOT}")"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -156,6 +153,8 @@ while [[ $# -gt 0 ]]; do
         --draft-model) shift; DRAFTER_MODEL="${1:?--draft-model requires a value}"; shift ;;
         --prompt-file=*) PROMPT_FILE="${1#--prompt-file=}"; shift ;;
         --prompt-file) shift; PROMPT_FILE="${1:?--prompt-file requires a value}"; shift ;;
+        --binary=*) BINARY="${1#--binary=}"; shift ;;
+        --binary) shift; BINARY="${1:?--binary requires a value}"; shift ;;
         --port=*) PORT="${1#--port=}"; shift ;;
         --port) shift; PORT="${1:?--port requires a value}"; shift ;;
         --tag=*) BENCH_TAG="${1#--tag=}"; shift ;;
@@ -289,6 +288,11 @@ if [[ ! -x "${BINARY}" ]]; then
     echo "ERROR: binary not found at ${BINARY}. Run: make build-perf" >&2
     exit 125
 fi
+
+# Run identity (backend / version / git sha / build profile / hardware tag)
+# comes from the measured binary — never hard-coded here.
+rmlx_export_identity "${BINARY}"
+GIT_SHA="$(rmlx_git_sha "${REPO_ROOT}")"
 
 if [[ ! -d "${VERIFIER_MODEL}" ]]; then
     echo "ERROR: verifier model not found: ${VERIFIER_MODEL}" >&2

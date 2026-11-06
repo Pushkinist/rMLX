@@ -68,16 +68,18 @@ USAGE
 }
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)" || exit 1
+# shellcheck source=scripts/lib/identity.sh
+. "$REPO_ROOT/scripts/lib/identity.sh"
 
 SUBCOMMAND="${1:-}"
-BIN="target/release-debug/rmlx"
+BIN="$(rmlx_default_binary "$REPO_ROOT" release-debug)"
 KV_QUANT=""
 case "$SUBCOMMAND" in
 gputrace) FLAGS=" --kv-quant --model --prompt-tokens --skip --steps --gen --out-dir --keep-all " ;;
 mst)
 	FLAGS=" --model --kv-quant --prompt-tokens --max-tokens --time-limit --skip-ms --binary --keep --out-dir "
 	KV_QUANT="none"
-	BIN="target/release/rmlx"
+	BIN="$(rmlx_default_binary "$REPO_ROOT" release)"
 	;;
 preflight) FLAGS=" --binary " ;;
 -h | --help)

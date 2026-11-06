@@ -8,6 +8,7 @@
 # Usage (after RMLX_BIN / BINARY is resolved):
 #
 #     source "$REPO_ROOT/scripts/lib/identity.sh"
+#     RMLX_BIN="$(rmlx_default_binary "$REPO_ROOT" release-perf)"
 #     rmlx_export_identity "$RMLX_BIN"
 #
 # Then, inside the record-building python:
@@ -20,6 +21,14 @@
 #
 # Non-rMLX emitters (mlx_lm, oMLX, llama.cpp) describe a different backend and
 # must NOT source this.
+
+# The rmlx binary the checkout at $1 builds under cargo profile $2. The only
+# place a `target/<profile>/rmlx` path is written.
+rmlx_default_binary() {
+  local root="${1:?rmlx_default_binary: pass the checkout root}"
+  local profile="${2:?rmlx_default_binary: pass the cargo profile}"
+  printf '%s/target/%s/rmlx\n' "$root" "$profile"
+}
 
 # Resolve identity once and export it. Idempotent.
 rmlx_export_identity() {

@@ -262,10 +262,9 @@ if [[ "${PRESET}" == cache-types ]]; then
     (( PROMPT_TOKENS % 1024 == 0 )) || usage_error "--prompt-tokens takes a multiple of 1024 for --preset cache-types"
 fi
 
-TARGET_DIR="${REPO_ROOT}/target"
 if [[ -z "${BINARY}" ]]; then
     for profile in release-perf release; do
-        BINARY="${TARGET_DIR}/${profile}/rmlx"
+        BINARY="$(rmlx_default_binary "${REPO_ROOT}" "${profile}")"
         # The canary files build_profile=release-perf, so it takes no other build.
         if [[ -x "${BINARY}" || "${PRESET}" == canary ]]; then
             break

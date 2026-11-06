@@ -106,13 +106,15 @@ RMLX_HOME="${RMLX_HOME:-${REPO_ROOT}/.rmlx}"
 . "${REPO_ROOT}/scripts/lib/args.sh"
 # shellcheck source=scripts/lib/record_pending.sh
 . "${REPO_ROOT}/scripts/lib/record_pending.sh"
+# shellcheck source=scripts/lib/identity.sh
+. "${REPO_ROOT}/scripts/lib/identity.sh"
 # Slots that measured and whose ab_arm record did not land.
 PENDING_RECORDS=0
 AWK_BUSIEST="${REPO_ROOT}/scripts/lib/busiest_between.awk"
 
 # ---- defaults ----------------------------------------------------------------
 
-DEFAULT_BINARY="${REPO_ROOT}/target/release-perf/rmlx"
+DEFAULT_BINARY="$(rmlx_default_binary "${REPO_ROOT}" release-perf)"
 BIN_A=""
 BIN_B=""
 ARGS_A=""
@@ -137,7 +139,7 @@ usage() {
 usage: scripts/bench/ab.sh [options]
 
 Arms (at least one of the two must differ):
-  --binary-a PATH        binary for arm A (default: target/release-perf/rmlx)
+  --binary-a PATH        binary for arm A (default: the release-perf build)
   --binary-b PATH        binary for arm B (default: same as --binary-a)
   --arm-a "ARGS"         extra `rmlx baseline` arguments for arm A
   --arm-b "ARGS"         extra `rmlx baseline` arguments for arm B

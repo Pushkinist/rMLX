@@ -40,6 +40,7 @@ make_stubs() {
 	cat >"$root/bin/rmlx" <<'STUB'
 #!/usr/bin/env bash
 set -u
+echo "$0" >>"$RMLX_HOME/rmlx_ran"
 value_of() { # <field> <level> <row> <default>
 	awk -v f="$1" -v l="$2" -v r="$3" -v d="$4" '
 		$1 == f && $2 == l { i = r + 3; if (i > NF) i = NF; print $i; found = 1; exit }
@@ -304,6 +305,27 @@ home="$(new_home no_binary)"
 run_sweep "$home" --binary "$FAKE/bin/nope"
 why="$(st_check 125 --has "binary not found / not executable")"
 st_verdict exit_125_missing_binary "$why" "a missing binary ends 125"
+
+home="$(new_home binary_not_executable)"
+: >"$FAKE/not_executable_rmlx"
+run_sweep "$home" --binary "$FAKE/not_executable_rmlx"
+why="$(st_check 125 --has "binary not found / not executable: $FAKE/not_executable_rmlx")"
+want "bench calls" "$(ls "$home/slots.log" 2>/dev/null || true)" ""
+st_verdict exit_125_binary_not_executable "$why" "a --binary that is no executable file ends 125 before any slot runs"
+
+home="$(new_home binary_flag)"
+run_sweep "$home"
+why="$(st_check 0)"
+want "binaries run" "$(sort -u "$home/rmlx_ran")" "$BIN"
+st_verdict binary_flag_names_the_rmlx_that_runs "$why" "--binary names the rmlx every slot, the claim probe and the identity run"
+
+home="$(new_home binary_default)"
+mkdir -p "$FAKE/target/release-perf"
+cp "$BIN" "$FAKE/target/release-perf/rmlx"
+run_raw "$home" --model "$MODEL" --arch-key qwen3 --levels "256 512 1024" --prompt-tokens 4096 --out "$home/out"
+why="$(st_check 0)"
+want "binaries run" "$(sort -u "$home/rmlx_ran")" "$FAKE/target/release-perf/rmlx"
+st_verdict default_binary_is_release_perf "$why" "with no --binary the sweep runs the checkout's release-perf build"
 
 home="$(new_home no_model)"
 run_sweep "$home" --model "$FAKE/models/nope"
