@@ -111,7 +111,7 @@ the update of step t+1. The cache evaluates the K buffer and the V buffer with
 one `async_eval` each. On Ternary-Bonsai-8B (36 layers) that distance is then
 one step, and each update stays in place. With one `async_eval` for both
 buffers, MLX copies them on that model: decode is 22 % slower and the Metal
-allocation is 497 MB larger (`scripts/perf_ab.sh`, 8 slots).
+allocation is 497 MB larger (`scripts/bench/ab.sh`, 8 slots).
 
 On gemma-4-e2b, layers 15 to 34 read the K/V of layers 13 and 14. For those
 two layers the distance is shorter, and they copy. A per-layer tally of one
@@ -326,7 +326,7 @@ The figures are printed by tools, not recorded here:
 - `make kv-update-census`: the variant shapes, the `match` sites over
   `KvStorage` or `KvQuant` that name at least half the enum (and those with no
   catch-all arm, which a new codec must touch), and the `update_` bodies.
-- `scripts/debt_report.sh --matched-lines <population>`: the duplication
+- `scripts/report/debt_report.py --matched-lines <population>`: the duplication
   figure per population. The KV ones are `rotor-storage`, `iso-storage`,
   `turbo-storage`, `rotor-updates`, `iso-updates`, `turbo-updates`,
   `turbo-ssd` and `update-bodies`.
@@ -369,7 +369,7 @@ keeps one structured parser per payload shape (`mixed_*`, `rot_k_v*`,
   `make check-kv-codec-disposition` reads the help text and the INERT banners
   against the runtime disposition.
 - The `.metal` kernels and their `probes/kernels.manifest` entries, and
-  `scripts/gpu_validation_census.txt`.
+  `scripts/suite/gpu_validation_census.txt`.
 - The iso trace target `rmlx_kv_quant::kvcache::update_iso`, which
   `docs/PERF_BASELINE.md` § "Iso trace phases" names. An event without a
   `target =` override takes its module path, so moving a body moves its target.
@@ -377,5 +377,5 @@ keeps one structured parser per payload shape (`mixed_*`, `rot_k_v*`,
   `path = "warm_ttft_bypass"`. `crates/rmlx-cli/tests/e2e/runner.rs`,
   `crates/rmlx-models/tests/niah_long_context.rs` and
   `docs/KV_FUSED_KERNELS.md` read it.
-- The `kv_bytes` request-boundary event, which
-  `scripts/bench/tri_engine_summarize.py` reads from a run's stderr.
+- The `kv_bytes` request-boundary event, which a bench reads from a run's
+  stderr.

@@ -1,7 +1,7 @@
 //! Tests for the `rmlx info --list-cache-types` listings.
 //!
 //! The residency table is the one surface in the tree that publishes a
-//! resident-KV ratio to an operator — `check_kv_codec_disposition.sh` RULE 7
+//! resident-KV ratio to an operator — `scripts/check/engine_parity.sh kv-codec-disposition` RULE 7
 //! rejects one written anywhere else, and the `--kv-quant` help points here.
 //! A surface with that job and no test is a surface that can quietly stop
 //! covering a codec, or start printing a column of `1.000x`, with every gate

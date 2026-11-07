@@ -131,10 +131,6 @@ the pull request lists the stand-downs. No skip list exists.
 | `Qwen3.6-35B-A3B-8bit` (sparse MoE) | A different class from the dense targets. | `integration_qwen3_5_moe_35b` (`crates/rmlx-models/src/qwen3_5_moe/tests.rs`); `mislabelled_moe_snapshot_cannot_bypass_the_k_side_guard` and `correctly_declared_moe_snapshot_is_still_guarded` (`crates/rmlx-models/tests/resolved_arch_class.rs`); `qwen3_moe_golden_tokens_k8v8`; `qwen3_5_moe_forward_seq_last_k.rs`; `niah_pflash_qwen36_32k_*`; the e2e cases `p2c_qwen36_guard_kbits` and `p2c_qwen36_guard_symk`; `qwen_moe_low_k_bits_rejected` (`crates/rmlx-cli/tests/cache_type_validate.rs`); the MoE sidecar pairs and the DFlash 1 and EAGLE-3 pairs (`spec_greedy_equivalence.rs`, `dflash_drafter_alignment.rs`, `qwen3_5_eagle3_alignment.rs`, `spec_conditioning_residual.rs`, `prefill_buffer_cache.rs`, `gone_request.rs`, `thread_boundary_drafters.rs`) |
 | `Ternary-Bonsai-8B-mlx-2bit` and the other first-generation Bonsai packs | Superseded by Bonsai 2; holds the only Qwen3 architecture and YaRN cells. | `bonsai_golden_tokens.rs`; `qwen3_tests.rs`; `niah_bonsai_*` and `niah_pflash_bonsai_*`; the `bonsai-8b` matrix rows; the 61 e2e cases bound to the `BONSAI` key (quant matrix, SSD tier, prompt cache, lifecycle); `bonsai_8b_prefill_stays_off_the_faulty_attention_configuration`; the first-generation 27B cells in `prefill_attention_configuration.rs` and `thread_boundary_text.rs`; `kv_calibrate_tests.rs`; the three thinking-budget and logprob cells in `bonsai_golden_tokens.rs`; `thinking_budget_exact_hit_qwen3_5_moe`; the Bonsai refusals in `cache_type_validate.rs` |
 
-`scripts/bench-records-sweep.sh` is a broad records sweep, not a target list. It
-keeps naming Qwen3.6, Qwen3.6-27B-PARO, Bonsai-8B, gemma-4-e2b and medgemma on
-purpose.
-
 ### Gaps
 
 No target has these, so no routine run covers them:
@@ -551,14 +547,14 @@ the Qwen3.6 snapshot they panic in `generate_greedy`. Unless
 `RMLX_NIAH_KV_QUANT` replaces the codec, every driver run that selects them
 fails, the default `--mode turbo` run included.
 
-`scripts/release_e2e/stage6_perf/niah_long_context.sh` runs the cells in two
+`scripts/bench/codec_matrix/niah_long_context.sh` runs the cells in two
 fresh processes, with the kernel off and then on:
 
 ```bash
-bash scripts/release_e2e/stage6_perf/niah_long_context.sh                # TurboFlash
-bash scripts/release_e2e/stage6_perf/niah_long_context.sh --mode pflash  # niah_pflash_ cells
-bash scripts/release_e2e/stage6_perf/niah_long_context.sh --mode both
-bash scripts/release_e2e/stage6_perf/niah_long_context.sh --on-only --filter niah_gemma4_32k
+bash scripts/bench/codec_matrix/niah_long_context.sh                # TurboFlash
+bash scripts/bench/codec_matrix/niah_long_context.sh --mode pflash  # niah_pflash_ cells
+bash scripts/bench/codec_matrix/niah_long_context.sh --mode both
+bash scripts/bench/codec_matrix/niah_long_context.sh --on-only --filter niah_gemma4_32k
 ```
 
 `--mode turbo` runs every cell unless `--filter` narrows it. The driver sets
@@ -576,7 +572,7 @@ to 32k tokens. The NIAH driver and `make smoke-codec-matrix` run them.
 ## Codec smoke + NIAH matrix
 
 `make smoke-codec-matrix` runs
-`scripts/release_e2e/stage6_perf/codec_smoke_runner.sh` over every
+`scripts/bench/codec_matrix/runner.sh` over every
 `(codec, model)` row of `kv_codec_matrix.toml`. For each row it runs the smoke
 prompts through `rmlx baseline`, then the row's NIAH cells.
 
@@ -585,12 +581,12 @@ make smoke-codec-matrix                                  # every row
 make smoke-codec-matrix CODEC=k8v4                       # one codec
 make smoke-codec-matrix MATRIX_MODEL=bonsai-8b           # one model
 make smoke-codec-matrix RECORD=1                         # record baselines
-bash scripts/release_e2e/stage6_perf/codec_smoke_runner.sh --dry-run
+bash scripts/bench/codec_matrix/runner.sh --dry-run
 ```
 
 The variable is `MATRIX_MODEL`, because the Makefile's `MODEL` has a default.
 The script also takes `--manifest <path>` and `--out <path>`. It writes
-`scripts/release_e2e/stage6_perf/last_run.json`, which git ignores, with
+`<RMLX_HOME>/bench/codec_matrix/last_run.json` with
 `ran`, `skipped_known`, `skipped_absent` and `incomplete`. It ends with
 `matrix_done ... ran=N skipped=M`. The exit code is 0 when at least one row ran,
 every row that ran passed and no row skipped for an absent snapshot or an unset
@@ -610,7 +606,7 @@ holds the claim, the row fails with exit 11 and the refusal names the holder.
 
 ### Manifest
 
-`scripts/release_e2e/stage6_perf/kv_codec_matrix.toml` holds one `[[entries]]`
+`scripts/bench/codec_matrix/kv_codec_matrix.toml` holds one `[[entries]]`
 table per `(codec_name, model)`:
 
 | Field | Meaning |
@@ -630,7 +626,7 @@ measured value into the manifest instead. A measured `0.0` is refused.
 
 ### Smoke prompts
 
-`scripts/release_e2e/stage6_perf/smoke_prompts.toml` holds three prompts with
+`scripts/bench/codec_matrix/smoke_prompts.toml` holds three prompts with
 no chat-template markup. A row fails if any prompt fails.
 
 | Name | Prompt | Validation |

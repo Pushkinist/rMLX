@@ -217,11 +217,11 @@ pub fn decode_config_with_inherent_depth(value: &str) -> Option<String> {
 /// Rows for every other drafter keep the cell they have always been in.
 ///
 /// This is the only place the **drafter** terms are written: the engine composes
-/// the string here and logs it on its `done` line, and `scripts/spec_bench.sh`
+/// the string here and logs it on its `done` line, and `scripts/bench/serve_bench.sh`
 /// records what the engine said rather than spelling it a second time. It is not
 /// the only composer of the *column* — `rmlx_models::kv_cache`'s boundary terms,
-/// `scripts/ingest/{perf_ab,codec_inertness}_ingest.py` and
-/// `scripts/prefill_chunk_sweep.sh` each build their own, sharing the values
+/// `scripts/ingest/ingest.py` (`ab`, `codec-inertness`) and
+/// `scripts/bench/prefill_chunk_sweep.sh` each build their own, sharing the values
 /// through `check-kv-boundary-default-parity` but not the format.
 ///
 /// `block_size` is a `usize` so the value the engine holds reaches the term

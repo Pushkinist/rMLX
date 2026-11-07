@@ -1,0 +1,8 @@
+# Synthetic workspace for scripts/check/rust_gates_fixtures.sh.
+# Never built — the gate reads only the member list and the package name.
+# crates/fy holds a manifest and is not listed, which is how a members array that
+# changed layout looks.
+[workspace]
+members = [
+    "crates/fx",
+]

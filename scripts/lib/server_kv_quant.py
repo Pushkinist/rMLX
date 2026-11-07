@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Read the KV codec a run resolved out of its rmlx run log.
 
 A bench row's `kv_quant` is part of the `bests` cell key, so a label that does

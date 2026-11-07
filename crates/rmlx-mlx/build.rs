@@ -183,21 +183,28 @@ fn main() {
         .filter(|line| !line.trim_start().starts_with("#!["))
         .collect::<Vec<_>>()
         .join("\n");
-    // The one call whose argument list differs between the mlx-c C APIs is
-    // compiled per `mlxc_c_api_0_7`. `src/c_api.rs` compares that choice with
-    // the `libmlxc.dylib` the process loads, through the marker named here.
-    // The two headers that declare the call and the marker re-run this script.
-    for header in ["fast.h", "compile.h"] {
+    // The two calls whose argument lists differ between the mlx-c C APIs are
+    // compiled per cfg: `mlxc_c_api_0_7` (0.7 or later) for SDPA and
+    // `mlxc_c_api_0_8` (0.8 only) for `gather_qmm`. `src/c_api.rs` compares
+    // that choice with the `libmlxc.dylib` the process loads, through the
+    // markers named here. The headers that declare the calls and the markers
+    // re-run this script.
+    for header in ["fast.h", "compile.h", "ops.h"] {
         rerun_if_present(&format!("{mlx_c_prefix}/include/mlx/c/{header}"));
     }
-    let force_fused = sdpa_takes_force_fused(&cleaned).unwrap_or_else(|e| {
+    let c_api = mlxc_c_api(&cleaned).unwrap_or_else(|e| {
         panic!("rmlx-mlx build.rs: unknown mlx-c C API at {mlx_c_prefix}: {e}")
     });
     println!("cargo::rustc-check-cfg=cfg(mlxc_c_api_0_7)");
-    if force_fused {
+    println!("cargo::rustc-check-cfg=cfg(mlxc_c_api_0_8)");
+    if c_api != MlxcApi::V0_6 {
         println!("cargo:rustc-cfg=mlxc_c_api_0_7");
     }
+    if c_api == MlxcApi::V0_8 {
+        println!("cargo:rustc-cfg=mlxc_c_api_0_8");
+    }
     println!("cargo:rustc-env=RMLX_MLXC_0_7_MARKER={MLXC_0_7_MARKER}");
+    println!("cargo:rustc-env=RMLX_MLXC_0_8_MARKER={MLXC_0_8_MARKER}");
 
     std::fs::write(&bindings_path, cleaned)
         .expect("rmlx-mlx build.rs: could not rewrite bindings.rs after strip");

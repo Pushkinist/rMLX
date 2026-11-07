@@ -1,0 +1,293 @@
+# Planted workspaces for check/gpu_tests.sh ignored and list: the failure reason, under each awk.
+#
+# Columns, tab-separated, none empty ("-" for none): fixture (a directory beside this
+# table), args (gate arguments, "{}" is the fixture path), stream (both, out, err or
+# sorted: the gate's output the needles are read from; sorted is stdout with its lines
+# sorted, for a listing whose order follows the file system), exit (exact), has (strings
+# that must all appear), lacks (strings none of which may appear), is (the whole output;
+# "\t" is a tab, "\n" a line break, "{}" the fixture path), what (what the case proves).
+# Needles are fixed strings separated by ";;".
+# In has, "A;>B" is one needle: B must appear after the first A.
+#
+# The gate it guards enforces a rule ("a test reaching Device::Gpu carries
+# #[ignore]") that nothing else in the tree can check, so a silent loss of
+# recall there is indistinguishable from compliance. Each fixture under
+# `scripts/fixtures/gpu_tests_ignored/` is a synthetic workspace paired with the
+# outcome the gate must produce for it, driven through the gate's `--root`
+# option. Half the cases are violations the gate must catch and half are
+# legitimate shapes it must leave alone — a gate that fails everything is as
+# useless as one that fails nothing, and only the pair pins it.
+#
+# WHY THE EXIT CODE ALONE IS NOT AN ASSERTION
+#   The gate has several fail-closed paths that also exit 1 — a missing --root
+#   directory, zero parsed workspace members, fewer members than crate dirs on
+#   disk, a member whose src/ is gone, an unreadable package name, zero matched
+#   test files. A case that only checks `exit == 1` is satisfied by every one of
+#   them, so DELETING a fixture makes its case pass. (Measured: removing one
+#   fixture tree and gutting another still reported "ok (9 cases)".) Each case
+#   therefore pins three things: the exit code, the violation-class MARKER the
+#   gate must print, and the specific LABEL it must name — plus an optional
+#   string that must NOT appear. A wrong reason is a failure.
+#
+# The macro cases are the reason this file exists. A `macro_rules!` body
+# declaring `#[test] fn $name()` names no readable fn at its definition site and
+# emits no `fn` line at its invocation sites, so a source scanner can miss it in
+# both directions at once: never flagged however much Metal it dispatches, and
+# never listed for the runner either.
+#
+# EVERY CASE RUNS ONCE PER AWK ON THE MACHINE
+#   The gate is an awk program, and awk implementations genuinely disagree. A
+#   bracket range of octal escapes (`[\300-\337]`, the obvious way to match a
+#   UTF-8 continuation byte) is accepted by BSD awk and is a hard syntax error
+#   in gawk — so a gate green on a developer's Mac can be hard-DOWN on the Linux
+#   CI runner, which is strictly worse than the blind spot it exists to close.
+#   Byte-vs-character indexing and the POSIX classes differ too: `[[:print:]]`
+#   calls a UTF-8 continuation byte printable in BSD awk and mawk under a UTF-8
+#   locale but not under C, and gawk indexes characters where the others index
+#   bytes. A suite that checks one implementation cannot see any of that, so it
+#   runs under each — and when only one is installed it SAYS so rather than
+#   reporting a clean run that proved less than it looks like it did.
+
+macro_gpu_no_ignore	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_cell!{$name}	-	-	a macro body binding Device::Gpu without #[ignore] is caught
+macro_gpu_via_helper	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;cell!{$name}	-	-	a macro body reaching Metal through a helper is caught
+macro_inline_body	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;later_plain_gpu_no_ignore	-	-	a one-line generated fn does not swallow the rest of the file
+macro_inline_string_brace	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;second_cell!{$name}	-	-	a } inside a string literal does not make the line look unbalanced
+fn_url_in_string	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;later_plain_gpu_no_ignore	-	-	a // inside a string literal is not a comment
+fn_char_literal_quote	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;later_plain_gpu_no_ignore	-	-	a " inside a char literal does not desynchronise the string scan
+fn_comment_brace	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;plain_gpu_no_ignore	-	-	a } inside a trailing comment does not make the line look self-contained
+trait_signature_fns	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;after_trait_gpu_no_ignore	-	-	one-line signature-only fns neither latch nor hard-fail the run
+trait_where_signature	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;after_where_gpu_no_ignore	fn never closed	-	a where-split declaration ends at its `;`: it neither latches nor swallows the test after it
+trait_where_signature_nested_block	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;after_where_gpu_no_ignore	OK:	-	a nested block after a where-split declaration cannot close a latch, so the un-ignored test is named
+fn_where_split_with_body	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;calls_the_where_split_helper	fn never closed	-	a where-split fn with a body is not a declaration: its body's Device::Gpu is seen through the call
+fn_never_closes	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;fn never closed	-	-	a capture that cannot terminate is reported, not skipped
+attr_multiline_ignore	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;later_plain_gpu_no_ignore	probe	-	a wrapped #[ignore = ".." ] closes, and is read rather than merely un-latched
+attr_trailing_comment	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_after_comment_attr	-	-	a comment after an attribute's closing ] does not latch the capture
+attr_never_closes	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;attribute never closed	-	-	an attribute capture that cannot terminate is reported, not swallowed
+exempt_in_body	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_marker_inside_body	-	-	a marker among a fn's statements exempts nothing
+exempt_in_body	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_after_marker_in_body	-	-	and does not carry to the next fn
+macro_one_line_no_test	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_cell!{$name}	-	-	a one-line macro declaring no test is stepped over, not latched
+tokio_test_gpu	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;tokio_gpu_no_ignore	-	-	#[tokio::test] classifies like #[test]
+tokio_test_gpu	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;tokio_flavored_gpu_no_ignore	-	-	the parameterised #[tokio::test(..)] spelling classifies too
+macro_close_comment	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;second_cell!{$name}	-	-	a commented close brace still ends the body, so blame lands on the right macro
+macro_unreadable	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;gpu_cell!	-	-	an assembled fn name fails closed, not silently
+macro_one_line	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;one_line_cell!	-	-	a whole-macro-on-one-line #[test] fails closed
+plain_gpu_no_ignore	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;plain_gpu_test	-	-	the original non-macro detection still fires
+plain_gpu_no_ignore_in_tests_rs	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;crates/fx/src/tests.rs: plain_gpu_test	-	-	a bare tests.rs under src/ is a unit-test file and is scanned
+macro_gpu_ignored	--root {}	both	0	OK: every GPU-touching test carries #[ignore] (1 files;;gpu_cell!{$name}	-	-	a compliant macro body does not fire, and was read
+macro_cpu_no_ignore	--root {}	both	0	OK: every GPU-touching test carries #[ignore] (1 files	NOTE:	-	a macro body that never reaches the GPU stays un-ignored
+macro_gpu_exempt	--root {}	both	0	OK: every GPU-touching test carries #[ignore] (1 files	NOTE:	-	the per-test exemption marker works inside a macro body
+plain_gpu_ignored	--root {}	both	0	OK: every GPU-touching test carries #[ignore] (1 files	NOTE:	-	the compliant non-macro shape stays green
+ignore_metal_undeclared	--root {}	both	1	ERROR: #[ignore] claims a Metal context;;orphaned_metal_test	-	-	an #[ignore] claiming Metal with no reachable device and no declared route is fatal
+ignore_bare_env_gated	--root {}	both	1	ERROR: #[ignore] with no reason on an environment-gated test;;env_gated_cpu_cell	ERROR: #[ignore] claims a Metal context	-	a reasonless #[ignore] on an environment-gated test no device is reachable from is fatal
+ignore_bare_env_gated	--root {}	both	1	ERROR: #[ignore] with no reason on an environment-gated test;;snapshot_gated_cpu_cell	ERROR: #[ignore] claims a Metal context	-	and so is one gated through the snapshot resolver
+ignore_bare_env_gated_dispositioned	--root {}	both	0	OK: every GPU-touching test carries #[ignore] (1 files	ERROR	-	a written reason, a GPU cell, and an ungated cell each pass it
+unscanned_in_body	--root {}	both	1	ERROR: #[ignore] claims a Metal context;;marker_inside_body	-	-	a declared-route marker among a fn's statements declares nothing
+unscanned_in_body	--root {}	both	1	ERROR: #[ignore] claims a Metal context;;test_after_body_marker	-	-	and does not carry to the next fn
+metal_unscanned_no_ignore	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;declared_without_ignore	-	-	a declared route makes the missing #[ignore] a violation
+metal_unscanned_and_exempt	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;metal-unscanned AND exempt	-	-	declaring and exempting the same test fails closed
+metal_unscanned_stale	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;Device::Gpu is reachable here	-	-	a marker the scanner can check for itself is stale, not redundant
+metal_unscanned_declared	--root {}	both	0	OK: every GPU-touching test carries #[ignore] (1 files	ERROR	-	a declared route closes the fatal converse
+metal_unscanned_declared	--root {}	both	0	NOTE: declared-route GPU tests;;declared_metal_test	-	-	and the enforced-but-unlisted test is announced
+member_floor	--root {}	both	1	ERROR: parsed 1 workspace members but 2 crate dirs exist under crates/	OK:	-	a crate directory the members list does not name is a narrowed scan, refused
+no_manifest	--root {}	both	1	not found — cannot resolve workspace members	OK:	-	a root with no workspace manifest is refused, not scanned as empty
+no_members	--root {}	both	1	parsed 0 workspace members	OK:	-	a member list the parser reads as empty is refused
+member_without_directory	--root {}	both	1	member crate 'crates/gone' from Cargo.toml has no directory	OK:	-	a listed member that moved is a broken scan, not a narrowed one
+member_without_src	--root {}	both	1	does not exist — this gate is scanning nothing for 'crates/fx'	OK:	-	a listed member with no src/ scans nothing and says so
+member_without_name	--root {}	both	1	could not read [package] name from	OK:	-	a manifest that names no package is refused, since cargo is handed the name
+no_test_files	--root {}	both	1	matched 0 test files across 1 workspace members	OK:	-	a workspace with no test file to read is refused, not passed
+# The list/enforce split, pinned on a fixture that holds one of each. The macro
+# cell is GPU-touching and compliant, so it is enforced; only the plain test may
+# reach `list`, because the runner turns a listed name into a libtest filter
+# and a `$metavar` matches no test. Asserting the exact stdout is what stops the
+# split from silently becoming "macro cells are listed" (which under-matches in
+# the runner) or "plain tests are dropped" (which stops running them).
+macro_gpu_ignored	!list --root {}	out	0	-	-	fx\tplain_gpu_test	list — macro cell enforced but not listed; plain test listed
+# The same run must still ANNOUNCE the excluded macro cells. `make gpu-test`
+# calls only `list`, so a note printed exclusively by the enforcing path is
+# invisible to the one operator who needs it.
+macro_gpu_ignored	!list --root {}	err	0	NOTE: macro-generated GPU tests;>fixture_tests.rs: gpu_cell!{$name}	-	-	list — the excluded macro cells are announced on stderr, after the note that says why
+# The same split for the declared-route marker, and for the same reason: the
+# runner turns a listed name into a libtest filter and executes it, and every
+# declared test is snapshot-gated or drives a child process, so listing one
+# would have the runner execute a no-op, see no Metal validation banner for that
+# crate, and fail the suite over a missing model. Asserting the exact stdout is
+# what stops "declared tests are enforced but unlisted" from quietly becoming
+# either "declared tests are listed" or "plain tests were dropped too".
+metal_unscanned_declared	!list --root {}	out	0	-	-	fx\tplain_gpu_test	list — declared test enforced but not listed; plain test listed
+# `list` must refuse an undeclared Metal-claiming #[ignore] exactly as the
+# enforcing path does. `make gpu-test` calls only `list`, so a check that
+# fires in one mode and not the other leaves the whole GPU suite running over a
+# tree the gate has already judged incomplete.
+#
+# The exit code alone would not assert it: with the check removed the fixture
+# classifies no GPU test at all, so `list` still exits 1 on its own
+# refuse-to-emit-an-empty-list path. The REASON is what pins this.
+ignore_metal_undeclared	!list --root {}	both	1	ERROR: #[ignore] claims a Metal context	-	-	list — refuses an undeclared Metal-claiming #[ignore] too
+# The reasonless-#[ignore] rule refuses `list` too, for the reason above; and
+# the GPU form of the same cell is what `list` hands the runner, which is the
+# disposition that puts it under a gate.
+ignore_bare_env_gated	!list --root {}	both	1	ERROR: #[ignore] with no reason on an environment-gated test	-	-	list — refuses a reasonless environment-gated #[ignore] too
+ignore_bare_env_gated_dispositioned	!list --root {}	out	0	-	-	fx\tenv_gated_gpu_cell	list — the GPU form of the cell is listed; the others are not
+# The population as a whole: two members, the second named other than its directory, a unit-test
+# file below src/, an integration binary reaching a helper in a subdirectory of tests/, an async
+# test, and one each of the macro, declared-route and exempt shapes. The exact listing is what
+# sees a scan narrow: a find that stops descending, a root that is not scanned, a member the parser
+# drops, the directory name where the package name belongs. The listing is sorted because its
+# order is the file system's.
+multi_crate	!list --files --root {}	sorted	0	-	-	fa\tinteg_via_helper\t{}/crates/fa/tests/integ.rs\nfa\tnested_deep_gpu\t{}/crates/fa/src/deep/inner/deep_tests.rs\nfa\tsub_tests_rs_gpu\t{}/crates/fa/src/sub/tests.rs\nfa\ttokio_flavored_gpu\t{}/crates/fa/src/sub/tests.rs\nfb-pkg\tfb_gpu\t{}/crates/fb/src/lib_tests.rs	list --files names each classified test once, with its package and its declaring file; macro, declared and exempt tests stay out
+multi_crate	!list --root {}	sorted	0	-	-	fa\tinteg_via_helper\nfa\tnested_deep_gpu\nfa\tsub_tests_rs_gpu\nfa\ttokio_flavored_gpu\nfb-pkg\tfb_gpu	list names the package, not the directory; an exempt test that is also ignored is not listed
+multi_crate	!list --root {}	err	0	NOTE: macro-generated GPU tests;>deep_tests.rs: gpu_cell!{$name};;NOTE: declared-route GPU tests;>integ.rs: declared_child	-	-	both excluded populations are announced on stderr, each after the note that says why
+multi_crate	--root {}	out	0	-	-	OK: every GPU-touching test carries #[ignore] (5 files across 2 workspace members).	ignored prints its one line and nothing else on stdout, with every scanned file counted
+two_members	!list --root {}	sorted	0	-	-	fx\tgpu_fx\nfy\tgpu_fy	list reads every member of the manifest, one of them outside crates/ where the member floor cannot see it
+two_members	--root {}	out	0	-	-	OK: every GPU-touching test carries #[ignore] (2 files across 2 workspace members).	ignored reads every member of the manifest too
+# An exemption covers the one test it sits on. The test after it is held to the rule.
+exempt_is_per_test	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;fixture_tests.rs: real_gpu	exempt_policy_value	-	a test after an exempt one is still a violation; the exempt one is not named
+# list refuses everything ignored refuses before it has a population, for the same reason.
+# make gpu-test calls only list, so a refusal that only ignored makes leaves the suite running
+# over a tree the gate has already judged unreadable.
+macro_unreadable	!list --root {}	both	1	ERROR: this gate could not classify part of a scanned file;;gpu_cell!	OK:	-	an assembled fn name fails closed in list too
+member_floor	!list --root {}	both	1	ERROR: parsed 1 workspace members but 2 crate dirs exist under crates/	OK:	-	list refuses a narrowed member list too
+no_manifest	!list --root {}	both	1	not found — cannot resolve workspace members	OK:	-	list refuses a root with no workspace manifest
+no_members	!list --root {}	both	1	parsed 0 workspace members	OK:	-	list refuses a member list the parser reads as empty
+member_without_directory	!list --root {}	both	1	member crate 'crates/gone' from Cargo.toml has no directory	OK:	-	list refuses a member that moved
+member_without_src	!list --root {}	both	1	does not exist — this gate is scanning nothing for 'crates/fx'	OK:	-	list refuses a member with no src/
+member_without_name	!list --root {}	both	1	could not read [package] name from	OK:	-	list refuses a manifest that names no package
+no_test_files	!list --root {}	both	1	matched 0 test files across 1 workspace members	OK:	-	list refuses a workspace with no test file
+member_without_manifest	--root {}	both	1	could not read [package] name from	OK:	-	a member with no manifest is refused with its reason, not stopped silently
+member_without_manifest	!list --root {}	both	1	could not read [package] name from	-	-	list refuses a member with no manifest too
+same_name_two_files	!list --root {}	sorted	0	-	-	fx\tgpu_same\nfx\tgpu_same	one fn name declared in two files of a crate is two rows, not one; the real tree has this shape
+sig_body_opens_on_the_paren_line	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_a	OK:	-	a body opened on the line that closes the parameters is a body, not a lost signature
+sig_comment_brace_on_the_paren_line	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_b	OK:	-	a closing brace in a trailing comment is not code, so the body's brace still opens the body
+sig_block_comment_after_one_line_header	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_c1	OK:	-	a block comment after the body's brace does not hide that the body is open
+sig_block_comment_after_the_paren_line	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_c2	OK:	-	the same after a multi-line signature
+sig_brace_in_a_string_on_the_paren_line	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_d	OK:	-	a closing brace in a string is not code, and the body's brace on that line is
+sig_paren_line_closes_the_body	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_e	OK:	-	a body that opens and closes on the line that ends the signature does not swallow the test after it
+sig_array_type_wrapped	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_f	OK:	-	a `;` inside a wrapped array type is not the end of a declaration
+sig_where_assoc_const_bound	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_g	OK:	-	brackets and parentheses in a where clause balance before the `;` of a declaration
+sig_macro_paren_line_opens_body	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_cell!{$name}	OK:	-	a body opened on the paren line inside a macro body is read
+sig_decl_in_impl_then_nested_test	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_i	OK:	-	a where-split declaration inside an impl ends at its `;`, so the nested block after it closes nothing
+sig_multiline_decl_without_where	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_j	OK:	-	a multi-line declaration with no where clause ends at its `;`
+sig_macro_where_split_decl	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_k	OK:	-	a where-split declaration inside a macro body ends at its `;`
+sig_block_comment_line_in_signature	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_l	OK:	-	a `;` inside a block comment between the parameters is not the end of a declaration
+sig_metavar_param_list_in_macro	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_cell2!{$name}	OK:	-	a repetition in a macro's parameter list balances before an inline body
+sig_where_bound_with_brace_then_decl	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_o	OK:	-	a bracket and a brace inside a where bound balance on their line, and the `;` ends the declaration
+sig_trailing_comment_with_semicolon	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;calls_helper	OK:	-	a `;` in a trailing comment on a where line is not the end of a declaration
+sig_semicolon_in_brackets_in_where	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;calls_helper	OK:	-	a `;` inside brackets on a where line is not the end of a declaration
+sig_brace_mid_line_in_where_then_decl	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_s	OK:	-	a balanced brace in the middle of a where line does not open the body
+sig_parameter_attribute	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_t	could not classify	-	an attribute on a parameter is a line of the signature, so the fn is read and named
+sig_assoc_const_equality_bound	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_u	OK:	-	an associated-const equality bound before the `;` of a declaration
+sig_char_literal_brace_on_the_paren_line	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_ch	OK:	-	a brace in a char literal is not code, and the body's brace on that line is
+sig_inline_body_reaching_the_gpu	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;calls_the_inline_helper	OK:	-	an inline body on the line that ends the signature is recorded, so a test that calls it is GPU-touching
+sig_array_return_type_wrapped	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_ar	OK:	-	a `;` inside a wrapped array return type, with no parenthesis open, is not the end of a declaration
+sig_block_comment_in_where_clause	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_l2	OK:	-	a `;` inside a block comment between where bounds, with no bracket open, is not the end of a declaration
+sig_decl_after_a_body	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_after	OK:	-	the depths of a signature start from zero at each fn, so a wrapped declaration after a body is a declaration
+sig_raw_string_brace_in_a_body	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_raw	OK:	-	a closing brace in a raw string in the body that follows a where clause is not read as the end of a signature
+sig_semicolon_in_parens_without_brackets	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_par	OK:	-	a `;` inside parentheses with no bracket open is not the end of a declaration
+sig_block_comment_slashes_after_the_paren	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_w3	OK:	-	slashes in a block comment after the parameter list start no line comment, so the body brace on the next line is read
+sig_block_comment_slashes_in_where	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_w4	OK:	-	slashes in a block comment on a where line start no line comment, so the closing of the comment is seen
+sig_block_comment_quote_in_where	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_w5	OK:	-	a quote in a block comment on a where line opens no string
+sig_header_comment_quote_hides_the_body_brace	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_w6	OK:	-	a quote in a block comment on the header line does not hide the body brace after the comment
+sig_header_comment_slashes_hide_the_body_brace	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_w7	OK:	-	slashes in a block comment on the header line do not hide the body brace after the comment
+sig_hidden_close_then_inline_block	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_w9	OK:	-	a body line that opens with a block comment and holds an inline block is body, not the end of the item
+sig_nested_block_comment_on_header	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_nc1	OK:	-	a block comment nests, so the first closing of two does not end it
+sig_raw_string_odd_quotes_on_inline_body	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_rs1	OK:	-	a raw string with an inner quote on an inline body is one string, so the next test is not swallowed
+sig_raw_string_backslash_on_inline_body	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_rs2	OK:	-	a backslash does not escape in a raw string, so the string ends where its quote is
+sig_url_string_before_gpu_on_a_done_line	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_u1	OK:	-	a URL string before the device on the line that completes an item is not a comment
+sig_url_string_before_gpu_on_a_body_line	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_u2	OK:	-	a URL string before the device on a body line is not a comment
+sig_trailing_comment_naming_gpu_on_a_done_line	--root {}	both	0	OK: every GPU-touching test carries #[ignore] (1 files	ERROR	-	a trailing comment that names the device on the line that completes an item makes no test of it
+sig_const_block_in_param_type_wrapped	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_v	OK:	-	a line ending in a const block's brace inside an open parenthesis is not the end of the item
+sig_const_block_in_array_param_wrapped	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_v2	OK:	-	a line ending in a const block's brace inside an open bracket is not the end of the item
+sig_header_const_block_in_param_wrapped	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_v3	OK:	-	the same on the header line, which is read by the same rule as a later line
+sig_return_array_const_block_wrapped	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_v4	OK:	-	a const block in the length of a wrapped return array does not end the item
+sig_const_block_in_generic_param_wrapped	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_x	OK:	-	a const block inside an open generic list does not end the item
+sig_where_const_block_bound_wrapped	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_y1	OK:	-	a const block inside a where bound's open generic list does not end the item
+sig_return_type_const_block_wrapped_after_paren	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_y2	OK:	-	a const block inside a return type's open generic list does not end the item
+sig_header_return_type_const_block_wrapped	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_y3	OK:	-	the same on the header line
+sig_const_default_block_then_generics_close	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_y4	OK:	-	a const parameter's default block on the header line, with the generic list closing on the next, does not end the item
+sig_const_default_block_on_second_line	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_y5	OK:	-	a const parameter's default block on a later line of an open generic list does not end the item
+sig_shift_in_array_length_of_a_declaration	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_z1	OK:	-	a shift in an array length is not a generic bracket, so the declaration ends and the next test is read
+sig_shift_in_array_length_of_return_type_inline	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_z3;;gpu_z3b	OK:	-	a shift in a return array's length is not a generic bracket, so the inline body ends the item and the next test is read too
+sig_block_comment_open_at_the_end_of_the_header	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_hc	OK:	-	a block comment still open at the end of the header covers the lines after it, and a `;` in it is not the end of a declaration
+sig_arrow_before_a_const_block_in_the_generics	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_arrow	OK:	-	the `>` of `->` inside an open generic list does not close it, so the const block that ends the line does not end the item
+sig_comparison_in_a_const_block_of_the_return_type	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_cmp	OK:	-	a `>` inside a const block is an operator and does not close the generic list around it
+sig_comparison_in_a_const_block_then_a_declaration	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_lt	OK:	-	a `<` inside a const block is an operator and does not open a generic list, so the declaration ends at its `;`
+sig_const_block_bound_in_the_middle_of_a_where_clause	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_wb	OK:	-	a const block in a where bound that is not the last line of the clause does not end the item, although the line holds a balanced brace pair
+body_comment_naming_the_device_is_not_a_use	--root {}	both	0	OK: every GPU-touching test carries #[ignore] (1 files	ERROR	-	a trailing comment on a body line that names the device makes no test of it
+sig_multiline_raw_string_in_a_body	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_ml	OK:	-	a body line inside a raw string over several lines is not read as a signature line, so a stray `};` in it does not end the item
+sig_shift_in_a_bracket_inside_an_open_generic_list	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_sh	OK:	-	a `>>` in an array length inside an open generic list closes nothing, so the const block that ends the line does not end the item
+sig_unbalanced_angle_does_not_leak_into_the_next_item	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_next	OK:	-	a `<` that is an operator in one signature does not stay open in the next item's
+header_trailing_comment_naming_the_device_is_not_a_use	--root {}	both	0	OK: every GPU-touching test carries #[ignore] (1 files	ERROR	-	a trailing comment on the line that opens a one-line test names the device and makes no use of it
+sig_c_raw_string_then_slashes_in_a_string	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_hc6	OK:	-	a `cr#"..."#` literal is a raw string, so the slashes in the string after it start no comment on the header line
+body_c_raw_string_then_slashes_in_a_string	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_hc6b	OK:	-	the same on a body line, which is cut by the same reader
+body_real_tree_shape_source_text_in_a_test	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_bs2	OK:	-	source text held in a continued string of a test, as the tree has it, closes nothing
+body_block_comment_holding_a_close_brace	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_bc1	OK:	-	a `}` that starts a line inside a block comment of the body is not the end of the fn
+body_raw_string_holding_a_close_brace	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_br1	OK:	-	a `}` that starts a line inside a raw string of the body is not the end of the fn
+body_string_continued_then_slashes	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_hc9	OK:	-	slashes in the continued part of a string cut no code after them
+body_comment_open_then_slashes_before_its_close	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_hc5b	OK:	-	slashes inside a block comment that is still open start no line comment
+body_string_onto_a_slash_line	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_bq1	OK:	-	a string carried onto a line that starts with slashes is not a comment line
+body_string_line_starting_an_attribute	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_ba1	OK:	-	a line of a string that starts like an attribute is not one
+body_opens_on_the_second_signature_line_into_a_string	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_cl	OK:	-	a body that opens on the second line of the signature, into a string, starts in that string
+body_opens_on_the_second_signature_line_into_a_comment	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_cl2	OK:	-	the same into a block comment
+macro_matcher_with_an_operator_angle_is_not_an_item	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;lt!{$name}	OK:	-	a matcher `fn $name:ident where $a:literal < $b:literal;` is a pattern, not a header, so its `<` opens nothing and the macro's test is read
+macro_matcher_with_an_operator_angle_and_a_block_is_not_an_item	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;lt!{$name}	OK:	-	the same when the matcher ends in a repetition between braces
+sig_declaration_ends_at_its_semicolon_after_an_operator_angle	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_j6	OK:	-	a `;` with no `(` or `[` open ends a declaration whatever `<` stands before it, so the next test is read
+sig_generic_in_parentheses_on_an_inline_body	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_s5	OK:	-	a generic list inside the parameters balances there and is not counted at depth 0, so the inline body ends the item and the next test is read
+sig_generic_in_parentheses_inside_an_open_bound	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_s8	OK:	-	a generic list inside the parentheses of an open bound does not close the bound's own list
+sig_generic_list_on_an_inline_body	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_g1	OK:	-	a generic list that closes on the header line of an item with an inline body leaves nothing open, so the item ends there and the next test is read
+sig_comparison_in_a_const_block_on_an_inline_body	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_g2	OK:	-	a `<` inside a const block is an operator, so the generic list around it closes and the inline body ends the item
+file_scope_raw_string_holding_a_fake_fn_and_an_odd_quote	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_t01	could not classify	-	a fn header and an odd quote inside a raw string at file scope are text, so the test after the string is read and named
+file_scope_plain_string_holding_a_fake_fn_and_slash_star	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_t02	could not classify	-	the same in a plain string whose text holds `/*`, which opens no comment
+macro_body_raw_string_holding_a_fake_fn_and_an_odd_quote	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_t03	could not classify	-	the same in a macro body, where the text must not be taken for an item or for the close of the body
+header_line_opens_a_string_that_closes_in_the_body_then_another_test	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_hs1;;gpu_hs2	could not classify	-	a string opened on a header line is owned by the body, so the file-scope state is closed when the fn ends and the next test is read
+declaration_on_the_header_line_opens_a_comment_holding_a_fake_fn	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_td1	could not classify	-	a declaration that ends on its header line hands the comment it leaves open to the file scope, so the text in it is not an item
+declaration_after_a_where_clause_opens_a_comment_holding_a_fake_fn	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_td2	could not classify	-	the same for a declaration that ends on a later line of its signature
+attribute_string_over_two_lines_then_another_test	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_at2	could not classify	-	a string that an attribute carries over its lines is the attribute's, so the file scope is closed when the attribute ends
+file_ends_inside_a_string	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;open at the end of the file;;fixture_tests.rs;;fixture_tests.rs: end-of-file (a string or block comment is open	-	-	a file that ends inside a string is refused, not scanned as if the tail were code
+file_ends_inside_a_block_comment	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;open at the end of the file;;fixture_tests.rs;;fixture_tests.rs: end-of-file (a string or block comment is open	-	-	a file that ends inside a block comment is refused
+first_file_ends_inside_a_raw_string_before_a_second_file	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;open at the end of the file;;fixture_tests.rs;;fixture_tests.rs: end-of-file (a string or block comment is open	second.rs	-	a file that ends inside a raw string is refused at the next file, naming the first and not the second
+attr_item_on_the_attribute_line_then_a_gpu_helper	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_t04	could not classify	-	an item that feeds no rule shares the attribute's line, so the helper after it is read and the test using it named
+attr_test_and_fn_on_one_line	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;fixture_tests.rs:1:;;an item after an attribute's closing bracket	(attribute never closed	-	an attribute and its fn on one line are refused at that line, not left open to the end of the file
+attr_test_and_fn_on_one_line_in_a_macro_body	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;fixture_tests.rs:3:;;an item after an attribute's closing bracket;;cell! (1 #[test] declared, 0 readable)	(attribute never closed	-	the same in a macro body, beside the count of tests the body declares and the parser could not read
+attr_wrapped_ends_with_a_fn_on_the_closing_line	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;fixture_tests.rs:4:;;an item after an attribute's closing bracket	-	-	a wrapped attribute whose closing line carries the fn is refused at that line
+attr_statement_in_a_body_then_another_test	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_t05	could not classify	-	an attribute on a statement inside a body is a body line, so the test after it is read and named
+attr_statement_in_a_body_as_the_last_item	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_t14	could not classify	-	the same with the statement attribute in the last item of the file, which no later `]` closes
+attr_nested_brackets_then_a_gpu_test	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_nested	could not classify	-	an attribute holding nested brackets closes at its own `]`, so the test under it is read and named
+attr_block_comment_holding_a_bracket_in_a_wrapped_attribute	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_bc	could not classify	-	a `]` at the end of a line inside a block comment of a wrapped attribute does not close it
+attr_trailing_block_comment	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_after_block_comment	could not classify	-	a block comment after an attribute's closing `]` is not code
+attr_closing_line_opens_a_comment_holding_a_fake_fn	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_hb	could not classify	-	a comment that the closing line of a wrapped attribute leaves open is the file scope's, so the text in it is not an item
+nonascii_lifetime_then_a_quote_char_literal	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_hidden	could not classify	-	a non-ASCII lifetime is not a char literal, so the quote char after it opens no string and the test is read and named
+nonascii_lifetime_in_a_one_line_fn_signature	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_hidden	could not classify	-	the same in the signature of a one-line fn
+nonascii_lifetime_at_the_end_of_a_line	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_hidden	could not classify	-	a non-ASCII lifetime at the end of a line leaves the quote char on the next line a char literal
+nonascii_char_literals_in_an_array	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_after_chars	could not classify	-	a char literal of 2 and 3 bytes is stepped as one, so the quote char beside it opens no string
+attr_on_generic_parameters_then_a_gpu_test	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_after_generics	could not classify	-	an attribute on a generic parameter shares its line with the parameter, which no rule reads, so the test after it is read and named
+attr_on_tuple_struct_fields_then_a_gpu_test	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_after_tuple_fields	could not classify	-	the same for the fields of a tuple struct
+attr_on_tuple_variant_fields_then_a_gpu_test	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_after_variant_fields	could not classify	-	the same for the fields of a tuple variant
+attr_on_a_macro_matcher_line_then_a_gpu_test	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_tests!{$name}	could not classify	-	a matcher line `#[$m:meta] fn $name:ident` is a pattern, not an item, so the macro body under it is read and named
+attr_cfg_test_module_on_one_line	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_in_module	could not classify	-	a module opened on the attribute's line feeds no rule, so the test in it is read and named
+attr_on_a_macro_rules_line_is_refused	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;fixture_tests.rs:1:;;an item after an attribute's closing bracket	-	-	a `macro_rules!` after the attribute's `]` opens a body no rule would follow, so it is refused
+attr_on_a_device_alias_line_then_a_test_using_it	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;fixture_tests.rs:1:;;an item after an attribute's closing bracket	-	-	a Device alias after the attribute's `]` is refused, so a test using it never passes as clean
+attr_second_attribute_on_the_attribute_line	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;fixture_tests.rs:1:;;an item after an attribute's closing bracket	-	-	a second attribute after the first one's `]` is refused, so the attributes above the fn are never dropped unread
+attr_on_an_associated_item_then_the_test_attribute	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_after_item_attribute	could not classify	-	an attribute on an item that ends with its line is dropped, so its `#[ignore]` is never read as the ignore of the test attribute on the next line
+attr_qualified_helpers_on_the_attribute_line_are_refused	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;fixture_tests.rs:1:;;fixture_tests.rs:2:;;fixture_tests.rs:3:;;fixture_tests.rs:4:;;fixture_tests.rs:5:;;an item after an attribute's closing bracket	-	-	an unsafe, const, extern or restricted-visibility fn after the attribute's `]` is refused, so a GPU helper written so is never passed over
+attr_impl_and_mod_on_the_attribute_line_are_refused	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;fixture_tests.rs:2:;;fixture_tests.rs:9:;;an item after an attribute's closing bracket	-	-	an fn inside an impl or a module opened after the attribute's `]` is refused, so the helper and the test in it are never passed over
+attr_non_ascii_test_name_on_the_attribute_line_is_refused	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;fixture_tests.rs:1:;;an item after an attribute's closing bracket	-	-	a test with a non-ASCII name after the attribute's `]` is refused, not cleared because its name is blanked
+attr_on_a_fn_pointer_field_then_a_gpu_test	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_after_fn_pointer	could not classify	-	a fn pointer type is `fn(`, not an item, so a field carrying an attribute feeds no rule and the test after it is read and named
+attr_on_a_bound_naming_a_trait_ending_in_fn_then_a_gpu_test	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_after_bound	could not classify	-	a name that ends in fn is not the keyword, so a bound naming it feeds no rule and the test after it is read and named
+fn_unsafe_const_extern_and_restricted_helpers_on_their_own_line	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;calls_unsafe;;calls_const;;calls_extern;;calls_pubin;;calls_pubcrate	OK:	-	a helper written as an unsafe, const, extern or restricted-visibility fn on its own line is read as an fn, so the tests calling it are named
+fn_path_visibility_and_stacked_qualifiers	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;calls_path;;calls_async_unsafe;;calls_unsafe_extern;;calls_pub_const	OK:	-	a path visibility and stacked qualifiers are one header, so each helper is read and the tests calling it are named
+fn_non_ascii_helper_name_and_generics	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_uses_helper;;gpu_after	OK:	-	a non-ASCII letter stays in the name, so a call to `h_ü::<u8>(` finds its helper and names the test
+fn_non_ascii_test_name_on_its_own_line	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;ü;;é1	OK:	-	a test whose name starts with a non-ASCII letter is read, so it is named
+fn_macro_matcher_with_a_qualifier_is_not_an_item	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_tests!{$name}	could not classify	-	a matcher line `unsafe fn $name:ident` is a pattern, not an item, so the macro body under it is read and named
+fn_macro_matcher_with_a_qualifier_after_an_attribute_is_not_an_item	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_tests!{$name}	could not classify	-	a matcher `#[$m:meta] unsafe fn $name:ident` after an attribute is a pattern, not an item, so the macro body under it is read and named
+sig_matcher_line_headed_by_an_unsafe_fn_closes_a_bracket	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;fixture_tests.rs:4:;;a signature closes a bracket it never opened	-	-	a matcher line `unsafe fn foo($x:expr) $b:block` opens no item, and the `) => {` under it closes a bracket the signature never opened, so it is refused at that line and the test after the macro is not swallowed
+sig_matcher_line_headed_by_a_plain_fn_closes_a_bracket	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;fixture_tests.rs:4:;;a signature closes a bracket it never opened	-	-	the same with a plain `fn foo(` matcher line
+attr_test_and_fn_keyword_ending_the_line	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;fixture_tests.rs:1:;;an item after an attribute's closing bracket	-	-	an attribute followed by `fn` at the end of its line, the name on the next line, is refused at the attribute line, not cleared
+attr_then_a_qualifier_alone_on_a_line	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;fixture_tests.rs:2:;;a qualifier alone on a line after an attribute;;fixture_tests.rs:8:;;fixture_tests.rs:19:;;fixture_tests.rs:25:	-	-	`async`, `pub(crate)`, `unsafe extern "C"` or `const` alone on a line while an attribute block is pending is refused at that line, because the fn under it would be read without its attributes
+fn_visibility_alone_on_a_line_without_an_attribute	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;calls_vis_helper;;calls_extern_helper	could not classify	-	a visibility or qualifiers alone on a line with no attribute pending is not refused: the fn under it is read and its callers are named
+sig_every_bracket_kind_balanced_over_lines	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_all_brackets	could not classify	-	a signature whose parentheses, brackets, braces and generic angles all balance over several lines closes nothing it did not open, so the fn is read and named
+sig_matcher_line_headed_by_a_fn_then_a_square_bracket_closes	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;fixture_tests.rs:4:;;a signature closes a bracket it never opened	-	-	a matcher line `fn foo` under a `[` delimiter, then `] => {`: the `]` closes a bracket the signature never opened, so it is refused at that line
+sig_matcher_line_headed_by_a_fn_then_a_brace_closes	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;fixture_tests.rs:4:;;a signature closes a bracket it never opened	-	-	a matcher line `fn foo` under a `{` delimiter, then `} => {`: the `}` closes a bracket the signature never opened, so it is refused at that line
+sig_matcher_closer_on_the_fn_header_line	--root {}	both	1	ERROR: this gate could not classify part of a scanned file;;fixture_tests.rs:3:;;a signature closes a bracket it never opened	-	-	a `)` on the header line itself, before any opener, is refused at that line, not read as the start of a body
+sig_stray_paren_closer_ending_a_declaration	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_after_paren_macro	could not classify	-	a paren macro invocation holding a signature with no body closes its `)` after the signature, then `;`: that is a declaration, nothing after it is swallowed, so the next test is read and named
+sig_stray_brace_closer_ending_a_declaration_in_a_transcriber	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_after_transcriber	could not classify	-	a macro transcriber whose `fn $name() $body` takes its body from a metavariable ends with `};`: the `}` closes a transcriber bracket and the `;` ends a declaration, so the next test is read and named
+sig_stray_closer_ending_a_declaration_on_its_header_line	--root {}	both	1	ERROR: GPU-touching tests missing the #[ignore];;gpu_after_header_decl	could not classify	-	a paren macro invocation whose argument is a bodiless fn closes its `)` on the header line and ends with `;`: that is a declaration, so the next test is read and named

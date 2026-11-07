@@ -1,9 +1,9 @@
-# busiest_between.awk — which process burned the most CPU between two snapshots.
+# Which process burned the most CPU between two cpu_snapshot files.
 #
 # Usage:  awk -v window=<wall_seconds> -f busiest_between.awk <before> <after>
 #
 # Each snapshot is `<pid> <cumulative_cpu_seconds> <command>` per line, as
-# produced by `cpu_snapshot` in scripts/perf_ab.sh.
+# produced by `cpu_snapshot` in scripts/lib/cpu_snapshot.sh.
 #
 # Prints one line: `<state> <pct> <command>` where state is
 #

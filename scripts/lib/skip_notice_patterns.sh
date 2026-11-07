@@ -1,13 +1,13 @@
-# scripts/lib/skip_notice_patterns.sh — the stand-down notice, defined once.
+# The SKIP and WAIVED stand-down notice patterns, defined once for the runner and the gate.
 #
 # A model-gated test that returns before asserting anything announces
 # `SKIP <test>: <why>`. Two tools read that line and they must agree exactly on
 # what it is:
 #
-#   * `scripts/run_gpu_tests.sh` reads it out of a libtest log, to list the cell
+#   * `scripts/suite/run_gpu_tests.sh` reads it out of a libtest log, to list the cell
 #     and to drop its count from the shader-validation census expectation.
-#   * `scripts/check_named_skip_notices.sh` reads it out of the source, to fail
-#     the build on a notice that names no test.
+#   * `scripts/check/gpu_tests.sh skip-notices` reads it out of the source, to
+#     fail the build on a notice that names no test.
 #
 # A difference between the two is invisible in both directions and worse than
 # either being wrong alone: a notice the source gate calls attributed and the
@@ -29,8 +29,9 @@ ANY_SKIP='(^|[^A-Za-z0-9_])SKIP([^A-Za-z0-9_]|$)'
 # The same notice as it is written in a Rust format string, where the test's own
 # name arrives as an argument rather than as a literal. `{test}` exactly: any
 # other placeholder is a name the source gate cannot check, and `{other}` reads
-# identically while naming a cell that ran.
-NAMED_SKIP_PLACEHOLDER='SKIP \{test\}:'
+# identically while naming a cell that ran. The braces are bracket expressions because gawk
+# warns about a backslash before a brace in a dynamic regex, once for every line it matches.
+NAMED_SKIP_PLACEHOLDER='SKIP [{]test[}]:'
 
 # A test that ran and judged its answers, and did not make one of its checks on
 # this host, announces `WAIVED <test>: <why>`. It is not a stand-down: the test
@@ -40,4 +41,4 @@ NAMED_WAIVED='WAIVED [A-Za-z_][A-Za-z0-9_]*:'
 
 # Any waiver, named or not, and its form in a Rust format string. As for SKIP.
 ANY_WAIVED='(^|[^A-Za-z0-9_])WAIVED([^A-Za-z0-9_]|$)'
-NAMED_WAIVED_PLACEHOLDER='WAIVED \{test\}:'
+NAMED_WAIVED_PLACEHOLDER='WAIVED [{]test[}]:'

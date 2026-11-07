@@ -2188,7 +2188,7 @@ mod tests {
     const BYTE_MODEL_LAYERS: usize = 36;
 
     /// Print the per-layer KV byte model, swept over the type, for
-    /// `scripts/check_kv_byte_model_parity.sh` to hold `scripts/perf_ceiling.py`
+    /// `scripts/check/engine_parity.sh kv-byte-model` to hold `scripts/profile/perf_ceiling.py`
     /// against.
     ///
     /// That script carries a second, hand-maintained copy of this arithmetic so

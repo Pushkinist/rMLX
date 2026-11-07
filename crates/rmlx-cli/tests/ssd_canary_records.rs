@@ -1,4 +1,4 @@
-//! The three phase records `scripts/ssd_canary.sh` files are three cells.
+//! The three phase records `scripts/bench/ssd_canary.sh` files are three cells.
 //!
 //! Prompts are content-addressed and part of the cell key, so records that
 //! share a prompt body share a cell whatever their prompt names say. The

@@ -23,10 +23,6 @@ cargo test --no-run -p rmlx-kv-quant --tests
 rmlx claim run -- cargo test -p rmlx-kv-quant --lib -- --ignored <filter> --test-threads=1
 ```
 
-Building under the claim would hold it for the whole compile, blocking any
-other GPU user for no GPU work at all — so build first, then run the
-already-built binary under `rmlx claim run`.
-
 `cargo test` runs a binary's tests on parallel threads. A shared Metal context
 driven from several of them aborts the whole process:
 
@@ -41,18 +37,22 @@ each test still passes alone, so the rule is mechanical.
 returns before any device-parameterized op is not a GPU test: pass it
 `Device::Cpu` and leave it un-ignored, so the default gate keeps running it.
 
-`make check-gpu-tests-ignored` (`scripts/check_gpu_tests_ignored.sh`) enforces
+`make check-gpu-tests-ignored` (`scripts/check/gpu_tests.sh ignored`) enforces
 the rule. It runs in `make ci` and in the hosted `source gates` job. Its scope:
 
 - every workspace member, read from `Cargo.toml`;
-- `src/**/*_tests.rs`, `src/**/tests.rs` and `tests/*.rs` in each member;
+- `src/**/*_tests.rs`, `src/**/tests.rs` and `tests/**/*.rs` in each member;
 - `#[test]`, `#[tokio::test]` and `#[tokio::test(…)]`.
+
+A directory or file the scan cannot read is a refusal that names it, never a
+tree with no findings: `ignored` and `list` exit 1, `skip-notices` exits 2.
+`scripts/suite/gpu_test_classes.sh` refuses the
+same way in `half` and `threadgroup`: exit 2, with the classifier's reason.
 
 A test reaches `Device::Gpu` when the name appears in its body, or in a
 module-scope `const … = Device::Gpu`, or in a helper it calls. An unqualified
 call binds to a helper in the same file. A `module::helper(..)` call binds to
-the scanned file of that module name in the same crate. The gate keys on this
-shape and never on the ignore reason's wording, with one exception below.
+the scanned file of that module name in the same crate.
 
 ### Exempting a device-as-value test
 
@@ -91,8 +91,7 @@ one of three dispositions is recorded:
 3. It is ignored for a reason: write the reason.
 
 A bare `#[ignore]` on a test that reads no variable, or reads one only through
-another helper, is outside this check. The fixtures `ignore_bare_env_gated` and
-`ignore_bare_env_gated_dispositioned` pin both directions.
+another helper, is outside this check.
 
 ### Declaring a Metal route the scanner cannot follow
 
@@ -117,24 +116,21 @@ and the marker beside `exempt`.
 | `serve_refuses_to_start_above_the_positional_capacity` | `crates/rmlx-cli/tests/serve_context_ceiling.rs` | spawned `rmlx serve` child | nothing; run by hand |
 | `paro_kernel_registration` | `crates/rmlx-models/src/paroquant_msl_tests.rs` | `paro_rotate_kernel()` in a non-scanned source file | the `paro_rotate_identity_roundtrip_*` cells in `make gpu-test` dispatch the same kernel |
 
-**Three populations.** `--list` is what `make gpu-test` executes. It is a
-strict subset of what the gate enforces, and every run prints the difference:
+**Three populations.** `scripts/check/gpu_tests.sh list` is what `make gpu-test`
+executes. It is a strict subset of what the gate enforces, and every run prints
+the difference:
 
-| population | `#[ignore]` enforced | in `--list` | why not listed |
+| population | `#[ignore]` enforced | in `list` | why not listed |
 |---|---|---|---|
 | `Device::Gpu` reachable | yes | yes | — |
 | macro-generated | yes, at the `macro_rules!` body | no | a cell has no name before expansion, so no libtest filter selects it |
 | `metal-unscanned` | yes | no | the gate lists none of them; the runner's per-crate banner check would fail on a snapshot-gated or child-driving test on a host without the snapshot |
 
-`paro_kernel_registration` needs no snapshot and drives no child. It is
-unlisted only because the gate lists no `metal-unscanned` test.
-
 ### Macro-generated tests
 
 The gate classifies a `macro_rules!` body that declares `#[test]` as one
 synthetic test at its definition site. A `#[ignore]` deleted from the body
-fails the gate however many invocations exist. Reachability is traced from the
-body like any fn.
+fails the gate however many invocations exist.
 
 These shapes fail closed, reported as `U`, because an unreadable shape looks
 compliant:
@@ -143,23 +139,43 @@ compliant:
   name built by `paste!` or `concat_idents!`, or a `#[test]` on its `fn` line;
 - a `macro_rules!` written on one line whose body declares `#[test]`;
 - an item whose closing brace is never found;
-- an attribute whose closing `]` is never found.
+- an attribute whose closing `]` is never found, and a tail after its closing
+  `]` on its line that holds an fn anywhere (`#[test] fn x() {}`, an `fn` ending
+  the line, `#[cfg(test)] impl S { fn h() {} }`), a second attribute,
+  `macro_rules!` or `Device::Gpu`: the item is not followed;
+- qualifiers (`pub(…)`, `const`, `async`, `unsafe`, `extern "C"`) alone on a
+  line while an attribute block is pending: the fn under them would be read
+  without its attributes;
+- a signature that closes a bracket it never opened and does not end in `;`,
+  such as the `) => {` under a macro matcher line headed by `fn` (a closer
+  then `;` ends a declaration and is read);
+- a string or block comment still open at the end of a file: the gate lost the
+  file at some point and read the tail as text.
 
 Write a generated fn as `fn $name()` on its own line, with its attributes above
-it. End a wrapped attribute on a line whose last significant character is `]`.
+it. An attribute ends at its own `]`, counted over its code across its lines,
+and no fn follows that `]` on its line. A field (`cb: fn(u8),` included, a fn
+pointer type has no space after `fn`), a generic parameter or a `mod m {` may.
 
 ### What the scanner cannot see
 
 Each of these passes the gate silently:
 
-- A signature-only fn whose `where` clause pushes the `;` to a later line. The
-  latch closes at the next line indented like the fn, so any `#[test]` it
-  swallowed goes unclassified. The fixtures `trait_where_signature` and
-  `trait_where_signature_open_hole` pin both outcomes.
-- An attribute left open by a raw string or a block comment, closed by a later
-  line that ends in `]`. The items between are lost with no report.
-- A raw string (`r"…"`, `r#"…"#`) or a `/* … */` block comment on an item's
-  opening line: neither is tracked.
+- A `<` that is an operator outside every bracket, in an item with an inline
+  body (`fn f() where A < B { true }`): the `<` cannot be told from a generic
+  bracket without reading the spacing, the item stays open, and the next test is
+  read as part of it. No valid Rust writes one outside a macro matcher or macro
+  input; macro input reads `U`.
+- A device written inside a string or a comment of a body counts as named by
+  the body, which fails closed.
+- Valid Rust that rustfmt never writes. A bodiless fn and the trait's `}` on
+  one line (`trait Tr {` then `fn load(&self); }`) is refused as a fn never
+  closed. An item that starts on the line where a multi-line string or block
+  comment closes (`"; const D: Device = Device::Gpu;`) is not read.
+- An item that does not start its line and has no attribute before it
+  (`impl S { fn h() -> Device { Device::Gpu } }`, `mod m { #[test] fn t() {} }`
+  on one line): no rule reads it. rustfmt splits it.
+- A helper named by a raw identifier (`fn r#try`) is read as `r`, which no call matches.
 - An unqualified cross-file call through a glob import (`use m::*; helper()`).
 - A helper in a non-scanned source file. The one instance,
   `paro_kernel_registration`, is declared `metal-unscanned`.
@@ -167,14 +183,31 @@ Each of these passes the gate silently:
   the `U` counters do not cover its body.
 - A test generated by a proc macro (`#[rstest]`, `#[test_case]`), or by a
   `macro_rules!` defined in a non-scanned file.
+- A generated test whose `Device::Gpu` sits in the invocation's arguments
+  (`gen_test!(t, { … Device::Gpu … })` into `fn $name() $body`): the gate reads
+  the `macro_rules!` body only.
 
-The script's `PARSING` header gives the close-test rules in full.
+A fn's signature is read from its header line on, over the code of each line
+(comments, strings and char literals blanked by one reader, which reads a block
+comment, nesting included, before it looks at a `//` or a quote in it), with
+the depths of `(`, `[`, `{` and the generic `<` kept across its lines. A `{`
+still open at the end of a line is the body, and the body carries the string and
+comment state of the line that opened it, so a `}` that starts a line inside a
+string or a comment closes nothing. While a `(` or `[` is open the signature
+goes on, whatever the line ends in; a `;` with none open ends a declaration,
+since no generic list holds one; while a generic `<` is open it goes on, and
+with none open a `{` opened and closed on a line ends the item. A `<` or `>` is
+a generic bracket only outside every `(`, `[` and `{`, and never in `->` or
+`=>`. A header is an optional `pub` or `pub(…)`, any of `const`, `async` and `unsafe`, an optional
+`extern "C"`, then `fn` and a name; a non-ASCII letter stays in the name. A header `fn $name:` is a macro matcher, never an item. Outside a fn the
+same state is carried line to line, so the lines of a string or comment that
+spans several lines are text, never an item, an attribute or the close of a
+macro body.
 
 `make check-gpu-tests-ignored-fixtures`
-(`scripts/check_gpu_tests_ignored_fixtures.sh`, in `make ci` and hosted CI) is
+(`scripts/check/rust_gates_fixtures.sh gpu_tests_ignored`, in `make ci` and hosted CI) is
 the recall test. Each fixture under `scripts/fixtures/gpu_tests_ignored/` is a
-synthetic workspace driven through the gate's `--root`. Some are violations and
-some are legitimate shapes. Each case asserts the exit code, the violation
+synthetic workspace driven through the gate's `--root`. Each case asserts the exit code, the violation
 marker and the label the gate must name, because the gate has other paths that
 also exit 1. The suite runs once under each of `awk`, `gawk` and `mawk` that is
 installed, and prints a note when only one is.
@@ -182,7 +215,7 @@ installed, and prints a note when only one is.
 ## Running the GPU tests: `make gpu-test`
 
 `make test` passes no `--ignored`, and hosted CI has no Metal. `make gpu-test`
-(`scripts/run_gpu_tests.sh`) is the step that runs the GPU tests:
+(`scripts/suite/run_gpu_tests.sh`) is the step that runs the GPU tests:
 
 ```bash
 make gpu-test                                   # every member crate
@@ -192,7 +225,7 @@ make gpu-test HALF=codec                        # one half, see below
 make gpu-test VALIDATE=0                        # without shader validation
 ```
 
-It runs exactly the tests `check_gpu_tests_ignored.sh --list` names. It does
+It runs exactly the tests `check/gpu_tests.sh list` names. It does
 not run every `#[ignore]` test: many are ignored for network access, a missing
 feature or a doc example. Each name becomes a libtest substring filter, not
 `--exact`; an over-match runs a test twice and hides nothing.
@@ -214,7 +247,7 @@ checkout of the base commit and compare.
 
 The runner reports every red it found before it exits: shader-validation hits,
 failing tests, under-matched crates and crates with no validation banner.
-`make gpu-runner-selftest` (`scripts/run_gpu_tests_selftest.sh`, in `make ci`
+`make gpu-runner-selftest` (`scripts/suite/run_gpu_tests_selftest.sh`, in `make ci`
 and hosted CI) pins each report against stub crates, with no GPU.
 
 ### A cell that stood down is reported, and it is not a pass
@@ -239,8 +272,8 @@ has no exit code, so a developer without the weights is not blocked.
 `make ci-perf` prints `ci-perf INCOMPLETE` instead of `ci-perf ok` when the
 runner's output carries the word.
 
-`make check-named-skip-notices` (`scripts/check_named_skip_notices.sh`, in
-`make ci`) enforces the notice at the source line, over the classified GPU
+`make check-named-skip-notices` (`scripts/check/gpu_tests.sh skip-notices`, in
+`make ci` and hosted CI) enforces the notice at the source line, over the classified GPU
 tests:
 
 - a notice names its own test fn, written out or as the exact `{test}`
@@ -282,8 +315,10 @@ the second and third rule. The three that hold a stand-down today are
 stand-down in them is held to `SKIP {test}:` by review.
 
 The notice's shape lives in `scripts/lib/skip_notice_patterns.sh`, which the
-gate and the runner both read. `make check-named-skip-notices-fixtures` is the
-gate's recall test.
+gate and the runner both read. `make check-named-skip-notices-fixtures`
+(`scripts/check/gpu_tests_selftest.sh`, 162 cases, in `make ci` and hosted CI) is
+the gate's recall test. It classifies planted workspaces, as the Makefile does,
+and plants its unreadable paths at run time.
 
 A cell that resolves through `common::slug_or_override`
 (`crates/rmlx-models/tests/common/mod.rs`) or `test_snapshot::snapshot`
@@ -333,7 +368,7 @@ id; `load_speculative` calls the same function.
 
 ### Splitting the GPU suite by what it guards
 
-`scripts/gpu_test_halves.sh` is the one producer of the partition. It prints
+`scripts/suite/gpu_test_classes.sh half` is the one producer of the partition. It prints
 `half<TAB>crate<TAB>test` for every classified test:
 
 > A classified GPU test is in the **`codec`** half if and only if its declaring
@@ -373,7 +408,7 @@ Under `--half` the runner holds:
 - A stand-down inside a half still ends it INCOMPLETE.
 - The two halves' selections and census expectations sum to the whole run's.
 
-Each rule is a case under `THE HALVES` in `scripts/run_gpu_tests_selftest.sh`.
+Each rule is a case under `THE HALVES` in `scripts/suite/run_gpu_tests_selftest.sh`.
 No case can see a codec change that passes the codec half and breaks a test in
 the rest half. The whole gate on `main` finds it one merge later.
 
@@ -381,7 +416,7 @@ the rest half. The whole gate on `main` finds it one merge later.
 
 `make ci-perf` is the only shared gate that runs the GPU tests. In order:
 
-1. `run_gpu_tests.sh --preflight` checks the environment and runs no test:
+1. `suite/run_gpu_tests.sh --preflight` checks the environment and runs no test:
    `RMLX_SKIP_GPU` unset and a non-empty classification. Then
    `rmlx claim run -- true` takes the Metal claim and releases it, so a claim
    another process holds fails here with exit 11. Both fail before the long
@@ -402,7 +437,7 @@ variable `ci-perf` takes, under the rules above.
 The GPU suite builds under `dev`, with debug assertions live, while
 `test-perf` builds under `release-perf`. So no gate runs a `Device::Gpu` test
 with debug assertions off (CLAUDE.md hard rule 9). The `dev` build is not
-shared with `test-perf`. `scripts/target_gc.sh` protects `release-perf` and
+shared with `test-perf`. `scripts/host/gc.sh target` protects `release-perf` and
 prunes stale profiles, so a run after `make target-gc` can pay a cold `dev`
 build.
 
@@ -507,7 +542,7 @@ the one the attention kernel above got. Find the configuration with a
 reproduction in pure MLX, and stop reaching it.
 
 Each rule is a case under `THE VERDICT` in
-`scripts/run_gpu_tests_selftest.sh`.
+`scripts/suite/run_gpu_tests_selftest.sh`.
 
 ### Threadgroup-memory validation: on for rMLX's kernels, off for MLX's
 
@@ -530,9 +565,9 @@ judged with threadgroup validation on, and a test of rMLX's own `.metal`
 kernels, which this repo can get wrong in threadgroup memory, loses coverage
 without it.
 
-`scripts/gpu_test_threadgroup.sh` is the one producer of the split. A
+`scripts/suite/gpu_test_classes.sh threadgroup` is the one producer of the split. A
 *dispatcher* is a source file that embeds, with `include_str!`, a `.metal` file
-under a directory `scripts/metal_dirs.sh` names; its *entry names* are the fns a
+under a directory `scripts/lib/metal_dirs.sh` names; its *entry names* are the fns a
 non-test dispatcher defines. A classified test runs with threadgroup validation
 on when its declaring file is itself a dispatcher, or when its body, or a
 same-file fn it calls (followed by name), names an entry name. Comments and
@@ -623,13 +658,13 @@ output. The tests
 `split_k_tail_row_reads_never_reach_the_output` and
 `implicit_gemm_conv_tail_channel_reads_never_reach_the_output` in
 `crates/rmlx-mlx/src/ops/matmul_tests.rs` show it bit for bit with the tail rows
-poisoned. The header of `scripts/gpu_validation_census.txt` gives the argument
+poisoned. The header of `scripts/suite/gpu_validation_census.txt` gives the argument
 and the run the pin was derived from. The cells that run left standing down
 for a variable were armed in filtered runs afterwards and reported nothing.
 
 ### The census pin
 
-`scripts/gpu_validation_census.txt` pins the accepted hits, so a standing
+`scripts/suite/gpu_validation_census.txt` pins the accepted hits, so a standing
 diagnostic from a kernel this repo does not compile does not keep every run
 red. One entry per `(kernel, kind, crate, test)` carries that test's own count
 and the reference to the analysis. The file's header states the fields.

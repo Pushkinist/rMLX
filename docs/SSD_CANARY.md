@@ -1,6 +1,6 @@
 # SSD Canary
 
-`scripts/ssd_canary.sh` drives a live `rmlx serve` through three server
+`scripts/bench/ssd_canary.sh` drives a live `rmlx serve` through three server
 processes. It checks that a new process serves prompts from blocks an
 earlier process spilled to SSD, and that startup eviction holds the budget.
 
@@ -8,7 +8,7 @@ earlier process spilled to SSD, and that startup eviction holds the budget.
 
 ```bash
 make build-perf
-VERIFIER_MODEL=/path/to/snapshot bash scripts/ssd_canary.sh \
+VERIFIER_MODEL=/path/to/snapshot bash scripts/bench/ssd_canary.sh \
   [--port 62265] [--ssd-gb 100] [--dry-run]
 ```
 
@@ -44,7 +44,9 @@ by the size cap.
 
 Each phase's server takes the Metal claim, and the script stops only the
 server it started. When another process holds the claim, the phase server
-exits 11 and names the holder, and the canary stops with that status.
+exits 11 and names the holder, and the canary stops with that status. A
+server that does not answer `/v1/models` within 180 seconds stops the canary
+with 1.
 
 ## Phases
 
@@ -68,7 +70,9 @@ server.
 
 ## Checks
 
-The run exits 1 when any FAIL check fails. WARN checks only print a note.
+The run exits 1 when any FAIL check fails. WARN checks only print a note. A run
+whose checks held but whose records the recorder refused exits 75
+(docs/METRICS_DB.md § 13, rule 24); a FAIL check wins over it.
 
 | Check | Level |
 |---|---|
@@ -93,7 +97,10 @@ a whole-run figure or another phase's. A phase that measured no spill or no
 hydrate omits that figure (`null`) rather than sending a `0`: the duration
 would misread as the best ever seen, and the metrics registry's
 plausible-value bounds refuse a `0` rate outright (docs/METRICS_SCHEMA.md
-§4.1). The EVICT record carries bytes used and evictions only.
+§4.1). The EVICT record carries bytes used and evictions only. A record the
+recorder refuses stays in `<run directory>/metrics/buffer/pending/`, its file
+is named in an `ERROR` line, and the other phases' records and the checks still
+run; file it again with `rmlx metrics record --file <that file>`.
 
 ## Output
 
@@ -121,7 +128,7 @@ without the DB, or when no canary cell has a value at the SHA — which is every
 cell on the first run after the per-phase prompts were introduced, since the
 earlier runs filed all three phases under one prompt.
 
-`scripts/ssd_canary_selftest.sh` (`make ssd-canary-selftest`, in `make ci`)
+`scripts/bench/ssd_canary_selftest.sh` (`make ssd-canary-selftest`, in `make ci`)
 runs `make ssd-canary` and the gate against a stub binary and a stub server,
 with `RMLX_HOME` exported, unset, and beside an exported `RMLX_METRICS_DB`,
 and checks that a relative `RMLX_HOME` is refused before a phase server starts. It checks that a data root survives the run byte for byte,

@@ -1,7 +1,7 @@
 # Synthetic KV_CODECS.md
 
 Stand-in for `docs/KV_CODECS.md`, the first doc the gate lists in
-`BANNER_DOCS`, read only by `scripts/check_kv_codec_disposition_fixtures.sh`.
+`BANNER_DOCS`, read only by `scripts/check/engine_parity_selftest.sh`.
 Each per-variant section below mirrors the shape the gate scans for: a `### `
 heading, then an INERT banner within three lines of it when the codec is inert,
 then prose.

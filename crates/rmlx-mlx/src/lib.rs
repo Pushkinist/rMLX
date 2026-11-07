@@ -105,7 +105,7 @@ thread_local! {
 // `mlx_closure_apply`, which that automated pass structurally cannot see
 // because the call goes through a `std::function` vtable. Re-running the
 // procedure at a pin bump yields 24 and no closure entry; that is the pass's
-// blind spot, not a stale guard. `scripts/check_eval_lock.sh` records both
+// blind spot, not a stale guard. `scripts/check/eval_lock.sh` records both
 // passes.
 //
 //   - `mlx_array_eval`, `mlx_async_eval`, `mlx_eval`

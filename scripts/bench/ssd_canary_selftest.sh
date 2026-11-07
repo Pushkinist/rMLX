@@ -1,0 +1,1068 @@
+#!/usr/bin/env bash
+# Recall test for ssd_canary.sh and its make targets, against a stub rmlx and a stub HTTP server.
+#
+# Recall test for: bench/ssd_canary.sh
+#
+# No GPU, no model, no metrics DB outside a throwaway directory.
+#
+# LOC-exempt: one recall test of one canary, a fixture builder and a stub shared by a flat list of cases
+#
+# Each run case builds a fixture tree (a copy of the script, the helpers it
+# reads, the real `prompts/ssd_bench/` and the Makefile, plus a stub binary at
+# `target/release-perf/rmlx`), seeds a data root, runs the canary (`make
+# ssd-canary`, or the script by hand from outside the tree), then `make
+# ssd-canary-gate`, and asserts:
+#   survive  every file in the data root before the run is byte-identical after
+#   run-dir  every phase server was handed one absolute directory that did not
+#            exist before, and a second run gets another one
+#   cleanup  that directory's SSD blocks are gone at exit, its summary and
+#            events DB are kept
+#   rm       every path the script removed lies inside that directory, and none
+#            names a claim; the script deletes through `rm` alone
+#   measure  the summary and the POPULATE record carry what the stub server
+#            wrote into its own data root (one events row per op, one index row)
+#   label    the records carry the KV codec the server logged and the context
+#            ceiling the servers were given
+#   ingest   the three phase records went to the DB the binary resolves
+#   gate     the gate read that same DB, scoped to the canary's prompts
+# Single cases: a missing binary exits 125, `--tag` is refused, a flag given
+# without its value exits 1, `--binary` names the binary to run (absolute or
+# relative), and one that is no executable file exits 125.
+#
+# The stub resolves its data root and DB the way the binary does (an absolute
+# RMLX_HOME, else the checkout found by walking up for Cargo.lock, else
+# $HOME/.rmlx; RMLX_METRICS_DB or `--db` for the DB), and refuses a relative
+# RMLX_HOME with the binary's error line. Its `metrics record` logs
+# the DB it was pointed at and creates the file when absent, but never writes
+# into an existing DB, so `survive` covers the DB as well. It refuses any path
+# outside the fixture.
+#
+# Usage: ssd_canary_selftest.sh [--script <path>] [--makefile <path>]
+#   (defaults: the tree's own scripts/bench/ssd_canary.sh and Makefile)
+# Exit 0 — every case behaved; 1 — at least one did not; 2 — a usage error or it cannot run.
+# Set:    -uo — a non-zero status inside a case ends the run under -e, before the cases after it
+
+set -uo pipefail
+export LC_ALL=C
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT="$REPO_ROOT/scripts/bench/ssd_canary.sh"
+MAKEFILE="$REPO_ROOT/Makefile"
+
+source "$REPO_ROOT/scripts/lib/args.sh"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --script)   need_value "$1" $# 2; SCRIPT="$2"; shift 2 ;;
+        --makefile) need_value "$1" $# 2; MAKEFILE="$2"; shift 2 ;;
+        *) echo "ssd-canary-selftest: unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
+
+for tool in python3 sqlite3 curl make shasum; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        echo "ssd-canary-selftest: unavailable: $tool not found" >&2
+        exit 2
+    }
+done
+for f in "$SCRIPT" "$MAKEFILE" "$REPO_ROOT/scripts/lib/identity.sh" "$REPO_ROOT/scripts/lib/server_kv_quant.py"; do
+    [[ -f "$f" ]] || { echo "ssd-canary-selftest: unavailable: $f not found" >&2; exit 2; }
+done
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/rmlx_ssd_canary_selftest.XXXXXX")"
+WORK="$(cd "$WORK" && pwd -P)"
+trap 'rm -rf "$WORK"' EXIT
+
+PASSED=0
+FAILED=0
+pass() { PASSED=$((PASSED + 1)); echo "  ok   $1"; }
+fail() { FAILED=$((FAILED + 1)); echo "  FAIL $1" >&2; }
+
+# The stub server's own writes, which the summary and the records must carry.
+STUB_KV_QUANT=k8v4
+STUB_SPILL_US=2000
+STUB_REVISIT_SPILL_US=5000
+STUB_BLOCK_BYTES=4096
+
+# ── Shims: fast `sleep`, logging `rm`, `cargo` that runs the stub ────────────
+
+SHIM="$WORK/shim"
+mkdir -p "$SHIM"
+cat >"$SHIM/sleep" <<'EOF'
+#!/bin/sh
+exec /bin/sleep 0.05
+EOF
+cat >"$SHIM/rm" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$SELFTEST_LOG/rm.log"
+exec /bin/rm "$@"
+EOF
+# `cargo build …` builds nothing; `cargo run … -- <args>` runs the tree's stub.
+cat >"$SHIM/cargo" <<'EOF'
+#!/bin/sh
+printf 'ARGS=%s\n' "$*" >>"$SELFTEST_LOG/cargo.log"
+while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done
+[ $# -gt 0 ] || exit 0
+shift
+exec ./target/release-perf/rmlx "$@"
+EOF
+chmod +x "$SHIM"/*
+
+cat >"$WORK/stub_server.py" <<'EOF'
+import http.server, json, sys
+
+hits = [0]
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def send(self, body, ctype="application/json"):
+        data = body.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path == "/v1/models":
+            self.send(json.dumps({"object": "list", "data": []}))
+        elif self.path == "/metrics/cache":
+            self.send(json.dumps({"models": [{"ssd_hits": hits[0]}]}))
+        elif self.path == "/metrics":
+            self.send('rmlx_ssd_evict_total{namespace="ssd-canary"} 5\n', "text/plain")
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        hits[0] += 1
+        self.send(json.dumps({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}))
+
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+EOF
+
+# ── Fixture tree ──────────────────────────────────────────────────────────────
+
+# make_tree <dir> [seed-hydrate=1] [revisit-spill-us=STUB_SPILL_US]
+# [hydrate-bytes=524288] [refused-tag=] — the script, its helpers, the prompts, the
+# Makefile, a stub binary and an empty Cargo.lock (so a workspace walk-up
+# stops here). seed-hydrate=0 makes the stub server never record an
+# 'ssd_hydrate' event, matching a run that never hydrates anything from SSD.
+# seed-hydrate=2 records one only on the 2nd server started in the data root
+# (REVISIT), matching a run where POPULATE only ever spills. seed-hydrate=3
+# records one only on the 1st server (POPULATE), the mirror case, matching a
+# run where REVISIT measures no hydrate of its own. revisit-spill-us gives
+# the 2nd server's spill a different duration than the 1st's, so a REVISIT
+# figure that leaked in POPULATE's own (or vice versa) reads as a wrong
+# number, not just a present/absent key. hydrate-bytes=0 seeds a hydrate
+# whose duration is real but whose throughput rounds to 0.000 mb/s, so a
+# measured-but-implausible rate is distinguishable from an unmeasured one.
+# refused-tag makes the stub's `metrics record` refuse the record of that tag
+# and leave its file in the buffer.
+make_tree() {
+    local t="$1" seed_hydrate="${2:-1}" revisit_spill_us="${3:-$STUB_SPILL_US}" \
+        hydrate_bytes="${4:-524288}" refused_tag="${5:-}"
+    mkdir -p "$t/scripts/bench" "$t/scripts/lib" "$t/prompts" "$t/target/release-perf" "$t/models/stub-ns__stub-model-8bit"
+    cp "$SCRIPT" "$t/scripts/bench/ssd_canary.sh"
+    cp "$REPO_ROOT/scripts/lib/args.sh" "$REPO_ROOT/scripts/lib/identity.sh" "$REPO_ROOT/scripts/lib/server_kv_quant.py" \
+        "$REPO_ROOT/scripts/lib/server_wait.sh" "$REPO_ROOT/scripts/lib/record_pending.sh" "$t/scripts/lib/"
+    cp -R "$REPO_ROOT/prompts/ssd_bench" "$t/prompts/ssd_bench"
+    cp "$MAKEFILE" "$t/Makefile"
+    : >"$t/Cargo.lock"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'WORK=%q\nKV=%q\nSPILL_US=%q\nREVISIT_SPILL_US=%q\nBLOCK=%q\nSEED_HYDRATE=%q\nHYDRATE_BYTES=%q\nREFUSED_TAG=%q\n' \
+            "$WORK" "$STUB_KV_QUANT" "$STUB_SPILL_US" "$revisit_spill_us" "$STUB_BLOCK_BYTES" "$seed_hydrate" "$hydrate_bytes" "$refused_tag"
+        cat <<'EOF'
+LOG="$SELFTEST_LOG"
+inside() {
+    case "$1" in
+        "$WORK"/*) return 0 ;;
+        *) printf 'outside-fixture %s\n' "$1" >>"$LOG/outside.log"; exit 3 ;;
+    esac
+}
+resolve_home() {
+    if [[ "${RMLX_HOME:-}" == /* ]]; then printf '%s\n' "$RMLX_HOME"; return; fi
+    if [[ -n "${RMLX_HOME+set}" ]]; then
+        echo "Error: config: RMLX_HOME=$RMLX_HOME must be an absolute path" >&2
+        return 1
+    fi
+    local d="$PWD"
+    while [[ "$d" != / && ! -f "$d/Cargo.lock" ]]; do d="$(dirname "$d")"; done
+    if [[ -f "$d/Cargo.lock" ]]; then printf '%s\n' "$d/.rmlx"; else printf '%s\n' "$HOME/.rmlx"; fi
+}
+if [[ "${1:-} ${2:-}" == "metrics identity" ]]; then
+    echo '{"backend":"rmlx","backend_version":"9.9.9","build_profile":"release-perf","hardware_tag":"stub"}'
+    exit 0
+fi
+if [[ "${1:-}" == "serve" ]]; then
+    raw="${RMLX_HOME-UNSET}"
+    home="$(resolve_home)" || exit 1
+    printf 'raw=%s home=%s args=%s\n' "$raw" "$home" "$*" >>"$LOG/serve.log"
+    inside "$home"
+    port=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in --port) port="$2"; shift 2 ;; *) shift ;; esac
+    done
+    mkdir -p "$home/logs" "$home/metrics" "$home/cache/kv/ssd-canary/blocks"
+    printf '{"fields":{"message":"cache-type resolved","kv_quant":"%s"}}\n' "$KV" >"$home/logs/stub-$$.jsonl"
+    # SEED_HYDRATE=0 never seeds a hydrate, matching a run that never
+    # hydrates anything from SSD. SEED_HYDRATE=1 seeds one on every phase
+    # server; SEED_HYDRATE=2 seeds one only on the 2nd server started in
+    # this data root (REVISIT), matching a run where only REVISIT ever
+    # hydrates; SEED_HYDRATE=3 seeds one only on the 1st (POPULATE), the
+    # mirror case. serve_n counts
+    # servers started against this data root so far, this one included. The
+    # spill duration also differs by server: the 2nd server (REVISIT) uses
+    # REVISIT_SPILL_US, every other uses SPILL_US, so a figure that leaked
+    # from the wrong phase reads as a wrong number.
+    serve_n_file="$home/.serve_count"
+    serve_n=$(( $(cat "$serve_n_file" 2>/dev/null || echo 0) + 1 ))
+    printf '%s' "$serve_n" >"$serve_n_file"
+    this_spill_us="$SPILL_US"
+    [ "$serve_n" = 2 ] && this_spill_us="$REVISIT_SPILL_US"
+    sqlite3 "$home/metrics/runs.db" \
+        "CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, op TEXT, value REAL, notes TEXT);
+         INSERT INTO events(op, value, notes) VALUES ('ssd_spill', $this_spill_us, '{\"bytes\":1048576}');"
+    seed_this_hydrate=0
+    case "$SEED_HYDRATE" in
+        1) seed_this_hydrate=1 ;;
+        2) [ "$serve_n" = 2 ] && seed_this_hydrate=1 ;;
+        3) [ "$serve_n" = 1 ] && seed_this_hydrate=1 ;;
+    esac
+    if [ "$seed_this_hydrate" = 1 ]; then
+        sqlite3 "$home/metrics/runs.db" \
+            "INSERT INTO events(op, value, notes) VALUES ('ssd_hydrate', 1000, '{\"bytes\":$HYDRATE_BYTES}');"
+    fi
+    sqlite3 "$home/cache/kv/ssd-canary/index.db" \
+        "CREATE TABLE IF NOT EXISTS kv_blocks(byte_size INTEGER);
+         INSERT INTO kv_blocks VALUES ($BLOCK);"
+    head -c "$BLOCK" /dev/zero >"$home/cache/kv/ssd-canary/blocks/b$$.bin"
+    exec python3 "$WORK/stub_server.py" "$port"
+fi
+if [[ "${1:-}" == "metrics" ]]; then
+    shift
+    db="" file="" sub="" want_home=false rest=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --db) db="$2"; shift 2 ;;
+            --db=*) db="${1#--db=}"; shift ;;
+            --file) file="$2"; shift 2 ;;
+            --file=*) file="${1#--file=}"; shift ;;
+            --home) want_home=true; shift ;;
+            path|record|deltas|query) sub="$1"; shift ;;
+            *) rest+=("$1"); shift ;;
+        esac
+    done
+    home="$(resolve_home)" || exit 1
+    [[ -n "$db" ]] || db="${RMLX_METRICS_DB:-$home/metrics/runs.db}"
+    case "$sub" in
+        path)
+            if $want_home; then
+                inside "$home"; mkdir -p "$home"; printf '%s\n' "$home"
+            else
+                inside "$db"; mkdir -p "$(dirname "$db")"; printf '%s\n' "$db"
+            fi
+            exit 0 ;;
+        record)
+            inside "$db"
+            [[ -n "$file" ]] || { echo "stub rmlx: record needs --file" >&2; exit 2; }
+            if [[ -n "$REFUSED_TAG" && "$file" == *"-$REFUSED_TAG.json" ]]; then
+                echo "stub rmlx: refusing $file" >&2
+                exit 1
+            fi
+            # Mirrors crates/rmlx-metrics's plausible-value bounds
+            # (docs/METRICS_SCHEMA.md §4.1) for the metrics ssd_canary.sh
+            # emits: a rate's floor excludes 0, a counter/duration/gauge's
+            # does not. A real emitter sends null, never a 0 placeholder,
+            # for a metric it did not measure.
+            if ! python3 - "$file" <<'PY'
+import json, sys
+BOUNDS = {
+    "ssd_bytes_used":       (1e13, True),
+    "ssd_evict_total":      (1e12, True),
+    "prompt_cache_ssd_hits": (1e12, True),
+    "ssd_spill_ms":         (3.6e6, True),
+    "ssd_hydrate_ms":       (3.6e6, True),
+    "ssd_spill_mb_per_s":   (1e6, False),
+    "ssd_hydrate_mb_per_s": (1e6, False),
+}
+rec = json.load(open(sys.argv[1]))
+for m in rec.get("metrics", []):
+    name, value = m["name"], m["value"]
+    if name not in BOUNDS:
+        continue
+    ceiling, zero_is_measurement = BOUNDS[name]
+    floor_ok = value >= 0.0 if zero_is_measurement else value > 0.0
+    if not floor_ok or value > ceiling:
+        bound = f"[0, {ceiling}]" if zero_is_measurement else f"(0, {ceiling}]"
+        sys.stderr.write(
+            f"ingest: {value} is not a plausible '{name}' - the registry bounds "
+            f"are {bound}. Send null, not a placeholder, for a metric this run "
+            "did not measure.\n"
+        )
+        sys.exit(1)
+PY
+            then
+                exit 1
+            fi
+            mkdir -p "$(dirname "$db")"
+            [[ -e "$db" ]] || : >"$db"
+            printf 'db=%s\n' "$db" >>"$LOG/record.log"
+            cat "$file" >>"$LOG/records.jsonl"
+            echo >>"$LOG/records.jsonl"
+            /bin/rm -f "$file"
+            exit 0 ;;
+        deltas)
+            printf 'db=%s args=%s\n' "$db" "${rest[*]-}" >>"$LOG/deltas.log"
+            exit 0 ;;
+        query)
+            inside "$db"
+            sql="${rest[*]-}"
+            printf 'db=%s\n' "$db" >>"$LOG/query.log"
+            echo "COUNT(*)"
+            tag="$(printf '%s' "$sql" | sed -n 's/.*tag=\([a-z-]*\) .*/\1/p')"
+            if [[ -n "$tag" ]]; then grep -c "tag=$tag " "$LOG/records.jsonl" 2>/dev/null || echo 0; fi
+            exit 0 ;;
+    esac
+fi
+echo "stub rmlx: unsupported call: $*" >&2
+exit 2
+EOF
+    } >"$t/target/release-perf/rmlx"
+    chmod +x "$t/target/release-perf/rmlx"
+}
+
+# seed_root <dir> — a data root holding what a real one holds.
+seed_root() {
+    local r="$1"
+    mkdir -p "$r/metrics/backups" "$r/metrics/buffer/pending" "$r/cache/kv/other" "$r/logs"
+    sqlite3 "$r/metrics/runs.db" "CREATE TABLE observations(x); INSERT INTO observations VALUES (42);"
+    printf 'backup\n' >"$r/metrics/backups/runs-old.db"
+    printf '{"pending":true}\n' >"$r/metrics/buffer/pending/queued.json"
+    printf 'index\n' >"$r/cache/kv/other/index.db"
+    printf '{"log":1}\n' >"$r/logs/old.jsonl"
+}
+
+free_port() {
+    python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])'
+}
+
+# run_env <case-dir> <cwd> <extra VAR=value...> -- <command...>
+# Runs a command in a clean environment: no inherited RMLX_*, no make flags.
+run_env() {
+    local cdir="$1" cwd="$2"
+    shift 2
+    local extra=()
+    while [[ $# -gt 0 && "$1" != "--" ]]; do extra+=("$1"); shift; done
+    shift
+    (cd "$cwd" && env -i \
+        HOME="$cdir/home" \
+        PATH="$SHIM:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin" \
+        TMPDIR="$cdir/tmp" \
+        SELFTEST_LOG="$cdir/log" \
+        ${extra[@]+"${extra[@]}"} \
+        "$@")
+}
+
+# summary_populate <iteration_summary.json> — the POPULATE figures the stub
+# server's writes determine, and the events DB the run read them from.
+summary_populate() {
+    python3 - "$1" <<'PY' 2>/dev/null || echo MISSING
+import json, sys
+d = json.load(open(sys.argv[1]))
+p = d["phases"]["POPULATE"]
+print((p["mean_spill_ms"], p["ssd_bytes_used"], p["spill_mb_per_s"], d["artifacts"]["events_db"]))
+PY
+}
+
+# populate_record <records.jsonl> — the POPULATE record's measurement and labels.
+populate_record() {
+    python3 - "$1" <<'PY' 2>/dev/null || echo MISSING
+import json, sys
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if line and "tag=ssd-canary-populate " in line:
+        r = json.loads(line)
+        m = {e["name"]: e["value"] for e in r["metrics"]}
+        print((m["ssd_spill_ms"], m["ssd_bytes_used"], r["kv_quant"], r["ctx_max"]))
+        break
+else:
+    print("MISSING")
+PY
+}
+
+# record_has_metric <records.jsonl> <tag> <metric-name> — whether the record
+# for <tag> carries <metric-name> at all. The stub server never measures a
+# hydrate (it reports no rmlx_ssd_hydrate_* counter), so a phase record must
+# omit 'ssd_hydrate_mb_per_s' — a rate's plausible-value floor excludes 0
+# (docs/METRICS_SCHEMA.md §4.1), so an emitter with nothing measured sends
+# null, which the CLI recorder drops before the record ever reaches ingest.
+record_has_metric() {
+    python3 - "$1" "$2" "$3" <<'PY' 2>/dev/null || echo MISSING
+import json, sys
+path, tag, metric = sys.argv[1], sys.argv[2], sys.argv[3]
+for line in open(path):
+    line = line.strip()
+    if line and f"tag={tag} " in line:
+        r = json.loads(line)
+        names = {e["name"] for e in r["metrics"]}
+        print(metric in names)
+        break
+else:
+    print("MISSING")
+PY
+}
+
+# record_metric_value <records.jsonl> <tag> <metric-name> — the value <tag>'s
+# record carries for <metric-name>, or MISSING if the tag or the metric is
+# absent. Checking the number, not just its presence, is what catches a
+# figure computed from the wrong phase's events but still present under the
+# right name.
+record_metric_value() {
+    python3 - "$1" "$2" "$3" <<'PY' 2>/dev/null || echo MISSING
+import json, sys
+path, tag, metric = sys.argv[1], sys.argv[2], sys.argv[3]
+for line in open(path):
+    line = line.strip()
+    if line and f"tag={tag} " in line:
+        r = json.loads(line)
+        m = {e["name"]: e["value"] for e in r["metrics"]}
+        print(m.get(metric, "MISSING"))
+        break
+else:
+    print("MISSING")
+PY
+}
+
+# ── Run cases ─────────────────────────────────────────────────────────────────
+
+# run_case <name> <root-mode>
+#   exported    RMLX_HOME points at a seeded temp root
+#   unset       the tree's own .rmlx is the seeded root, and the script is run
+#               by hand from outside the tree
+#   metrics-db  as `exported`, plus RMLX_METRICS_DB naming a DB elsewhere
+run_case() {
+    local name="$1" mode="$2"
+    local cdir="$WORK/$name"
+    local tree="$cdir/tree"
+    mkdir -p "$cdir/home" "$cdir/tmp" "$cdir/log"
+    make_tree "$tree"
+    local root home_env=() expected_db
+    case "$mode" in
+        exported)
+            root="$cdir/data-root"
+            home_env=("RMLX_HOME=$root") ;;
+        metrics-db)
+            root="$cdir/data-root"
+            home_env=("RMLX_HOME=$root" "RMLX_METRICS_DB=$cdir/elsewhere/runs.db") ;;
+        *)
+            root="$tree/.rmlx" ;;
+    esac
+    if [[ "$mode" == metrics-db ]]; then
+        expected_db="$cdir/elsewhere/runs.db"
+    else
+        expected_db="$root/metrics/runs.db"
+    fi
+    seed_root "$root"
+    (cd "$root" && find . -type f -print0 | xargs -0 shasum -a 256) >"$cdir/before.sha"
+    find "$root" -type d | sort >"$cdir/dirs_before"
+
+    local port run_how rc
+    port="$(free_port)"
+    if [[ "$mode" == unset ]]; then
+        run_how="ssd_canary.sh run from outside the tree"
+        run_env "$cdir" "$cdir" "VERIFIER_MODEL=$tree/models/stub-ns__stub-model-8bit" "PORT=$port" -- \
+            bash "$tree/scripts/bench/ssd_canary.sh" --ssd-gb 100 >"$cdir/run.out" 2>&1
+        rc=$?
+    else
+        run_how="make ssd-canary"
+        run_env "$cdir" "$tree" ${home_env[@]+"${home_env[@]}"} \
+            "VERIFIER_MODEL=$tree/models/stub-ns__stub-model-8bit" "PORT=$port" -- \
+            make --no-print-directory -f "$tree/Makefile" ssd-canary >"$cdir/run.out" 2>&1
+        rc=$?
+    fi
+    if [[ $rc -eq 0 ]]; then
+        pass "$name: $run_how exits 0"
+    else
+        fail "$name: $run_how exited $rc (tail: $(tail -3 "$cdir/run.out" | tr '\n' ' '))"
+    fi
+    if [[ -s "$cdir/log/outside.log" ]]; then
+        fail "$name: the binary was pointed outside the fixture: $(head -1 "$cdir/log/outside.log")"
+    fi
+
+    # survive
+    if (cd "$root" && shasum -a 256 -c --quiet "$cdir/before.sha") >"$cdir/survive.out" 2>&1; then
+        pass "$name: every file of the data root survives byte-identical"
+    else
+        fail "$name: data root changed: $(tr '\n' ' ' <"$cdir/survive.out" | cut -c1-300)"
+    fi
+
+    # run-dir
+    local raws homes run_dir=""
+    raws="$(sed -n 's/^raw=\([^ ]*\) home=.*/\1/p' "$cdir/log/serve.log" 2>/dev/null | sort -u)"
+    homes="$(sed -n 's/^raw=[^ ]* home=\([^ ]*\) .*/\1/p' "$cdir/log/serve.log" 2>/dev/null | sort -u)"
+    if [[ -z "$raws" || "$(printf '%s\n' "$raws" | wc -l | tr -d ' ')" != 1 ]]; then
+        fail "$name: phase servers were not handed one data root: [$(tr '\n' ' ' <"$cdir/log/serve.log" 2>/dev/null)]"
+    elif [[ "$raws" != "$homes" ]]; then
+        fail "$name: phase servers were handed [$raws], which the binary reads as [$homes]"
+    elif grep -qxF "$raws" "$cdir/dirs_before"; then
+        fail "$name: phase servers ran in $raws, which existed before the run"
+    elif [[ ! -d "$raws" ]]; then
+        fail "$name: phase servers ran in $raws, which is not a directory after the run"
+    else
+        run_dir="$raws"
+        pass "$name: phase servers ran in an absolute directory the run created"
+    fi
+
+    # cleanup
+    if [[ -n "$run_dir" ]]; then
+        if [[ -e "$run_dir/cache/kv" ]]; then
+            fail "$name: the run's SSD blocks were left at $run_dir/cache/kv"
+        elif [[ ! -f "$run_dir/iteration_summary.json" || ! -f "$run_dir/metrics/runs.db" ]]; then
+            fail "$name: the run's summary or events DB was removed"
+        else
+            pass "$name: SSD blocks removed at exit, summary and events DB kept"
+        fi
+    fi
+
+    # rm
+    local bad_rm=""
+    if [[ -f "$cdir/log/rm.log" ]]; then
+        while IFS= read -r line; do
+            for arg in $line; do
+                case "$arg" in -*) continue ;; esac
+                if [[ -z "$run_dir" || "$arg" != "$run_dir"/* ]] || [[ "$arg" == *claim* ]]; then
+                    bad_rm="$bad_rm [$arg]"
+                fi
+            done
+        done <"$cdir/log/rm.log"
+    fi
+    if [[ -z "$bad_rm" ]]; then
+        pass "$name: every removal lies inside the run's own directory"
+    else
+        fail "$name: removed outside the run's own directory:$(printf '%s\n' $bad_rm | sort -u | sed -n 1,3p | tr '\n' ' ')"
+    fi
+
+    # measure
+    local summary="$run_dir/iteration_summary.json" got want_spill_ms
+    got="$(summary_populate "$summary")"
+    want_spill_ms="$(python3 -c "print(${STUB_SPILL_US} / 1000.0)")"
+    if [[ "$got" == "(${want_spill_ms}, ${STUB_BLOCK_BYTES}, 500.0, '$run_dir/metrics/runs.db')" ]]; then
+        pass "$name: the summary carries the stub server's events and index"
+    else
+        fail "$name: summary POPULATE (mean_spill_ms, ssd_bytes_used, spill_mb_per_s, events_db) = $got, want ($want_spill_ms, ...)"
+    fi
+    got="$(populate_record "$cdir/log/records.jsonl")"
+    if [[ "$got" == "(2.0, ${STUB_BLOCK_BYTES}.0, '${STUB_KV_QUANT}', 8192)" ]]; then
+        pass "$name: the POPULATE record carries the measurement, the logged codec and the context ceiling"
+    else
+        fail "$name: POPULATE record (ssd_spill_ms, ssd_bytes_used, kv_quant, ctx_max) = $got"
+    fi
+
+    # The stub server measures a hydrate on every phase in this fixture, so a
+    # genuinely measured rate must still reach ingest as a number, not be
+    # dropped alongside the unmeasured case covered by run_null_hydrate_case.
+    got="$(record_has_metric "$cdir/log/records.jsonl" ssd-canary-populate ssd_hydrate_mb_per_s)"
+    if [[ "$got" == True ]]; then
+        pass "$name: a measured hydrate rate still reaches the POPULATE record"
+    else
+        fail "$name: POPULATE record ssd_hydrate_mb_per_s presence = $got (stub measured a hydrate)"
+    fi
+    if grep -q -- '--max-ctx 8192' "$cdir/log/serve.log" && ! grep -v -- '--max-ctx 8192' "$cdir/log/serve.log" | grep . >/dev/null; then
+        pass "$name: every phase server was given --max-ctx 8192"
+    else
+        fail "$name: a phase server ran without --max-ctx 8192"
+    fi
+
+    # ingest
+    local ingest_dbs n_records
+    ingest_dbs="$(sed -n 's/^db=//p' "$cdir/log/record.log" 2>/dev/null | sort -u)"
+    n_records="$(grep -c '^db=' "$cdir/log/record.log" 2>/dev/null)"
+    if [[ "$n_records" == 3 && "$ingest_dbs" == "$expected_db" ]]; then
+        pass "$name: three records went to the DB the binary resolves"
+    else
+        fail "$name: $n_records record(s) into [$ingest_dbs], expected [$expected_db]"
+    fi
+    local tag missing=""
+    for tag in ssd-canary-populate ssd-canary-revisit ssd-canary-evict; do
+        grep -q "tag=$tag " "$cdir/log/records.jsonl" 2>/dev/null || missing="$missing $tag"
+    done
+    if [[ -z "$missing" ]]; then
+        pass "$name: one record per phase tag"
+    else
+        fail "$name: no record for:$missing"
+    fi
+
+    # Every record must fall under the prefix the gate scopes itself to, and
+    # each phase must be its own prompt (prompts are content-addressed).
+    local prefix prompts_ok
+    prefix="$(sed -n 's/.*--prompt-prefix \([^ ]*\).*/\1/p' "$tree/Makefile" | sed -n 1p)"
+    prompts_ok="$(python3 - "$cdir/log/records.jsonl" "$prefix" <<'PY' 2>&1
+import json, sys
+recs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+names = [r["prompt"]["name"] for r in recs]
+bodies = {json.dumps(r["prompt"]["body"], sort_keys=True) for r in recs}
+if not sys.argv[2]:
+    print("the gate names no --prompt-prefix")
+elif not all(n.startswith(sys.argv[2]) for n in names):
+    print(f"prompt names {names} do not all start with {sys.argv[2]!r}")
+elif len(bodies) != len(recs):
+    print(f"{len(recs)} records share {len(bodies)} prompt bodies")
+else:
+    print("ok")
+PY
+)"
+    if [[ "$prompts_ok" == ok ]]; then
+        pass "$name: each phase has its own prompt, under the gate's prefix"
+    else
+        fail "$name: $prompts_ok"
+    fi
+
+    # gate
+    run_env "$cdir" "$tree" ${home_env[@]+"${home_env[@]}"} -- \
+        make --no-print-directory -f "$tree/Makefile" ssd-canary-gate SHA=abc1234 >"$cdir/gate.out" 2>&1
+    rc=$?
+    local gate_line gate_db
+    gate_line="$(tail -1 "$cdir/log/deltas.log" 2>/dev/null)"
+    gate_db="$(printf '%s' "$gate_line" | sed -n 's/^db=\([^ ]*\) args=.*/\1/p')"
+    if [[ $rc -ne 0 ]]; then
+        fail "$name: make ssd-canary-gate exited $rc ($(tail -1 "$cdir/gate.out"))"
+    elif [[ "$gate_db" != "$expected_db" ]]; then
+        fail "$name: the gate read [$gate_db], the run wrote [$expected_db]"
+    elif [[ "$gate_line" != *"--prompt-prefix ssd-canary- "* ]]; then
+        fail "$name: the gate is not scoped to the canary's prompts: $gate_line"
+    else
+        pass "$name: the gate read the DB the run wrote, scoped to the canary's prompts"
+    fi
+
+    # A second run must not reuse the first run's directory: a reused one holds
+    # the first run's events, so the next run would read them as its own.
+    if [[ "$mode" == exported ]]; then
+        find "$root" -type d | sort >"$cdir/dirs_before"
+        : >"$cdir/log/serve.log"
+        port="$(free_port)"
+        run_env "$cdir" "$tree" ${home_env[@]+"${home_env[@]}"} \
+            "VERIFIER_MODEL=$tree/models/stub-ns__stub-model-8bit" "PORT=$port" -- \
+            make --no-print-directory -f "$tree/Makefile" ssd-canary >"$cdir/run2.out" 2>&1
+        local second
+        second="$(sed -n 's/^raw=\([^ ]*\) .*/\1/p' "$cdir/log/serve.log" | sort -u)"
+        if [[ -z "$second" || "$second" == "$run_dir" ]] || grep -qxF "$second" "$cdir/dirs_before"; then
+            fail "$name: the second run's servers ran in [$second], not a new directory"
+        else
+            pass "$name: a second run gets a new directory"
+        fi
+    fi
+}
+
+# run_null_hydrate_case — a run where the stub server never records an
+# 'ssd_hydrate' event (a real cold POPULATE phase that only ever spills).
+# ssd_hydrate_mb_per_s is a rate: the registry's plausible-value floor
+# excludes 0 (docs/METRICS_SCHEMA.md §4.1), so ingest must never see a 0
+# placeholder for it. Before the fix, the script sent a literal "0.000" and
+# the (now-validating) stub's `metrics record` refused it, so the whole
+# canary aborted; this case fails on that script and passes once the script
+# sends null (dropped before it reaches the stub) instead.
+run_null_hydrate_case() {
+    local name="null-hydrate"
+    local cdir="$WORK/$name"
+    local tree="$cdir/tree"
+    mkdir -p "$cdir/home" "$cdir/tmp" "$cdir/log"
+    make_tree "$tree" 0
+    local root="$cdir/data-root"
+    seed_root "$root"
+
+    local port rc
+    port="$(free_port)"
+    run_env "$cdir" "$tree" "RMLX_HOME=$root" \
+        "VERIFIER_MODEL=$tree/models/stub-ns__stub-model-8bit" "PORT=$port" -- \
+        make --no-print-directory -f "$tree/Makefile" ssd-canary >"$cdir/run.out" 2>&1
+    rc=$?
+    if [[ $rc -eq 0 ]]; then
+        pass "$name: make ssd-canary exits 0 with no hydrate ever measured"
+    else
+        fail "$name: make ssd-canary exited $rc (tail: $(tail -5 "$cdir/run.out" | tr '\n' ' '))"
+    fi
+
+    local tag got any_present=""
+    for tag in ssd-canary-populate ssd-canary-revisit; do
+        got="$(record_has_metric "$cdir/log/records.jsonl" "$tag" ssd_hydrate_mb_per_s)"
+        if [[ "$got" == False ]]; then
+            pass "$name: $tag record omits the unmeasured ssd_hydrate_mb_per_s"
+        else
+            any_present="1"
+            fail "$name: $tag record ssd_hydrate_mb_per_s presence = $got (expected omitted)"
+        fi
+        # A duration's plausible-value floor admits 0 (docs/METRICS_SCHEMA.md
+        # §4.1), so the ingest would accept a placeholder 0 here — omission
+        # is the only way to tell "measured nothing" from "measured 0ms".
+        got="$(record_has_metric "$cdir/log/records.jsonl" "$tag" ssd_hydrate_ms)"
+        if [[ "$got" == False ]]; then
+            pass "$name: $tag record omits the unmeasured ssd_hydrate_ms"
+        else
+            any_present="1"
+            fail "$name: $tag record ssd_hydrate_ms presence = $got (expected omitted, not a fake 0)"
+        fi
+    done
+
+    # The measured spill rate and duration must still reach ingest as
+    # numbers: the null path must not swallow a real measurement alongside
+    # the unmeasured one.
+    got="$(record_has_metric "$cdir/log/records.jsonl" ssd-canary-populate ssd_spill_mb_per_s)"
+    if [[ "$got" == True ]]; then
+        pass "$name: the measured ssd_spill_mb_per_s still reaches the POPULATE record"
+    else
+        fail "$name: POPULATE record ssd_spill_mb_per_s presence = $got (stub measured a spill)"
+    fi
+    got="$(record_has_metric "$cdir/log/records.jsonl" ssd-canary-populate ssd_spill_ms)"
+    if [[ "$got" == True ]]; then
+        pass "$name: the measured ssd_spill_ms still reaches the POPULATE record"
+    else
+        fail "$name: POPULATE record ssd_spill_ms presence = $got (stub measured a spill)"
+    fi
+}
+
+# run_revisit_hydrate_case — a run where the stub server records a hydrate
+# only on the REVISIT server (the real shape: a cold POPULATE phase spills
+# but hydrates nothing, and only a revisited prompt hydrates from SSD), and
+# where REVISIT's own spill takes a different duration than POPULATE's, so a
+# figure computed from the wrong phase reads as a wrong number, not just a
+# present/absent key. Each phase record must carry rates computed from that
+# phase's own events: the POPULATE record must omit the hydrate rate it
+# never measured, and the REVISIT record must carry the one it did, and its
+# own spill duration, not POPULATE's or a whole-run average of both. Before
+# the fix, both records read the same (POPULATE's) hydrate and spill
+# variables, so REVISIT's own figures never reached ingest and POPULATE's
+# absent one still did not read null.
+run_revisit_hydrate_case() {
+    local name="revisit-hydrate"
+    local cdir="$WORK/$name"
+    local tree="$cdir/tree"
+    mkdir -p "$cdir/home" "$cdir/tmp" "$cdir/log"
+    make_tree "$tree" 2 "$STUB_REVISIT_SPILL_US"
+    local root="$cdir/data-root"
+    seed_root "$root"
+
+    local port rc
+    port="$(free_port)"
+    run_env "$cdir" "$tree" "RMLX_HOME=$root" \
+        "VERIFIER_MODEL=$tree/models/stub-ns__stub-model-8bit" "PORT=$port" -- \
+        make --no-print-directory -f "$tree/Makefile" ssd-canary >"$cdir/run.out" 2>&1
+    rc=$?
+    if [[ $rc -eq 0 ]]; then
+        pass "$name: make ssd-canary exits 0 with only REVISIT ever hydrating"
+    else
+        fail "$name: make ssd-canary exited $rc (tail: $(tail -5 "$cdir/run.out" | tr '\n' ' '))"
+    fi
+
+    local got
+    got="$(record_has_metric "$cdir/log/records.jsonl" ssd-canary-populate ssd_hydrate_mb_per_s)"
+    if [[ "$got" == False ]]; then
+        pass "$name: the POPULATE record omits the hydrate rate it never measured"
+    else
+        fail "$name: POPULATE record ssd_hydrate_mb_per_s presence = $got (expected omitted)"
+    fi
+    got="$(record_has_metric "$cdir/log/records.jsonl" ssd-canary-revisit ssd_hydrate_mb_per_s)"
+    if [[ "$got" == True ]]; then
+        pass "$name: the REVISIT record carries the hydrate rate it measured itself"
+    else
+        fail "$name: REVISIT record ssd_hydrate_mb_per_s presence = $got (expected present)"
+    fi
+
+    local want_ms
+    want_ms="$(python3 -c "print(${STUB_REVISIT_SPILL_US} / 1000.0)")"
+    got="$(record_metric_value "$cdir/log/records.jsonl" ssd-canary-revisit ssd_spill_ms)"
+    if [[ "$got" == "$want_ms" ]]; then
+        pass "$name: the REVISIT record's ssd_spill_ms is its own, not POPULATE's"
+    else
+        fail "$name: REVISIT record ssd_spill_ms = $got, want $want_ms (its own spill, not POPULATE's ${STUB_SPILL_US}us)"
+    fi
+}
+
+# run_populate_only_hydrate_case — the mirror of run_revisit_hydrate_case: a
+# hydrate seeded only on the POPULATE server. A REVISIT query whose lower
+# bound reads from the start of the run (rather than from POPULATE's own
+# end-of-phase boundary) would wrongly pick up POPULATE's hydrate here and
+# report a rate REVISIT never measured itself.
+run_populate_only_hydrate_case() {
+    local name="populate-only-hydrate"
+    local cdir="$WORK/$name"
+    local tree="$cdir/tree"
+    mkdir -p "$cdir/home" "$cdir/tmp" "$cdir/log"
+    make_tree "$tree" 3
+    local root="$cdir/data-root"
+    seed_root "$root"
+
+    local port rc
+    port="$(free_port)"
+    run_env "$cdir" "$tree" "RMLX_HOME=$root" \
+        "VERIFIER_MODEL=$tree/models/stub-ns__stub-model-8bit" "PORT=$port" -- \
+        make --no-print-directory -f "$tree/Makefile" ssd-canary >"$cdir/run.out" 2>&1
+    rc=$?
+    if [[ $rc -eq 0 ]]; then
+        pass "$name: make ssd-canary exits 0 with only POPULATE ever hydrating"
+    else
+        fail "$name: make ssd-canary exited $rc (tail: $(tail -5 "$cdir/run.out" | tr '\n' ' '))"
+    fi
+
+    local got
+    got="$(record_has_metric "$cdir/log/records.jsonl" ssd-canary-populate ssd_hydrate_mb_per_s)"
+    if [[ "$got" == True ]]; then
+        pass "$name: the POPULATE record carries the hydrate rate it measured itself"
+    else
+        fail "$name: POPULATE record ssd_hydrate_mb_per_s presence = $got (expected present)"
+    fi
+    got="$(record_has_metric "$cdir/log/records.jsonl" ssd-canary-revisit ssd_hydrate_mb_per_s)"
+    if [[ "$got" == False ]]; then
+        pass "$name: the REVISIT record omits the hydrate rate it never measured itself"
+    else
+        fail "$name: REVISIT record ssd_hydrate_mb_per_s presence = $got (expected omitted; it is POPULATE's)"
+    fi
+}
+
+# run_zero_byte_hydrate_case — a hydrate whose duration is real (1000us) but
+# whose average byte count is 0, so the computed throughput rounds to
+# 0.000 mb/s. A rate's plausible-value floor excludes 0 regardless of why it
+# is 0 (docs/METRICS_SCHEMA.md §4.1), so this must read null exactly like an
+# unmeasured rate, while the duration — genuinely measured — still reaches
+# ingest as a number.
+run_zero_byte_hydrate_case() {
+    local name="zero-byte-hydrate"
+    local cdir="$WORK/$name"
+    local tree="$cdir/tree"
+    mkdir -p "$cdir/home" "$cdir/tmp" "$cdir/log"
+    make_tree "$tree" 1 "$STUB_SPILL_US" 0
+    local root="$cdir/data-root"
+    seed_root "$root"
+
+    local port rc
+    port="$(free_port)"
+    run_env "$cdir" "$tree" "RMLX_HOME=$root" \
+        "VERIFIER_MODEL=$tree/models/stub-ns__stub-model-8bit" "PORT=$port" -- \
+        make --no-print-directory -f "$tree/Makefile" ssd-canary >"$cdir/run.out" 2>&1
+    rc=$?
+    if [[ $rc -eq 0 ]]; then
+        pass "$name: make ssd-canary exits 0 with a 0-byte-average hydrate"
+    else
+        fail "$name: make ssd-canary exited $rc (tail: $(tail -5 "$cdir/run.out" | tr '\n' ' '))"
+    fi
+
+    local got
+    got="$(record_has_metric "$cdir/log/records.jsonl" ssd-canary-populate ssd_hydrate_mb_per_s)"
+    if [[ "$got" == False ]]; then
+        pass "$name: the POPULATE record omits a rate that rounds to 0.000"
+    else
+        fail "$name: POPULATE record ssd_hydrate_mb_per_s presence = $got (expected omitted; it rounds to 0)"
+    fi
+    got="$(record_has_metric "$cdir/log/records.jsonl" ssd-canary-populate ssd_hydrate_ms)"
+    if [[ "$got" == True ]]; then
+        pass "$name: the POPULATE record still carries the genuinely measured duration"
+    else
+        fail "$name: POPULATE record ssd_hydrate_ms presence = $got (expected present; the duration was measured)"
+    fi
+}
+
+# run_refused_record_case — the recorder refuses the POPULATE record, the first
+# of the three. The refused file is named and stays in the buffer, the other two
+# records are still filed, the summary is still written, and the run ends 75.
+run_refused_record_case() {
+    local name="refused-record"
+    local cdir="$WORK/$name"
+    local tree="$cdir/tree"
+    mkdir -p "$cdir/home" "$cdir/tmp" "$cdir/log"
+    make_tree "$tree" 1 "$STUB_SPILL_US" 524288 ssd-canary-populate
+    local root="$cdir/data-root"
+    seed_root "$root"
+
+    local rc
+    run_env "$cdir" "$cdir" "RMLX_HOME=$root" \
+        "VERIFIER_MODEL=$tree/models/stub-ns__stub-model-8bit" "PORT=$(free_port)" -- \
+        bash "$tree/scripts/bench/ssd_canary.sh" --ssd-gb 100 >"$cdir/run.out" 2>&1
+    rc=$?
+    if [[ $rc -eq 75 ]]; then
+        pass "$name: a refused record ends the run with 75"
+    else
+        fail "$name: exited $rc, want 75 (tail: $(tail -3 "$cdir/run.out" | tr '\n' ' '))"
+    fi
+
+    local refused
+    refused="$(sed -n 's/^  ERROR: ssd-canary-populate: the record did not land; it is kept at \(.*\); file it again.*/\1/p' "$cdir/run.out")"
+    if [[ -n "$refused" && -e "$refused" ]] && ! grep -qF "[ingest] done: $refused" "$cdir/run.out"; then
+        pass "$name: the refused record is named, still in the buffer and not reported done"
+    else
+        fail "$name: no ERROR line names a refused record that is still in the buffer: [$refused]"
+    fi
+
+    local tag missing=""
+    for tag in ssd-canary-revisit ssd-canary-evict; do
+        grep -q "tag=$tag " "$cdir/log/records.jsonl" 2>/dev/null || missing="$missing $tag"
+    done
+    if [[ -z "$missing" ]]; then
+        pass "$name: the records after the refused one are still filed"
+    else
+        fail "$name: no record for:$missing"
+    fi
+
+    if grep -qF 'Summary written to' "$cdir/run.out" && grep -qF 'Validation: pass=true' "$cdir/run.out"; then
+        pass "$name: the summary and the validation still ran"
+    else
+        fail "$name: the run stopped before its summary and validation"
+    fi
+}
+
+echo "==> ssd-canary-selftest"
+
+# A relative RMLX_HOME is refused by the binary, so `make ssd-canary` fails
+# with its error before a phase server starts, and writes nothing: not the
+# relative path, not the checkout's own .rmlx.
+run_relative_home_case() {
+    local name=relative-home
+    local cdir="$WORK/$name"
+    local tree="$cdir/tree" root
+    mkdir -p "$cdir/home" "$cdir/tmp" "$cdir/log"
+    make_tree "$tree"
+    root="$tree/.rmlx"
+    seed_root "$root"
+    (cd "$root" && find . -type f -print0 | xargs -0 shasum -a 256) >"$cdir/before.sha"
+    find "$root" | sort >"$cdir/paths_before"
+    run_env "$cdir" "$tree" "RMLX_HOME=rel-root" \
+        "VERIFIER_MODEL=$tree/models/stub-ns__stub-model-8bit" "PORT=$(free_port)" -- \
+        make --no-print-directory -f "$tree/Makefile" ssd-canary >"$cdir/run.out" 2>&1
+    local rc=$?
+    if [[ $rc -ne 0 ]] && grep -qF 'RMLX_HOME=rel-root must be an absolute path' "$cdir/run.out"; then
+        pass "$name: make ssd-canary exits $rc with the binary's refusal"
+    else
+        fail "$name: make ssd-canary exited $rc without the refusal (tail: $(tail -3 "$cdir/run.out" | tr '\n' ' '))"
+    fi
+    if [[ -e "$tree/rel-root" ]]; then
+        fail "$name: the relative RMLX_HOME was used as a path"
+    else
+        pass "$name: the relative RMLX_HOME was not used as a path"
+    fi
+    if [[ -s "$cdir/log/serve.log" ]]; then
+        fail "$name: a phase server started: $(head -1 "$cdir/log/serve.log")"
+    else
+        pass "$name: no phase server started"
+    fi
+    if (cd "$root" && shasum -a 256 -c --quiet "$cdir/before.sha") >/dev/null 2>&1 &&
+        find "$root" | sort | cmp -s - "$cdir/paths_before"; then
+        pass "$name: the checkout's .rmlx is unchanged"
+    else
+        fail "$name: the checkout's .rmlx changed"
+    fi
+}
+
+# Every deletion must go through `rm`, the one the shim can see.
+if grep -nE '(/bin/rm|/usr/bin/rm|command rm|\\rm |unlink|rmdir|-delete|shred)' "$SCRIPT" >"$WORK/other_deletes"; then
+    fail "static: the script deletes through something other than rm: $(head -1 "$WORK/other_deletes")"
+else
+    pass "static: the script deletes through rm alone"
+fi
+
+run_case exported-home exported
+run_case unset-home unset
+run_case metrics-db-env metrics-db
+run_relative_home_case
+run_null_hydrate_case
+run_revisit_hydrate_case
+run_populate_only_hydrate_case
+run_zero_byte_hydrate_case
+run_refused_record_case
+
+# A missing binary exits 125, as documented, before anything else asks it.
+nobin="$WORK/no-binary"
+mkdir -p "$nobin/home" "$nobin/tmp" "$nobin/log"
+make_tree "$nobin/tree"
+/bin/rm -f "$nobin/tree/target/release-perf/rmlx"
+run_env "$nobin" "$nobin/tree" "VERIFIER_MODEL=$nobin/tree/models/stub-ns__stub-model-8bit" -- \
+    bash "$nobin/tree/scripts/bench/ssd_canary.sh" >"$nobin/out" 2>&1
+rc=$?
+if [[ $rc -eq 125 ]] && grep -q 'binary not found' "$nobin/out"; then
+    pass "no-binary: exits 125 naming the missing binary"
+else
+    fail "no-binary: exited $rc: $(head -1 "$nobin/out")"
+fi
+if grep -qF "binary not found at $nobin/tree/target/release-perf/rmlx." "$nobin/out"; then
+    pass "no-binary: the default binary is the checkout's release-perf build"
+else
+    fail "no-binary: the message names another path: $(head -1 "$nobin/out")"
+fi
+
+# binary_flag_case <name> <want-exit> <flag-arg>... — a tree with no default binary,
+# the stub elsewhere, and the canary run from outside the tree with the flag given.
+binary_flag_case() {
+    local name="$1" want="$2" cdir="$WORK/$1"
+    shift 2
+    local tree="$cdir/tree" rc
+    mkdir -p "$cdir/home" "$cdir/tmp" "$cdir/log" "$cdir/elsewhere"
+    make_tree "$tree"
+    cp "$tree/target/release-perf/rmlx" "$cdir/elsewhere/rmlx"
+    /bin/rm -f "$tree/target/release-perf/rmlx"
+    : >"$cdir/elsewhere/not_executable"
+    seed_root "$tree/.rmlx"
+    run_env "$cdir" "$cdir" "VERIFIER_MODEL=$tree/models/stub-ns__stub-model-8bit" "PORT=$(free_port)" -- \
+        bash "$tree/scripts/bench/ssd_canary.sh" --ssd-gb 100 "$@" >"$cdir/run.out" 2>&1
+    rc=$?
+    if [[ $rc -ne $want ]]; then
+        fail "$name: exited $rc, want $want (tail: $(tail -3 "$cdir/run.out" | tr '\n' ' '))"
+    elif [[ $want -eq 0 && ! -s "$cdir/log/serve.log" ]]; then
+        fail "$name: exited 0 but the binary named was never run as a server"
+    else
+        pass "$name: exits $want"
+    fi
+}
+
+binary_flag_case binary-flag 0 --binary "$WORK/binary-flag/elsewhere/rmlx"
+binary_flag_case binary-flag-relative 0 --binary=elsewhere/rmlx
+binary_flag_case binary-flag-not-executable 125 --binary "$WORK/binary-flag-not-executable/elsewhere/not_executable"
+if grep -qF "binary not found at $WORK/binary-flag-not-executable/elsewhere/not_executable." \
+    "$WORK/binary-flag-not-executable/run.out"; then
+    pass "binary-flag-not-executable: the refusal names the path given"
+else
+    fail "binary-flag-not-executable: the refusal names another path: $(head -1 "$WORK/binary-flag-not-executable/run.out")"
+fi
+
+# A prompt directory with no prompt file ends the setup with 1, before a server starts.
+noprompts="$WORK/no-prompts"
+mkdir -p "$noprompts/home" "$noprompts/tmp" "$noprompts/log"
+make_tree "$noprompts/tree"
+/bin/rm -f "$noprompts"/tree/prompts/ssd_bench/*.json
+seed_root "$noprompts/tree/.rmlx"
+run_env "$noprompts" "$noprompts" "VERIFIER_MODEL=$noprompts/tree/models/stub-ns__stub-model-8bit" "PORT=$(free_port)" -- \
+    bash "$noprompts/tree/scripts/bench/ssd_canary.sh" --ssd-gb 100 >"$noprompts/out" 2>&1
+rc=$?
+if [[ $rc -eq 1 ]] && grep -qF 'ERROR: expected >= 20 prompts, found 0' "$noprompts/out" && [[ ! -s "$noprompts/log/serve.log" ]]; then
+    pass "no-prompts: exits 1 naming the empty prompt list, no server started"
+else
+    fail "no-prompts: exited $rc: $(tail -1 "$noprompts/out")"
+fi
+
+# --tag was parsed and never read; it is refused rather than silently dropped.
+tag_dir="$WORK/tag"
+mkdir -p "$tag_dir/home" "$tag_dir/tmp" "$tag_dir/log"
+make_tree "$tag_dir/tree"
+run_env "$tag_dir" "$tag_dir/tree" -- bash "$tag_dir/tree/scripts/bench/ssd_canary.sh" --tag x \
+    >"$tag_dir/out" 2>&1
+rc=$?
+if [[ $rc -eq 1 ]] && grep -q 'Unknown flag: --tag' "$tag_dir/out"; then
+    pass "tag: --tag is refused as an unknown flag"
+else
+    fail "tag: --tag exited $rc: $(head -1 "$tag_dir/out")"
+fi
+
+# A flag given last without its value is a usage error, on the bash 3.2 that macOS ships.
+novalue_dir="$WORK/novalue"
+mkdir -p "$novalue_dir/home" "$novalue_dir/tmp" "$novalue_dir/log"
+make_tree "$novalue_dir/tree"
+run_env "$novalue_dir" "$novalue_dir/tree" -- /bin/bash "$novalue_dir/tree/scripts/bench/ssd_canary.sh" --port \
+    >"$novalue_dir/out" 2>&1
+rc=$?
+if [[ $rc -eq 1 ]] && grep -q -- '--port requires a value' "$novalue_dir/out"; then
+    pass "no-value: --port with no value exits 1 naming the flag"
+else
+    fail "no-value: --port exited $rc: $(head -1 "$novalue_dir/out")"
+fi
+
+echo "ssd-canary-selftest: $PASSED passed, $FAILED failed"
+[[ $FAILED -eq 0 ]]

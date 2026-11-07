@@ -11,8 +11,8 @@ fn every_script_copy_of_the_record_pending_code_is_this_one() {
             "RECORD_PENDING_EXIT=",
         ),
         (
-            "scripts/eval/wikitext2_ppl.py",
-            include_str!("../../../scripts/eval/wikitext2_ppl.py"),
+            "scripts/bench/wikitext2_ppl.py",
+            include_str!("../../../scripts/bench/wikitext2_ppl.py"),
             "RECORD_PENDING_EXIT = ",
         ),
     ];

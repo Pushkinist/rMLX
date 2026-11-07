@@ -39,7 +39,7 @@ pub(crate) fn release_cached_buffers() {
 /// wrong model — the variable is per architecture, but a path is a path.
 ///
 /// Every return of `None` prints `SKIP <test>: <why>`. A cell that returns
-/// silently is invisible to `scripts/run_gpu_tests.sh` and to the
+/// silently is invisible to `scripts/suite/run_gpu_tests.sh` and to the
 /// shader-validation census, and libtest reports it as a pass.
 pub(crate) fn snapshot(test: &str, var: &str, slug: &str, archs: &[&str]) -> Option<PathBuf> {
     let dir = match under_root(slug) {

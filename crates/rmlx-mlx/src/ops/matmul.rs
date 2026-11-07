@@ -508,6 +508,7 @@ pub fn gather_qmm(
     device: Device,
 ) -> Result<Array> {
     install_error_handler();
+    crate::c_api::verdict().require_match()?;
     // Use cached null sentinel for absent biases and lhs_indices.
     let biases_arr = match biases {
         Some(b) => b.inner,
@@ -542,12 +543,15 @@ pub fn gather_qmm(
                 gs,
                 bs,
                 mode_cstr.as_ptr(),
+                // A null `global_scale` is upstream's `std::nullopt`.
+                #[cfg(mlxc_c_api_0_8)]
+                null_sentinel(),
                 sorted_indices,
                 s,
             )
         })
     }?;
-    // Do NOT free biases_arr or lhs_arr — they are the cached null sentinel.
+    // Do NOT free biases_arr, lhs_arr or the global_scale slot — they are the cached null sentinel.
     unsafe { check_status(status, "gather_qmm") }?;
     Ok(Array { inner: res })
 }

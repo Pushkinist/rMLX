@@ -1339,7 +1339,7 @@ enum Cmd {
         ///
         /// The process must have been launched with `MTL_CAPTURE_ENABLED=1`;
         /// Metal inserts the capture layer at launch and cannot do so later.
-        /// `scripts/gpu_capture.sh` handles both.
+        /// `scripts/profile/capture.sh gputrace` handles both.
         ///
         /// Capture serialises every dispatch, so every timing this command
         /// measures is false: the run needs `--record --run-class diagnostic`,
@@ -1789,9 +1789,6 @@ fn resolve_prompts_root(prompts_dir: Option<PathBuf>) -> PathBuf {
 ///
 /// Checked here, in the process that is about to take the measurement, because
 /// that is the only place the answer describes the library actually loaded.
-/// With no built binary, `scripts/mlx_preflight.sh` can read only the `opt`
-/// symlinks. With one, it reads this verdict through the binary's `mlx_pin`
-/// line.
 ///
 /// An mlx-c C API mismatch refuses on every host, not only where the pin
 /// binds: attention cannot run, so the run would fail after the model load.

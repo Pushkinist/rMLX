@@ -31,7 +31,7 @@ required-features = ["metal-capture"]
 #   * `rmlx_mlx::metal_capture` — the arm / step / finish driver over
 #     mlx_metal_start_capture / mlx_metal_stop_capture, plus the window policy.
 #   * `rmlx_mlx::xctrace` — the `xctrace export` XML parser behind
-#     `scripts/mst_capture.sh`.
+#     `scripts/profile/capture.sh mst`.
 # Do NOT enable in release builds; the feature tag keeps binaries clean.
 metal-capture = []
 

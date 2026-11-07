@@ -17,7 +17,7 @@
 /// Whether a line is code rather than a whole-line comment.
 ///
 /// A needle written into the sentence that explains it would otherwise read as
-/// the statement it describes — the same reading `scripts/check_spec_charge.sh`
+/// the statement it describes — the same reading `scripts/check/spec_round_loops.sh`
 /// takes, and for the same reason. A trailing comment on a line of code is not
 /// stripped: that needs a quote-aware scan, and no needle here is one a caller
 /// would write at the end of a statement.

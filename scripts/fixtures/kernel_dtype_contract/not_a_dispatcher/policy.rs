@@ -1,4 +1,4 @@
-// Synthetic fixture for scripts/check_kernel_dtype_contract.sh — not compiled.
+// Synthetic fixture for scripts/check/kernel_dispatch.sh dtype-contract — not compiled.
 use rmlx_mlx::metal_kernel::MetalKernelInvoke;
 
 /// No MetalKernelInvoke here, so this file is out of scope even though it

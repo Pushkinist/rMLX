@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Read one rmlx run log back as a per-request table.
 
 The published-protocol harness sends one chat request per sample and needs each

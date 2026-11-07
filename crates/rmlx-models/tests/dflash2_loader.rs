@@ -64,7 +64,7 @@ const TENSOR_COUNT: usize = 81;
 /// slug skips, because nobody holds every snapshot; an unset root skips with the
 /// variable named.
 ///
-/// `test` is the caller's own function name, so the notice `run_gpu_tests.sh`
+/// `test` is the caller's own function name, so the notice `suite/run_gpu_tests.sh`
 /// harvests names something a test filter can select. A notice naming this file
 /// instead is counted as unattributable and listed nowhere.
 fn snapshot(test: &str) -> Option<PathBuf> {

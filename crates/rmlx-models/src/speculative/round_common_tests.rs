@@ -619,7 +619,7 @@ const TAPE_REPLAY_SLUGS: &[&str] = &[
 
 /// The snapshots present on this machine.
 ///
-/// A missing slug is noted, not announced as a stand-down: `run_gpu_tests.sh`
+/// A missing slug is noted, not announced as a stand-down: `suite/run_gpu_tests.sh`
 /// harvests `SKIP <test>:` and drops **every** census entry naming that test, so
 /// announcing one slug's absence while running on the other would leave the
 /// hits this test does produce unexpected. The named notice belongs to the one

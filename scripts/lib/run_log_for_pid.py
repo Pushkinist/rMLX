@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Pick the run log a given process wrote, out of the candidates on stdin.
 
 A bench phase starts a server and then has to read that server's log. "The

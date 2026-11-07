@@ -1,0 +1,60 @@
+# Planted scan roots for check/kernel_dispatch.sh dtype-contract: the exit code and the function it names.
+#
+# Columns, tab-separated, none empty ("-" for none): fixture (a directory beside this
+# table), args (gate arguments, "{}" is the fixture path), stream (both, out or err: the
+# gate's output the needles are read from), exit (exact), has (strings that must all
+# appear), lacks (strings none of which may appear), is (the whole output; "\t" is a
+# tab), what (what the case proves). Needles are fixed strings separated by ";;".
+# In has, "A;>B" is one needle: B must appear after the first A.
+#
+# A source gate is only worth its runtime if it still fires when the pattern it
+# looks for is spelled differently, hidden inside a tuple, or separated from
+# its marker by an attribute block. Each fixture under
+# `scripts/fixtures/kernel_dtype_contract/` is a synthetic scan root paired
+# with the exit code the gate must produce and, for the failing cases, the
+# function it must name. Four of them are bypasses that were reproduced against
+# an earlier revision of the gate: a rustfmt-split declaration it could not see,
+# a second escaping buffer that one cast exempted, a derived cast on an input
+# that counted as a guard, and a marker that leaked across a `const`. Asserting the named function — not just the exit code
+# — is what stops a gate that fails for the wrong reason from counting as
+# recall.
+
+clean	--root {} --min 1	both	0	check-kernel-dtype-contract: ok	-	-	a derived .astype( on the way out passes
+unguarded_return	--root {} --min 1	both	1	leaky_sdpa	-	-	an f32 kernel output returned as-is is caught
+f32_literal_astype	--root {} --min 1	both	1	upcast_only_sdpa	-	-	the .astype(Dtype::F32) upcast is not a guard
+literal_width_astype	--root {} --min 1	both	1	pinned_width_sdpa	-	-	a literal-width .astype( is not a guard
+bare_width_astype	--root {} --min 1	both	1	bare_f32_sdpa;;bare_bf16_sdpa;;bare_f16_sdpa;;check-kernel-dtype-contract: FAIL	check-kernel-dtype-contract: ok	-	a cast to a bare F32, Bf16 or F16 is a fixed width too, not a guard
+marker_above	--root {} --min 1	both	0	check-kernel-dtype-contract: ok	-	-	an f32-out-ok marker in the block above exempts the fn
+marker_through_attributes	--root {} --min 1	both	0	check-kernel-dtype-contract: ok	-	-	a marker separated by a multi-line attribute still applies
+marker_does_not_leak	--root {} --min 1	both	1	leaky_sdpa	-	-	one marker exempts one function, not the next one
+tuple_scales	--root {} --min 1	both	1	quantize_gpu	-	-	an f32 scale buffer returned in a tuple is caught
+partial_tuple_guard	--root {} --min 1	both	1	quantize_partial_guard_gpu	-	-	casting one of two escaping f32 buffers is not enough
+multiline_add_output_shape	--root {} --min 1	both	1	split_decl_sdpa	-	-	a rustfmt-split add_output_shape is still seen
+derived_astype_on_input	--root {} --min 1	both	1	input_cast_sdpa	-	-	a derived cast BEFORE the dispatch guards an input, not the output
+marker_over_const	--root {} --min 1	both	1	leaky_after_const_sdpa	-	-	a marker above a const does not leak onto the next fn
+nested_dir	--root {} --min 1	both	1	leaky_sdpa	-	-	a dispatcher in a sub-directory is still scanned
+not_a_dispatcher	--root {} --min 1	both	1	expected at least	-	-	a file with no MetalKernelInvoke is out of scope
+test_file_excluded	--root {} --min 1	both	1	expected at least	-	-	a *_tests.rs dispatcher is out of scope
+empty_tree	--root {} --min 1	both	1	expected at least	-	-	an empty scan root fails instead of passing vacuously
+clean	--root {} --min 2	both	1	expected at least	-	-	fewer dispatcher functions than the pinned floor fails
+fed_back_output	--root {} --min 1	both	0	check-kernel-dtype-contract: ok (1 dispatcher files, 1 f32-declaring functions)	check-kernel-dtype-contract: FAIL	-	an f32 output fed straight into a second kernel never escapes, so one cast covers the function
+same_line_marker	--root {} --min 1	both	0	check-kernel-dtype-contract: ok (1 dispatcher files, 1 f32-declaring functions)	check-kernel-dtype-contract: FAIL	-	an f32-out-ok marker on the signature line exempts the fn
+two_files	--root {} --min 2	both	0	check-kernel-dtype-contract: ok (2 dispatcher files, 2 f32-declaring functions)	check-kernel-dtype-contract: FAIL	-	the functions of every dispatcher file are summed, not those of the last one
+clean	--root {}	both	0	check-kernel-dtype-contract: ok (1 dispatcher files, 1 f32-declaring functions)	check-kernel-dtype-contract: FAIL	-	with --root and no --min the floor is 1, not the floor of the derived roots
+clean	--root {}/absent --min 1	both	2	scan root does not exist	check-kernel-dtype-contract: ok	-	a scan root that does not exist is refused, not scanned as empty
+comment_cast_after_dispatch	--root {} --min 1	both	1	restore_in_comment_sdpa;;check-kernel-dtype-contract: FAIL	check-kernel-dtype-contract: ok	-	a cast written only in a comment after the dispatch is no guard
+comment_names_f32_output	--root {} --min 1	both	0	check-kernel-dtype-contract: ok (1 dispatcher files, 1 f32-declaring functions)	check-kernel-dtype-contract: FAIL;;codes_only_gpu	-	an f32 named in a trailing comment declares no output, so the codes-only fn is not counted
+string_slashes_before_output	--root {} --min 1	both	1	tagged_sdpa;;check-kernel-dtype-contract: FAIL	check-kernel-dtype-contract: ok	-	two slashes inside a string literal do not hide the output declared after them
+char_quote_comment_cast	--root {} --min 1	both	1	leaky_char_sdpa;;check-kernel-dtype-contract: FAIL	check-kernel-dtype-contract: ok	-	a cast named only in a comment after the character literals '"' and '\"' is no guard
+char_quote_comment_f32	--root {} --min 1	both	0	check-kernel-dtype-contract: ok (1 dispatcher files, 1 f32-declaring functions)	check-kernel-dtype-contract: FAIL;;codes_a_gpu;;codes_b_gpu	-	an f32 named in a comment after the character literals '"' and '\"' declares no output
+same_statement_cast	--root {} --min 1	both	0	check-kernel-dtype-contract: ok (1 dispatcher files, 1 f32-declaring functions)	check-kernel-dtype-contract: FAIL	-	a derived cast chained on the dispatch in one statement restores the caller dtype
+same_statement_literal_cast	--root {} --min 1	both	1	literal_stmt_sdpa;;check-kernel-dtype-contract: FAIL	check-kernel-dtype-contract: ok	-	a cast to a literal width chained on the dispatch in one statement is still no guard
+apply_argument_cast	--root {} --min 1	both	1	arg_cast_sdpa;;check-kernel-dtype-contract: FAIL	check-kernel-dtype-contract: ok	-	a derived cast inside the arguments of the dispatch lands on an input and is no guard
+f16_output	--root {} --min 1	both	0	check-kernel-dtype-contract: ok (1 dispatcher files, 1 f32-declaring functions)	check-kernel-dtype-contract: FAIL;;half_sdpa	-	an f16 kernel output is not an f32 output: it is neither counted nor flagged
+two_casts_one_statement	--root {} --min 1	both	0	check-kernel-dtype-contract: ok (1 dispatcher files, 1 f32-declaring functions)	check-kernel-dtype-contract: FAIL	-	two derived casts in one statement guard two escaping outputs
+attribute_in_body	--root {} --min 1	both	0	check-kernel-dtype-contract: ok (1 dispatcher files, 1 f32-declaring functions)	check-kernel-dtype-contract: FAIL	-	an attribute line inside the body ends a statement, so a fed-back output is still read as fed back
+pub_crate_fn	--root {} --min 1	both	1	pub(crate) fn leaky_sdpa;;check-kernel-dtype-contract: FAIL	ok_sdpa;;check-kernel-dtype-contract: ok	-	a pub(crate) fn is a function of its own, named in the report
+substring_var	--root {} --min 1	both	1	substring_sdpa;;check-kernel-dtype-contract: FAIL	check-kernel-dtype-contract: ok	-	an input named mid is not the output mid_buf: a name inside another name is not a fed-back output
+empty_add_input_arg	--root {} --min 1	both	1	empty_arg_sdpa;;check-kernel-dtype-contract: FAIL	check-kernel-dtype-contract: ok	-	an add_input whose argument names no variable feeds nothing back
+blank_after_marker	--root {} --min 1	both	0	check-kernel-dtype-contract: ok (1 dispatcher files, 1 f32-declaring functions)	check-kernel-dtype-contract: FAIL	-	a blank line between the marker and the signature does not end the block
+clean	--root {}/dispatcher.rs --min 1	both	2	scan root is not a directory	scan root does not exist;;check-kernel-dtype-contract: ok	-	a scan root that is a file is refused as not a directory

@@ -400,8 +400,8 @@ async fn invalid_dimensions_is_400_gpu() {
 }
 
 /// A deterministic 64x48 synthetic-gradient PNG, base64 — exactly the image
-/// the parity probe and `scripts/parity/jina_v4_parity.py` synthesize, so the
-/// endpoint exercises the same `grid_thw=[1,4,4]` path the parity gate covers.
+/// the parity probe synthesizes, so the endpoint exercises the same
+/// `grid_thw=[1,4,4]` path the parity gate covers.
 const TEST_IMG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAEAAAAAwCAIAAAAuKetIAAAA5UlEQVR4nO1ZWwrDMAyTg+5/px5lR9hnGMODjo527BXWLvYqMMEIYwiJLDsxACdYXiMGAxwoSVeOGyjAGbDRkvmcTiDryukErtuqk3PbZXScSw7k8ykOeCgO2MyOj8C7u9g/ns91IAdOccBDcaC+rbvRcEoHinohX5EDn9ihJfhFXV8nP9vngVjxlA54KA7U7nUdjbh0ANIBaB5ApP4ejbh0ANIBSAfQu5bjC//f3kZtAxu2TG4/+B/YNj81D3goDtTlDUuAU+9CRTrgK3JgbvofgOYB7K8Xqt3rOqQDJU6vjz1w4AIqTWNtn1ky5AAAAABJRU5ErkJggg==";
 
 /// Image input (single-vector): `{"input":{"image":"data:...;base64,..."}}`

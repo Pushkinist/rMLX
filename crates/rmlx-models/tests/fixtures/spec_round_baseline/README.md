@@ -79,7 +79,7 @@ entries, because the test ran.
 To hold a whole capture to the manifest:
 
 ```sh
-python3 scripts/spec_round_stream_compare.py verify <RMLX_HOME>/tmp
+python3 scripts/spec/round_stream_compare.py verify <RMLX_HOME>/tmp
 ```
 
 A capture holding fewer than 36 cells — one pair is six — reports the cells that
@@ -97,7 +97,7 @@ To compare two captures field by field rather than by digest — which is what
 says *what* moved:
 
 ```sh
-python3 scripts/spec_round_stream_compare.py compare <dir-a> <dir-b>
+python3 scripts/spec/round_stream_compare.py compare <dir-a> <dir-b>
 ```
 
 A change that renames, adds or drops a field makes two captures incomparable
@@ -106,7 +106,7 @@ what to hold them to; an entry spelled `a|b` reads the first of the two a line
 carries:
 
 ```sh
-python3 scripts/spec_round_stream_compare.py compare <dir-a> <dir-b> \
+python3 scripts/spec/round_stream_compare.py compare <dir-a> <dir-b> \
   --fields round,accept,num_draft,n_committed,emitted_total
 ```
 
@@ -125,7 +125,7 @@ completeness statement are read the same way.
 ## Regenerating
 
 ```sh
-python3 scripts/spec_round_stream_compare.py manifest <RMLX_HOME>/tmp \
+python3 scripts/spec/round_stream_compare.py manifest <RMLX_HOME>/tmp \
   > crates/rmlx-models/tests/fixtures/spec_round_baseline/MANIFEST.sha256
 ```
 

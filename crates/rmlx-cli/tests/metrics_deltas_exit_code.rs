@@ -350,7 +350,7 @@ fn deltas_exit_code_false_always_zero() {
 }
 
 /// No-baseline case: all delta rows have `baseline_value == None` → exit 125,
-/// not 1. This matches the regression_gate.sh "git bisect skip" idiom.
+/// not 1. Exit 125 is the `git bisect skip` convention for a failed precondition.
 ///
 /// The DB has an "anchor" observation at sha_anchor's timestamp and a "new-model"
 /// cell whose only observations are AFTER that timestamp. The `new-model` row

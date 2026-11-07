@@ -386,7 +386,7 @@ implemented, so a published acceptance figure taken under that rule is a
 different quantity from this port's.
 
 **On the 4-bit verifier.** `z-lab__Qwen3.8-27B-DFlash2` drafts for
-`mlx-community__Qwen3.8-27B-4bit`. On the code prompt of `scripts/spec_bench.sh`
+`mlx-community__Qwen3.8-27B-4bit`. On the code prompt of `scripts/bench/serve_bench.sh`
 (128 tokens, greedy) the speed-up over plain decode is 2.90 times at block 5
 (accept rate 0.9808, 4.885 tokens per round) and 2.89 times at block 8 (0.8730,
 7.056).

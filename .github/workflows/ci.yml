@@ -54,6 +54,15 @@ jobs:
       # recall in both directions — violations caught, legitimate shapes left be.
       - name: the #[ignore] gate still catches what it is for
         run: make check-gpu-tests-ignored-fixtures
+      # A classified GPU test that stands down says `SKIP <test>: <why>`, and the runner
+      # can attribute only a notice that names its test; a guard that stands a cell down
+      # and says nothing is counted as a pass. Static, over the same classification.
+      - name: a GPU test that stands down names itself
+        run: make check-named-skip-notices
+      # ...and that gate is a text scan too, so planted workspaces pin each of its rules
+      # and each of its refusals, on this job's awk.
+      - name: the stand-down gate still catches what it is for
+        run: make check-named-skip-notices-fixtures
       # The runner those tests execute under accumulates shader-validation
       # diagnostics and crate failures independently, and both have to reach the
       # operator in the same run — while any diagnostic stands, reporting one and
@@ -83,6 +92,14 @@ jobs:
       # exit code.
       - name: the dtype-contract gate still catches what it is for
         run: make check-kernel-dtype-contract-fixtures
+      # The third rule of the same tool: an f32 scalar combined with a bf16
+      # activation promotes the result to f32, and the call site looks harmless
+      # at review. Static; the scan needs only bash, awk, grep and find.
+      - name: no f32 scalar is combined with a bf16 activation unguarded
+        run: make check-no-scalar-f32-leak
+      # ...and planted scan roots pin the recall of the gate above.
+      - name: the f32-scalar gate still catches what it is for
+        run: make check-no-scalar-f32-leak-fixtures
       # rMLX serialises every MLX evaluation under one lock; this gate is what
       # keeps a new FFI call from quietly stepping outside it. Static — the
       # local stress driver is deliberately not run here.
@@ -92,6 +109,30 @@ jobs:
       # passing forever. Fixture trees pin its recall, per rule.
       - name: the eval-lock gate still catches what it is for
         run: make check-eval-lock-fixtures
+      # A speculative round loop that charges its phases and records that it did not
+      # re-attributes its work to the drafter with every token and count identical, so
+      # no test sees it. Static: bash and awk over the checked-in sources.
+      - name: speculative round loops carry one phase-charge decision
+        run: make check-spec-charge
+      # ...and a loop that takes no sampler decodes greedily under a sampled label,
+      # fluent and silent. Same scanner, the sampler rules.
+      - name: speculative generation paths carry the request's sampler
+        run: make check-spec-sampling
+      # Both gates are source-shape scans, so their recall is the part that can rot.
+      # Planted source roots pin the rule and the exit code of every case; they need
+      # perl, which the runner ships.
+      - name: the phase-charge gate still catches what it is for
+        run: make check-spec-charge-fixtures
+      - name: the sampler gate still catches what it is for
+        run: make check-spec-sampling-fixtures
+      # Three more single-rule source gates, read by grep and awk; planted scan
+      # roots pin their recall and their refusal of a root with nothing in it.
+      - name: the inline-test gate still catches what it is for
+        run: make check-no-inline-tests-fixtures
+      - name: the per-layer KV codec gate still catches what it is for
+        run: make check-kv-layer-quants-fixtures
+      - name: the decode-swallow gate still catches what it is for
+        run: make check-no-decode-swallow-fixtures
       # A library that names the GPU device itself does Metal work in a process
       # that decided on the CPU and holds no claim. Static gate.
       - name: library code takes its device from the caller
@@ -114,15 +155,17 @@ jobs:
         run: make check-personal-data
       - name: the personal-data gate still catches what it is for
         run: make check-personal-data-selftest
+      # Stub toolchains and planted kernel trees: no Metal compiler is needed.
+      - name: the MSL kernel gates still catch what they are for
+        run: make check-metal-kernels-selftest
+      # Synthetic bundles and a stub plutil: no trace and no Xcode tool needed.
+      - name: the .gputrace readers still refuse what they must
+        run: make gputrace-selftest
       # The restore script links and pins Homebrew kegs, so its recall test runs
       # it against throwaway prefixes and a stub brew. It needs no macOS tool:
       # bash with compgen, tar, shasum, strings, awk, sort -V and head -c.
       - name: make mlx-restore-pin refuses what it must not link
         run: make mlx-restore-pin-selftest
-      # The preflight gates every measurement target on the built binary's
-      # mlx_pin line; its recall test stubs the chip, otool and the binary.
-      - name: make mlx-preflight stops where a measurement would refuse
-        run: make mlx-preflight-selftest
       # A headline number's provenance is these files, and a manifest sitting
       # beside them proves nothing on its own: the draw is recorded rather than
       # recomputed, and an edited file can be re-blessed in the same commit. The
@@ -155,6 +198,13 @@ jobs:
         run: make check-doc-size
       - name: the doc-size gate still catches what it is for
         run: make check-doc-size-selftest
+      # `make check-scripts` itself resolves a base from origin/main, which a
+      # shallow checkout lacks: the rules `not-a-mode` (which files are new) and
+      # `pin-new` (which pins are new) read it, so only its recall test runs here.
+      # That test names its own base everywhere. Pure bash + python3 over
+      # throwaway trees — no toolchain, no GPU, no model.
+      - name: the scripts gate still catches what it is for
+        run: make check-scripts-selftest
 
   msl:
     name: msl kernels (compile + format)
@@ -211,7 +261,7 @@ jobs:
 
   build:
     name: build + clippy
-    runs-on: macos-14 # Apple Silicon
+    runs-on: macos-26 # Apple Silicon
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable

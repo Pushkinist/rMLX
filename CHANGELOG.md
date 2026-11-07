@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- rMLX builds against the mlx-c 0.8 C API, Homebrew's current mlx-c, beside 0.6
+  and 0.7. The build stops on a C API it does not know, and a binary refuses
+  attention and `gather_qmm` calls when the loaded `libmlxc.dylib` has another
+  C API than the one it was built against.
+
 ## [0.4.5] - 2026-10-24
 
 A Qwen3.5-family request can now resume from a saved recurrent state. Every

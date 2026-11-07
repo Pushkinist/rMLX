@@ -14,11 +14,11 @@ arm occupies it. ABBA puts the same arm in slot 2 of every block, so that
 penalty lands on one arm and looks like a clean result.
 
 - **Two arms**: pair every ABBA block with a BAAB block, so each arm holds
-  each slot position equally often. `scripts/perf_ab.sh` alternates ABBA,
+  each slot position equally often. `scripts/bench/ab.sh` alternates ABBA,
   BAAB, ABBA.
 - **Three or more levels**: run a Latin square. The level index is
   `(position + row) % n_levels`, one row per cycle, so every level holds every
-  slot once per `n_levels` rows. `scripts/prefill_chunk_sweep.sh` runs this
+  slot once per `n_levels` rows. `scripts/bench/prefill_chunk_sweep.sh` runs this
   shape.
 - **Report the paired statistic.** Compare each level to the baseline within
   a row and take the median over rows. A pooled median across slots re-admits
@@ -161,14 +161,14 @@ To capture:
    run aborts before loading the model.
 
 For Apple's GPU tools to attach to the process, checked by
-`make gputrace-preflight` (`scripts/gputrace_preflight.sh`):
+`make gputrace-preflight` (`scripts/profile/capture.sh preflight`):
 
 3. Full Xcode selected: `sudo xcode-select -s
    /Applications/Xcode.app/Contents/Developer`.
 4. Developer mode: `sudo DevToolsSecurity -enable`.
 5. The binary signed with `com.apple.security.get-task-allow`. Cargo emits a
    linker-signed binary with no entitlements. `make build-capture` re-signs it
-   with `scripts/rmlx-capture.entitlements`, and re-running it repairs a
+   with `scripts/profile/rmlx-capture.entitlements`, and re-running it repairs a
    binary a plain `cargo build` re-created. Check with
    `codesign -d --entitlements - target/release-debug/rmlx`.
 6. The Metal toolchain, for the shader recompile a replay does
@@ -180,11 +180,11 @@ For Apple's GPU tools to attach to the process, checked by
 ```sh
 make profile-gputrace CODEC=iso3_sym MODEL=/path/to/snapshot
 # or, with the window spelled out:
-bash scripts/gpu_capture.sh --kv-quant iso3_sym --model /path/to/snapshot \
+bash scripts/profile/capture.sh gputrace --kv-quant iso3_sym --model /path/to/snapshot \
   --prompt-tokens 4096 --skip 4 --steps 8
 ```
 
-Traces land in `.rmlx/traces/` as
+Traces land in `<RMLX_HOME>/traces/` (`.rmlx/traces/` when `RMLX_HOME` is unset) as
 `<model>-<codec>-<prompt>tok-<timestamp>.gputrace`. The script runs the MLX
 preflight and refuses a binary without the feature. It refuses a host the
 tools cannot attach to before it writes anything. It sizes `--max-ctx` for the
@@ -229,11 +229,11 @@ on the replay's schedule. Host round-trips, such as a blocking
 ```sh
 make profile-mst MODEL=/path/to/snapshot
 # or, spelled out:
-bash scripts/mst_capture.sh --model /path/to/snapshot --kv-quant none \
+bash scripts/profile/capture.sh mst --model /path/to/snapshot --kv-quant none \
   --prompt-tokens 4096 --max-tokens 600 --time-limit 18
 ```
 
-`mst_capture.sh` records the live process, exports the `metal-gpu-intervals`
+`capture.sh mst` records the live process, exports the `metal-gpu-intervals`
 table, parses it and prints a per-channel table and a CSV. The table gives
 each submission's `start` and `duration` in nanoseconds, `gpu-channel-name`,
 `start-latency`, `cmdbuffer-id` and `encoder-id`. One row is one encoder.
@@ -257,9 +257,10 @@ each submission's `start` and `duration` in nanoseconds, `gpu-channel-name`,
   NULL. A naive parser misaligns columns into plausible wrong numbers.
   `rmlx_mlx::xctrace` checks each row's cell count and each cell's tag
   against the schema, and rejects an unresolvable `ref`.
-- **Bound the volume** with `--time-limit`. `.rmlx/traces/mst` keeps the
+- **Bound the volume** with `--time-limit`. `<RMLX_HOME>/traces/mst` keeps the
   newest `--keep` bundles (default 5) and prunes the rest on every exit.
-  `make traces-gc` does not cover this directory.
+  `make traces-gc` does not cover this directory: it bounds `*.gputrace`
+  bundles directly under `<RMLX_HOME>/traces`.
 - **No kernel names on the timeline.** The stock template records
   `Shader Timeline: Disabled`, so no key joins a name to a timed row. The
   table `metal-shader-profiler-shader-list` names each pipeline that a
@@ -293,10 +294,10 @@ structure it reads and fails by name when the layout moves.
 
 | Command | What it answers |
 |---|---|
-| `bash scripts/gputrace_summary.sh <bundle>` | What was captured (from the harness file name), total and command-stream size, and whether a `.gpuprofiler_raw` is present. |
-| `bash scripts/gputrace_kernels.sh <bundle>` | Which Metal functions the window referenced, and which it recorded as unused. `--set used\|unused\|all`, `--names-only`. |
-| `bash scripts/gputrace_diff.sh <a> <b>` | What A's window referenced that B's did not, and the reverse. |
-| `bash scripts/gputrace_preflight.sh` | The host prerequisites above, each with its fix. Also `make gputrace-preflight`. |
+| `bash scripts/profile/gputrace.sh summary <bundle>` | What was captured (from the harness file name), total and command-stream size, and whether a `.gpuprofiler_raw` is present. |
+| `bash scripts/profile/gputrace.sh kernels <bundle>` | Which Metal functions the window referenced, and which it recorded as unused. `--set used\|unused\|all`, `--names-only`. |
+| `bash scripts/profile/gputrace.sh diff <a> <b>` | What A's window referenced that B's did not, and the reverse. |
+| `bash scripts/profile/capture.sh preflight` | The host prerequisites above, each with its fix. Also `make gputrace-preflight`. |
 
 Some function records store their name by object id. The scripts count and
 report those (`… 46 named, 12 stored by object id`), so the named list is a
@@ -305,16 +306,19 @@ answerable offline, how many times is not.
 
 ### Keeping `.rmlx/traces` bounded
 
-- `scripts/gpu_capture.sh` keeps the newest 6 bundles and at most 40 GB after
+- `capture.sh gputrace` keeps the newest 6 bundles and at most 40 GB after
   each capture. Eviction is oldest-first, never the bundle just written, and
   each removal is printed.
 - `--keep-all` (`make profile-gputrace … KEEP_ALL=1`) skips the cap.
+- `make traces-gc` bounds the same directory: `<RMLX_HOME>/traces`; `RMLX_HOME`
+  defaults to the checkout's `.rmlx` and a relative value is refused; `--dir`
+  names another.
 
 ```sh
 make traces-gc                                   # report what is over the caps
 make traces-gc APPLY=1                           # enforce them
 make traces-gc APPLY=1 MAX_COUNT=12 MAX_TOTAL_GB=80
-bash scripts/traces_gc.sh --apply --max-age-days 7   # optional age rule
+bash scripts/host/gc.sh traces --apply --max-age-days 7   # optional age rule
 ```
 
 ### Tests
@@ -365,7 +369,7 @@ it as `metal_peak_alloc_mb`. It is a process-lifetime figure unless a
 `PeakBracket` scopes it.
 
 The engine writes the peak to the run log once per request, in MiB, in the
-`generate: metal peak alloc` event of a plain request. `scripts/spec_bench_published.sh`
+`generate: metal peak alloc` event of a plain request. `scripts/published/bench.sh`
 reads it back for the fixed-length prompt. A published "peak memory" column
 that an MLX engine read off its own counter is this figure. One read off the
 process, as Activity Monitor shows it, is `phys_footprint`.
@@ -465,9 +469,11 @@ The per-arch chunk defaults and their resolution order are in
 measured on. Do not change one without a sweep run as a Latin square (see
 "Ordering on this host" above).
 
-`scripts/prefill_chunk_sweep.sh` drives the per-arch sweep through
+`scripts/bench/prefill_chunk_sweep.sh` drives the per-arch sweep through
 `RMLX_PREFILL_CHUNK_<ARCH>`. It records each cell in the metrics DB under
-`decode_config = 'prefill_chunk=<n>'`.
+`decode_config = 'prefill_chunk=<n>'`. A record the DB refuses is named on
+stderr and left under `--out`, the other cells are still filed, and the run ends
+75.
 
 `decode_loop::chunked_prefill` and `speculative::prefill_chunked_for_class`
 log the resolved size as `debug!` fields: `prefill_chunk` and
@@ -530,8 +536,8 @@ user rather than report the counters as unavailable.
 ### Capture
 
 ```bash
-bash scripts/gputrace_preflight.sh
-bash scripts/gpu_capture.sh --kv-quant <codec> --model <snapshot> \
+bash scripts/profile/capture.sh preflight
+bash scripts/profile/capture.sh gputrace --kv-quant <codec> --model <snapshot> \
      --prompt-tokens 8192 --skip 32 --steps 8 --keep-all
 ```
 
@@ -564,7 +570,7 @@ survive the default prune.
 | `Last Level Cache Limiter` | memory-bound |
 | `Instruction Throughput Limiter` | issue-bound |
 | `Kernel Occupancy` | resident threadgroups; falls as allocated registers rise |
-| `Device Memory Bandwidth` | achieved GB/s, against the ceiling `scripts/perf_ceiling.py` assumes |
+| `Device Memory Bandwidth` | achieved GB/s, against the ceiling `scripts/profile/perf_ceiling.py` assumes |
 
 Group encoders by their top limiter. Dispatch counts identify the kernel: 26
 codec layers over 8 steps is 208 encoders. Store exports under
@@ -573,4 +579,4 @@ codec layers over 8 steps is 208 encoders. Store exports under
 Under Serial, limiters, occupancy, registers, SIMD groups, kernel identity
 and dtype are precise. Absolute time and bandwidth are not production
 numbers; compare the ON/OFF ratio. Never compare a profiled millisecond with
-a `perf_ab.sh` millisecond.
+a `bench/ab.sh` millisecond.

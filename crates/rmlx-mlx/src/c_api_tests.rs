@@ -2,18 +2,15 @@ use super::*;
 
 #[test]
 fn only_the_same_c_api_on_both_sides_is_a_match() {
-    for compiled in [CApi::V0_6, CApi::V0_7] {
-        assert_eq!(
-            CApiVerdict::classify(compiled, compiled),
-            CApiVerdict::Match(compiled)
-        );
-        assert_eq!(
-            CApiVerdict::classify(compiled, compiled.other()),
-            CApiVerdict::Mismatch {
-                compiled,
-                loaded: compiled.other()
-            }
-        );
+    for compiled in CApi::ALL {
+        for loaded in CApi::ALL {
+            let want = if compiled == loaded {
+                CApiVerdict::Match(compiled)
+            } else {
+                CApiVerdict::Mismatch { compiled, loaded }
+            };
+            assert_eq!(CApiVerdict::classify(compiled, loaded), want);
+        }
     }
 }
 
@@ -28,11 +25,11 @@ fn a_mismatch_is_an_error_that_names_both_c_apis_and_the_call() {
     .expect_err("a mismatch must not pass")
     .to_string();
     for needle in [
-        // `scripts/mlx_preflight.sh` keys on this phrase to name no restore.
         "C API mismatch",
         "compiled against the mlx-c 0.6 C API",
         "has the mlx-c 0.7 C API",
         "mlx_fast_scaled_dot_product_attention",
+        "mlx_gather_qmm",
         "cargo clean -p rmlx-mlx",
         "brew reinstall rmlx",
         "release tarball",
@@ -41,8 +38,16 @@ fn a_mismatch_is_an_error_that_names_both_c_apis_and_the_call() {
     }
 }
 
+/// Each C API has its own name in the message, so a mismatch between any two
+/// reads as one.
+#[test]
+fn every_c_api_has_its_own_name() {
+    let names: Vec<_> = CApi::ALL.iter().map(|api| api.name()).collect();
+    assert_eq!(names, ["mlx-c 0.6", "mlx-c 0.7", "mlx-c 0.8"]);
+}
+
 /// Positive and negative control of the probe itself: a probe that answers
-/// the same for every name cannot tell the two C APIs apart.
+/// the same for every name cannot tell the C APIs apart.
 #[test]
 fn the_export_probe_finds_a_present_symbol_and_not_an_absent_one() {
     assert!(process_exports("mlx_array_new"));

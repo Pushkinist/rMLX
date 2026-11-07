@@ -231,8 +231,8 @@ its defaults. The empty string is refused.
 |---|---|---|
 | `<drafter>/block=<n>` | speculative arm and its configured block | `rmlx_metrics::cell::decode_config`, called by the round loop, which logs it on its `done` line |
 | `<drafter>/depth=<policy>` | how the loop sizes each round's block, when it resizes | same |
-| `prefill_chunk=<n>` | non-default prefill chunk | `scripts/prefill_chunk_sweep.sh` |
-| `kv_boundary/head=<h>,kv_boundary/tail=<t>` | `--kv-boundary-layers` off its default | `rmlx baseline --record`, `rmlx eval ppl`, `scripts/ingest/{codec_inertness,perf_ab}_ingest.py` |
+| `prefill_chunk=<n>` | non-default prefill chunk | `scripts/bench/prefill_chunk_sweep.sh` |
+| `kv_boundary/head=<h>,kv_boundary/tail=<t>` | `--kv-boundary-layers` off its default | `rmlx baseline --record`, `rmlx eval ppl`, `scripts/ingest/ingest.py {ab,codec-inertness}` |
 
 `<drafter>` is the `DraftKind::as_str` name: `mtp`, `dflash`, `dflash2`,
 `eagle3` or `two_model`.
@@ -243,14 +243,14 @@ round. `cell::ADAPTIVE_DRAFTERS` lists the drafters that always resize: today
 block, so its arm is always `dflash/block=<n>,dflash/depth=accept_rate`.
 Migration 008 rewrites a stored `dflash/block=<n>` to that form.
 
-`scripts/spec_bench.sh` records the string the engine logged.
-`scripts/ingest/published_ingest.py` carries the string its result file
+`scripts/bench/serve_bench.sh` records the string the engine logged.
+`scripts/ingest/ingest.py published` carries the string its result file
 recorded from the `done` line. Neither composes a drafter term.
 
 The `kv_boundary/*` pair is always written together, `head` before `tail`.
 The shipped default is `NULL`. The two Python ingesters derive the terms from
-the run's own recorded arguments: the probe's `kv_boundary` column and
-`perf_ab.sh`'s per-arm `args`. They read the default from
+the run's own recorded arguments: the inertness sweep's `kv_boundary` column and
+`bench/ab.sh`'s per-arm `args`. They read the default from
 `rmlx_core::kv_boundary` through `scripts/lib/kv_boundary_default.py`;
 `make check-kv-boundary-default-parity` gates it.
 
@@ -262,9 +262,9 @@ carries one.
 
 **Producers of the column.** `rmlx_metrics::cell::decode_config` is the one
 producer of drafter terms. The other composers are `rmlx_models::kv_cache`
-(the boundary terms), `scripts/ingest/perf_ab_ingest.py`,
-`scripts/ingest/codec_inertness_ingest.py` and
-`scripts/prefill_chunk_sweep.sh`. `check-kv-boundary-default-parity` holds
+(the boundary terms), `scripts/ingest/ingest.py`
+(modes `ab` and `codec-inertness`) and
+`scripts/bench/prefill_chunk_sweep.sh`. `check-kv-boundary-default-parity` holds
 their default values together; only `validate` holds their format.
 
 `bests`, the cell queries and the exports partition on the whole cell key.
@@ -463,7 +463,7 @@ controller tick with `stage = 'admission_ctrl'`:
 | `kv_cache_bytes` | `bytes` | `lower_better` | Resident KV bytes after decode. See below. |
 | `tps_per_gb_ram` | `ratio` | `higher_better` | `decode_tps_warm / peak_rss_gb`. |
 | `task_pass_at_1` | `ratio` | `higher_better` | Quality-probe pass rate, 0.0–1.0. |
-| `greedy_samples` | `count` | `higher_better` | Samples of a dataset a speculative run answered at temperature 0, to be judged against plain decode (`scripts/lib/published_greedy.py`). The five `greedy_*` rows of one dataset are one record and add up: identical, near tie, refused and unjudgeable are the classes of the samples. |
+| `greedy_samples` | `count` | `higher_better` | Samples of a dataset a speculative run answered at temperature 0, to be judged against plain decode (`scripts/published/greedy.py`). The five `greedy_*` rows of one dataset are one record and add up: identical, near tie, refused and unjudgeable are the classes of the samples. |
 | `greedy_identical` | `count` | `higher_better` | Samples whose speculative answer, reasoning included, equals the plain answer to the last character. |
 | `greedy_near_tie` | `count` | `lower_better` | Samples whose answers first differ at a decision the verifier was nearly tied on (`rmlx eval spec-answer`). A near tie is the oracle's reading of one divergence; it does not show the rest of the answer agrees. |
 | `greedy_refused` | `count` | `lower_better` | Samples whose answers differ where the verifier was not tied, or where one run stopped well before the other. |
@@ -608,7 +608,7 @@ kinds. The rows are inside their bounds, so a predicate names each.
     AND (notes IS NULL OR notes NOT LIKE '%decode_window=%');
   ```
 - **MLX snapshots filed under a GGUF weight label.** Early rMLX bench
-  scripts (`perf-iter/bench_decode_tps.sh` among them) labelled an MLX
+  scripts labelled an MLX
   `8bit` snapshot `q8_0` and a `4bit` one `q4_k_m` from a name table. rMLX
   reads no GGUF, so an `rmlx` row carrying either label is one of these;
   current producers read the label from the snapshot's `config.json`
@@ -663,7 +663,7 @@ kinds. The rows are inside their bounds, so a predicate names each.
 Read a recorded rate through `bests` or a `query::*` function; both apply
 the bound. A consumer that needs the raw distribution, such as a median over
 a cell, carries the predicate itself and cites this section.
-`scripts/perf_ceiling.py`'s `prefill_anchor` is the one such consumer.
+`scripts/profile/perf_ceiling.py`'s `prefill_anchor` is the one such consumer.
 
 **Backend coverage.** `rmlx_metrics::registry::COVERAGE_MATRIX` states which
 backend can emit which metric. A pair it does not list reads as `No`. Its

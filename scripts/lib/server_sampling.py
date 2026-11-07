@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Read whether a run's requests were sampled, out of its rmlx run log.
 
 The engine writes one `host categorical sampler active` event per request, and

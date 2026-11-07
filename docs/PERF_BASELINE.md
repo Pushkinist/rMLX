@@ -2,8 +2,7 @@
 
 This doc holds the decode-throughput anchors of the three test-target models.
 It also names the tools that measure a build against them. No program reads an
-anchor from this doc. `scripts/regression_gate.sh` takes the anchor as
-arguments, and `make canary-gate` reads `runs.db`.
+anchor from this doc. `make canary-gate` reads `runs.db`.
 
 ## Canary anchors (release-perf)
 
@@ -13,7 +12,7 @@ default. `auto` is unquantised bf16 on every architecture (`docs/KV_QUANT.md`
 with the `release-perf` profile, by `make canary`.
 
 Hardware: M5 Max, bandwidth ceiling 614 GB/s. That is the host constant
-`scripts/perf_ceiling.py` divides by; `--bandwidth-gbs` overrides it.
+`scripts/profile/perf_ceiling.py` divides by; `--bandwidth-gbs` overrides it.
 
 | model | kv_quant | decode_tps | stddev |
 |---|---|---:|---:|
@@ -26,10 +25,12 @@ host. Absolute decode TPS drifts between runs on a busy host. Only an
 interleaved A/B run supports a direction between two builds.
 
 **Canary protocol.** `make canary` builds the `release-perf` binary and runs
-`scripts/perf_canary.sh`:
+`scripts/bench/baseline_cells.sh --preset canary`:
 
-- Models: the three above. `bash scripts/perf_canary.sh --include-26b` adds
-  `mlx-community__gemma-4-26b-a4b-it-mxfp8`.
+- Models: the three above. `--include-26b` adds
+  `mlx-community__gemma-4-26b-a4b-it-mxfp8`. `--models-root` names the
+  directory that holds the snapshots; `make canary` passes
+  `$RMLX_O_MODELS_ROOT`.
 - Shape: `rmlx baseline --prompt-tokens 4096 --max-tokens 100
   --max-ctx 8192`, with no `--kv-quant`.
 - Runs: 1 warmup discarded, 3 measured; median and sample stddev.
@@ -60,16 +61,6 @@ interleaved A/B run supports a direction between two builds.
   exit does not prove every cell was re-measured. Through `make`, a failed
   recipe line always reports `make`'s own exit code (2), not the
   underlying command's.
-- `scripts/regression_gate.sh <model> <baseline_tps> <baseline_stddev>
-  [--tolerance PCT]` compares the last CSV row naming the model with the
-  anchor given as arguments. The tolerance defaults to 3%. It widens to 5%
-  when that row's stddev exceeds half the tolerance band. Exit 0 is within
-  tolerance, 1 a regression, 125 a failed precondition (arguments, binary,
-  CSV, or a missing or unparseable row).
-
-The last CSV row for a model is its `k8vturbo3` arm, because the canary
-appends that row after the `auto` row. `regression_gate.sh` therefore
-compares the `k8vturbo3` median with the anchor.
 
 **The canary decodes greedily.** `rmlx baseline` samples at temperature 0, on
 the GPU-argmax path. A served request resolves its temperature in the order
@@ -85,9 +76,9 @@ on a cell that runs long.
 **The canary tracks one build over time. It cannot compare two.** All of a
 model's measured runs happen together. When it is pointed at two builds in
 turn, whichever ran second wears any drift. For any two-arm question, use
-`--ab`.
+`make canary-ab`.
 
-## A/B comparison: `perf_canary.sh --ab` (`scripts/perf_ab.sh`)
+## A/B comparison: `scripts/bench/ab.sh`
 
 Interleaved comparison of two arms. An arm is a binary plus extra
 `rmlx baseline` arguments. `make canary-ab ARGS='…'` builds `release-perf`
@@ -95,13 +86,13 @@ and runs the same harness.
 
 ```bash
 # two builds, same flags
-bash scripts/perf_canary.sh --ab \
+bash scripts/bench/ab.sh \
   --binary-a target/release-perf/rmlx.main \
   --binary-b target/release-perf/rmlx \
   --label-a main --label-b patch
 
 # one build, two flag settings, on one model
-bash scripts/perf_canary.sh --ab \
+bash scripts/bench/ab.sh \
   --model "$RMLX_O_MODELS_ROOT/mlx-community__gemma-4-e2b-it-mxfp8" \
   --arm-a "--kv-quant k8v8" --arm-b "--kv-quant k8v4" \
   --allow-token-divergence
@@ -164,14 +155,14 @@ measurement.** It declares the arms are stubs, for a caller that checks this
 script's own logic. The machine is then not consulted: no quiescence probe, no
 interference sampling, no exclusivity check and no load average. The run says
 so in its header, on every slot line and in `waivers.synthetic_arms`.
-`scripts/ingest/perf_ab_ingest.py` refuses such a result with no waiver. The
+`scripts/ingest/ingest.py ab` refuses such a result with no waiver. The
 arm-reading guards still apply.
 
-The boundary lives in `scripts/lib/cpu_snapshot.sh`, as `snapshot_ok` and
-`window_not_sampled`. `scripts/bench_llama_ab.sh` takes the same
-`--synthetic-arms` flag through it. Its result file carries `synthetic_arms`,
-and `scripts/ingest/llama_ab_ingest.py` refuses that result with no waiver. A
-real `bench_llama_ab.sh` run ends by handing its result to that ingest, which
+The boundary lives in `scripts/lib/cpu_snapshot.sh`, as `snapshot_ok`,
+`window_not_sampled` and `classify_window`. `scripts/bench/llama_ab.sh` takes
+the same `--synthetic-arms` flag through it. Its result file carries `synthetic_arms`,
+and `scripts/ingest/ingest.py ab --harness llama` refuses that result with no waiver. A
+real `bench/llama_ab.sh` run ends by handing its result to that ingest, which
 records both arms as `ab_arm` rows under the identity `--record-args` carries;
 `--keep-arm A|B` on a second run of the ingest records the surviving arm as
 `gate`.
@@ -206,7 +197,7 @@ per arm. A `--synthetic-arms` run passes `--metrics off` to every slot and
 records nothing. A slot whose record does not land keeps its reading and the
 verdict, names its buffer file, and ends the run 75 when nothing else failed.
 Promoting the surviving
-arm is a separate step: `scripts/ingest/perf_ab_ingest.py --keep-arm A|B`
+arm is a separate step: `scripts/ingest/ingest.py ab --keep-arm A|B`
 turns one result file into one `gate` RunRecord (`docs/METRICS_DB.md` §8.5;
 `decode_tps_warm`, `kv_cache_bytes`) for that arm, whose slots are already
 `ab_arm` rows. It refuses a TAINTED run unless told otherwise, and carries the
@@ -227,16 +218,16 @@ scratch directory when that matters.
 comparison. Kernel selections are latched in `OnceLock` at first read, so one
 process exercises one dispatch path.
 
-**Selftests.** `make canary-ab-selftest` (`scripts/perf_ab_selftest.sh`, also
+**Selftests.** `make canary-ab-selftest` (`scripts/bench/ab_selftest.sh logic`, also
 in `make ci`) mutation-checks the harness against stub binaries with planted
 differences. It must report a planted ratio exactly, and nothing for two equal
 arms. Every case passes `--synthetic-arms`. The cases that test host gating
 supply the machine as `ps` and `claim-holder` shims on `PATH`. Every run counts the
 cases that took each route; a case that could reach this machine fails the
-suite. `scripts/bench_llama_ab_selftest.sh` carries the same boundary, with
+suite. `scripts/bench/llama_ab_selftest.sh` carries the same boundary, with
 `ps` as its whole host surface.
 
-`make canary-ab-host-gate-fixtures` (`scripts/perf_ab_host_gate_fixtures.sh`,
+`make canary-ab-host-gate-fixtures` (`scripts/bench/ab_selftest.sh host-gate`,
 also in `make ci`) pins that boundary from both sides. The quiescence and
 Metal-exclusivity gates still refuse a shimmed hostile host. A hostile and a
 quiet host give the same verdict text under `--synthetic-arms`. The flag
@@ -245,33 +236,25 @@ waives no arm-reading guard.
 ## Per-codec × per-model cells
 
 `make bench-codec-cell CODEC=<codec> MODEL=<snapshot>` runs
-`scripts/bench_codec_cell.sh`. It runs `rmlx baseline --kv-quant <codec>`, 1
-warmup and 3 measured runs, at `--prompt-len 4096` and `--max-tokens 100` by
-default. The binary is `$RMLX_BINARY`, else `target/release-perf/rmlx`, else
-`target/release/rmlx`. It appends three rows to
-`$RMLX_HOME/bench/codec_cells.csv` and gates nothing.
-
-| Column | Type | Meaning |
-|---|---|---|
-| timestamp | ISO-8601 | When the row was recorded |
-| codec | string | The `--kv-quant` value |
-| model | string | Snapshot directory basename |
-| prompt_len | int | `--prompt-tokens` value |
-| max_tokens | int | `--max-tokens` value |
-| run_idx | int | 1, 2 or 3 |
-| decode_tps | float | Decode tokens per second |
-| prefill_tps | float | Prefill tokens per second |
-| git_sha | string | `HEAD` at bench time, first 12 characters |
+`scripts/bench/baseline_cells.sh --model <snapshot> --kv-quant <codec>
+--record diagnostic`. It runs `rmlx baseline --kv-quant <codec>`, 1 warmup and
+3 measured runs, at `--prompt-tokens 4096` and `--max-tokens 100` by default
+(`--warmup`, `--runs`, `--prompt-tokens` and `--max-tokens` change them), and
+prints the mean decode and prefill rate and the sample stddev of the measured
+runs. Every run, the warmup included, is recorded in `runs.db` as `diagnostic`
+under one label (`codec_cell:<utc stamp>:<codec>`, or `--label`), so the cell
+reaches no champion and no gate. The binary is `--binary`, else
+`target/release-perf/rmlx`, else `target/release/rmlx`.
 
 ## Reading a decode rate against the bandwidth ceiling
 
-`scripts/perf_ceiling.py` computes the bytes one decode step must stream. It
+`scripts/profile/perf_ceiling.py` computes the bytes one decode step must stream. It
 reads `config.json` and the safetensors headers, adds the KV bytes of the
 codec at the given context, and divides by the host bandwidth. It reads no
 tensor data and launches no model.
 
 ```sh
-scripts/perf_ceiling.py --model "$RMLX_O_MODELS_ROOT/<snapshot>" \
+scripts/profile/perf_ceiling.py --model "$RMLX_O_MODELS_ROOT/<snapshot>" \
     --kv-quant <codec> --ctx 4096 --max-ctx 8192 --no-db --json
 ```
 
@@ -303,7 +286,7 @@ decode step streams.
 
 ## Cross-backend cells
 
-`scripts/bench_cell.sh` drives one bench cell on one backend: `rmlx`,
+`scripts/bench/cross_backend.sh` drives one bench cell on one backend: `rmlx`,
 `mlx-lm`, `omlx`, `paroquant` or llama.cpp. Its llama.cpp arms load GGUF
 files. No file loads in both families: the MLX backends read MLX safetensors,
 llama.cpp reads GGUF. A llama.cpp cell set against an MLX backend compares

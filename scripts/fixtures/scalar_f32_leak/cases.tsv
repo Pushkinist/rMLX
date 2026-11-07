@@ -1,0 +1,63 @@
+# Planted scan roots for check/kernel_dispatch.sh scalar-f32: the exit code and the line it names.
+#
+# Columns, tab-separated, none empty ("-" for none): fixture (a directory beside this
+# table), args (gate arguments, "{}" is the fixture path), stream (both, out or err: the
+# gate's output the needles are read from), exit (exact), has (strings that must all
+# appear), lacks (strings none of which may appear), is (the whole output; "\t" is a
+# tab), what (what the case proves). Needles are fixed strings separated by ";;".
+# In has, "A;>B" is one needle: B must appear after the first A.
+#
+# The gate flags a scalar_f32( call that nothing casts back to the operand dtype: an f32
+# scalar combined with a bf16 activation promotes the result to f32. A call passes with a
+# non-F32 .astype( on its own line or on a continuation line of the same chain, or with a
+# f32-ok marker on its own line or in the comment block directly above; a cast whose
+# target is F32 keeps the f32 and is no guard. A row that must fail names the file and
+# the line of the call, so a gate that fails for another reason does not count as recall,
+# and a row that must pass names the number of files it scanned, which is what makes an
+# excluded directory visible: a violation planted there passes only if it was left out.
+# The refusals (nothing to scan, a missing root, --min, a bad option) exit 2 and print
+# no verdict.
+
+clean	--root {}	both	0	check-no-scalar-f32-leak: ok (2 files scanned)	check-no-scalar-f32-leak: FAIL;;unguarded scalar_f32(	-	a scalar_f32( cast to the operand dtype on the same line passes
+unguarded	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;unguarded/model.rs:3: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	a bare scalar_f32( with no cast is caught
+f32_target_astype	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;f32_target_astype/model.rs:3: unguarded scalar_f32(;;f32_target_astype/model.rs:4: unguarded scalar_f32(;;f32_target_astype/model.rs:5: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	a cast whose target is F32 keeps the f32 and is no guard, in all three spellings
+bf16_target_astype	--root {}	both	0	check-no-scalar-f32-leak: ok (1 files scanned)	check-no-scalar-f32-leak: FAIL;;unguarded scalar_f32(	-	a cast to a non-F32 literal dtype is a guard
+chain_guarded	--root {}	both	0	check-no-scalar-f32-leak: ok (1 files scanned)	check-no-scalar-f32-leak: FAIL;;unguarded scalar_f32(	-	a non-F32 cast on a continuation line of the same chain guards the call
+chain_unguarded	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;chain_unguarded/model.rs:3: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	a chain that ends with no cast is reported at its scalar_f32( line
+two_chains	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;two_chains/model.rs:3: unguarded scalar_f32(;;two_chains/model.rs:5: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	two unguarded chains in a row are both reported, each at its own line
+chain_f32_astype	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;chain_f32_astype/model.rs:3: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	an F32 cast on a continuation line does not resolve the chain
+chain_ends_at_eof	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;chain_ends_at_eof/model.rs:3: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	a chain still open at the end of the file is reported, not dropped
+terminated_then_cast	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;terminated_then_cast/model.rs:3: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	a cast on the line after a finished statement does not guard the earlier call
+marker_same_line	--root {}	both	0	check-no-scalar-f32-leak: ok (1 files scanned)	check-no-scalar-f32-leak: FAIL;;unguarded scalar_f32(	-	a same-line f32-ok marker exempts the call
+marker_above	--root {}	both	0	check-no-scalar-f32-leak: ok (1 files scanned)	check-no-scalar-f32-leak: FAIL;;unguarded scalar_f32(	-	an f32-ok marker on the comment line above exempts the call
+marker_block_above	--root {}	both	0	check-no-scalar-f32-leak: ok (1 files scanned)	check-no-scalar-f32-leak: FAIL;;unguarded scalar_f32(	-	a marker in the first line of a multi-line comment block directly above still applies
+marker_after_blank_line	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;marker_after_blank_line/model.rs:5: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	a blank line between the marker and the call ends the comment block
+marker_over_statement	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;marker_over_statement/model.rs:5: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	a marker does not survive a plain statement between it and the call
+marker_exempts_one_call	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;marker_exempts_one_call/model.rs:5: unguarded scalar_f32(	marker_exempts_one_call/model.rs:4:;;check-no-scalar-f32-leak: ok	-	one marker exempts one call, not the call on the next line
+comment_mention	--root {}	both	0	check-no-scalar-f32-leak: ok (1 files scanned)	check-no-scalar-f32-leak: FAIL;;unguarded scalar_f32(	-	a pure comment line that names scalar_f32( is not a call
+excluded_dirs	--root {}	both	0	check-no-scalar-f32-leak: ok (1 files scanned)	check-no-scalar-f32-leak: FAIL;;unguarded scalar_f32(	-	laguna/ and dr_venus/ are out of scope, and only the one in-scope file is counted
+excluded_tests	--root {}	both	0	check-no-scalar-f32-leak: ok (1 files scanned)	check-no-scalar-f32-leak: FAIL;;unguarded scalar_f32(	-	*_tests.rs, tests.rs and a tests/ directory are out of scope, and only the one in-scope file is counted
+nested_dir	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;nested_dir/sub/deeper/model.rs:3: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	a file in a sub-directory is still scanned
+empty_tree	--root {}	both	2	no .rs file to scan	check-no-scalar-f32-leak: ok	-	a root with no .rs file is a lost population, not a pass
+min_refused	--min 1 --root {}	both	2	scalar-f32 has no floor	check-no-scalar-f32-leak: ok	-	scalar-f32 has no floor, so --min is refused instead of ignored
+clean_missing_root	--root {}/absent	both	2	scan root does not exist	check-no-scalar-f32-leak: ok	-	a scan root that does not exist is refused, not scanned as empty
+clean_unknown_option	--bogus --root {}	both	2	usage: bash scripts/check/kernel_dispatch.sh	check-no-scalar-f32-leak: ok	-	an option the tool does not have is a usage error
+clean_root_twice	--root {} --root {}	both	0	check-no-scalar-f32-leak: ok (1 files scanned)	check-no-scalar-f32-leak: FAIL;;(2 files scanned)	-	a root given twice is scanned once, not twice
+trailing_comment_hides_end	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;trailing_comment_hides_end/model.rs:3: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	a trailing comment does not keep the statement open for a cast on the next line
+trailing_comment_mention	--root {}	both	0	check-no-scalar-f32-leak: ok (1 files scanned)	check-no-scalar-f32-leak: FAIL;;unguarded scalar_f32(	-	a trailing comment that names scalar_f32( is not a call
+string_holds_marker_text	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;string_holds_marker_text/model.rs:3: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	marker text inside a string literal is no marker
+string_slashes_before_call	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;string_slashes_before_call/model.rs:3: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	two slashes inside a string literal do not hide the call after them
+string_then_marker	--root {}	both	0	check-no-scalar-f32-leak: ok (1 files scanned)	check-no-scalar-f32-leak: FAIL;;unguarded scalar_f32(	-	a real marker after a string literal with two slashes still exempts its call
+string_marker_line_above	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;string_marker_line_above/model.rs:4: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	marker text inside a string literal on the line above is no marker
+chain_end_comment	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;chain_end_comment/model.rs:3: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	a trailing comment on the last line of a chain does not keep it open for a later cast
+comment_names_cast	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;comment_names_cast/model.rs:3: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	a cast named only in a trailing comment is no guard
+char_quote_hides_call	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;char_quote_hides_call/model.rs:3: unguarded scalar_f32(;;char_quote_hides_call/model.rs:4: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	a quote inside the character literals '"' and '\"' does not flip the string state, so the call behind a later string is still code
+char_quote_marker	--root {}	both	0	check-no-scalar-f32-leak: ok (1 files scanned)	check-no-scalar-f32-leak: FAIL;;unguarded scalar_f32(	-	a quote inside the character literals '"' and '\"' opens no string, so the marker after them is still a comment
+args_on_own_line	--root {}	both	0	check-no-scalar-f32-leak: ok (1 files scanned)	check-no-scalar-f32-leak: FAIL;;unguarded scalar_f32(	-	an argument on its own line ending in a comma does not end the statement: the cast after the call still guards it
+brace_terminated	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;brace_terminated/model.rs:3: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	a closing brace ends the statement, so a cast on the next line guards another statement
+cast_in_continuation_comment	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;cast_in_continuation_comment/model.rs:3: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	a cast named only in a comment on a continuation line is no guard
+marker_no_colon	--root {}	both	1	check-no-scalar-f32-leak: FAIL;;marker_no_colon/model.rs:3: unguarded scalar_f32(	check-no-scalar-f32-leak: ok	-	an f32-ok marker without its colon exempts nothing
+target_dir	--root {}	both	0	check-no-scalar-f32-leak: ok (1 files scanned)	check-no-scalar-f32-leak: FAIL;;gen.rs	-	a target/ directory is build output and is not scanned
+marker_trailing_above	--root {}	both	0	check-no-scalar-f32-leak: ok (1 files scanned)	check-no-scalar-f32-leak: FAIL;;unguarded scalar_f32(	-	a marker in the trailing comment of the code line directly above exempts the call
+clean	--root {}/model.rs	both	2	scan root is not a directory	scan root does not exist;;check-no-scalar-f32-leak: ok	-	a scan root that is a file is refused as not a directory
+clean	--root {} --root {}/absent	both	2	scan root does not exist	check-no-scalar-f32-leak: ok	-	every root given is checked, not only the first

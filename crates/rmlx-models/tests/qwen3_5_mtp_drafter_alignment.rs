@@ -351,7 +351,7 @@ fn greedy_tracks_plain_greedy(test: &str, pair: &Pair) {
     // One rule, `shorter / 2`, checked against each pair's two readings: the
     // shipped round loop, and the same loop with a rollback that keeps one
     // rejected draft on every partial round (its rollback stops one position
-    // short; `scripts/spec_broken_engine.sh` names the edit).
+    // short; `scripts/spec/broken_engine.sh` names the edit).
     //
     //   pair  | shipped              | rollback keeps a draft | floor
     //   mxfp8 | 31 of 31 shared      |  2 of 12 shared        | 6

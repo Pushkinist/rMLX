@@ -102,7 +102,7 @@ pub mod rotor_qjl;
 pub mod rotorquant;
 pub mod rotorquant_msl;
 /// Deliberately out-of-bounds kernel used as the positive control for the
-/// shader-validation gate. Off by default; see `scripts/run_gpu_tests.sh`.
+/// shader-validation gate. Off by default; see `scripts/suite/run_gpu_tests.sh`.
 #[cfg(feature = "shader-validation-canary")]
 pub mod shader_validation_canary;
 pub mod sparse_attn;

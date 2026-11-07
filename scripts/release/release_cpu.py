@@ -21,7 +21,7 @@ build pins BASELINE_CPU instead, keeping every other flag config.toml sets.
       config.toml's flags in config.toml's order. A `--remap-path-prefix` is
       not compared: it changes the paths the binary records, not its code. It reads rustflags only: a
       rustc wrapper's own arguments are not recorded, which is why
-      package_binary.sh builds with every wrapper cleared.
+      release.sh package builds with every wrapper cleared.
       The binary carries no record of its target CPU, so the chain is: the
       packaged bytes -> the byte-identical `target/release/deps/rmlx-<hash>`
       cargo linked -> `target/release/.fingerprint/rmlx-cli-<hash>/bin-rmlx.json`,

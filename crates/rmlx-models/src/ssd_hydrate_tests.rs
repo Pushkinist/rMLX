@@ -665,7 +665,7 @@ fn the_entry_carries_the_blocks_tokens_not_the_requests() {
 /// exist to replace. Every line is read with its `//` comment blanked, so a
 /// needle inside a comment is not a fact about the code.
 ///
-/// The walk skips test sources the same way `scripts/lib/debt_report.py` does:
+/// The walk skips test sources the same way `scripts/report/rust_scan.py` does:
 /// a `tests` path component, a `tests.rs`, or a `*_tests.rs`. A test entry that
 /// implements the trait is therefore out, and this file is out of its own scan.
 struct HydrateScan {

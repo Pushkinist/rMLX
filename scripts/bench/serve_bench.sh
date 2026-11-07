@@ -1,0 +1,1225 @@
+#!/usr/bin/env bash
+# serve_bench.sh — bench one model through rmlx serve, alone or against a drafter
+#
+# Usage:  bash scripts/bench/serve_bench.sh --model DIR --record gate|diagnostic
+#             [--draft-model DIR [--draft-kind KIND] [--draft-block-size N]] [--prompt-file F]
+#             [--port N] [--dry-run] [--kv-quant Q] [--max-ctx N] [--tag T] [--server-stamps]
+#             [--binary PATH]
+# Exit:   0 every arm measured and filed; 1 a usage error, a missing model or prompt file, or a
+#         run the checks refused; 75 every arm measured and a record did not land (it stays in the
+#         queue named on stderr); 125 the rmlx binary is missing or not executable; passthrough of
+#         rmlx serve (11: another process holds the Metal claim)
+#
+# --model is the verifier snapshot dir. Without --draft-model only the no-drafter arm runs and
+# one record is filed; with it (the assistant drafter snapshot dir) a drafter arm follows, is
+# judged against the first, and files a second. --record sets the `run_class` of every record
+# filed. --prompt-file is a canonical JSON prompt (prompts/spec_bench/*.json) whose
+# `messages[0].content` is sent and whose `name` is the registered prompt row name; without
+# it a short prose prompt is sent. --binary PATH is the rmlx that serves and gives the run identity;
+# without it, the release-perf build of this checkout (make build-perf).
+#
+# `--server-stamps` is for a self-test. The client rate is then read from the stub server's own
+# stamps, which makes the cross-check compare the stub with itself, so the rows are written under
+# `stamped_records/` in the scratch directory and are never passed to `rmlx metrics record`.
+#
+# Output:
+#   - One RunRecord JSON file per arm written + ingested into runs.db
+#   - Final comparison table printed to stdout
+#
+# Measurement basis (docs/SPEC_READING_A_RUN.md § "Benching an arm"):
+#   Both arms report the decode rate the engine measured, over the window from
+#   the first emitted token to the last, prefill excluded — so the two rows mean
+#   the same thing and the delta between them is a decode-rate delta. The
+#   speculative arm takes the rate the round loop logged; the no-drafter arm
+#   takes the one the server derives from that request's inter-token gaps and
+#   publishes at GET /metrics/cache. Each arm is cross-checked against the same
+#   window timed client-side, and a disagreement past CROSS_CHECK_BAND_PCT is a
+#   refusal, not a choice between them.
+#
+# The two arms must have answered the same thing, or differ only at a near tie:
+#   A greedy speculative loop emits the verifier's own argmax at every position,
+#   so with no sampler running the speculative arm and the no-drafter arm are two
+#   ways of computing one answer. Every measured run's whole completion is
+#   digested. Equal digests file `answer_check=matches_plain`. A difference is
+#   not by itself a defect: the verify pass scores a block in one forward, a
+#   different reduction order, and that can flip a decision the verifier was
+#   nearly tied on. So a difference is judged by `rmlx eval spec-answer` over one
+#   unstreamed logprob pass of each arm, sent between the warmup and the measured
+#   runs and held to its arm's measured digest. A near-tie flip files
+#   `answer_check=near_tie@<token>` with the rank and margin that decided it; any
+#   other difference stops the run before any median is taken — an arm that
+#   answered a different question has no throughput to report for this one, and
+#   `observations` is append-only. Whether a sampler ran is read back from the
+#   engine's own per-request event rather than assumed from the temperature the
+#   request asked for; under one the arms are two draws, the comparison does not
+#   apply, and both rows say so in `answer_check`.
+#
+# Hard constraints honoured:
+#   - Single server process at a time; the script stops the server it started
+#     (kill + wait on its PID) between phases. A claim some other process holds
+#     stops the run with the server's exit status (11).
+#   - 1 warmup + 3 measured requests per config, plus 1 logprob pass when a drafter
+#     runs; 5 s sleep between requests, LOGPROB_PASS_PAUSE_S after the logprob pass
+#   - All inserts go through `rmlx metrics record --file` (no direct sqlite writes)
+
+set -euo pipefail
+
+# The server this run started and has not yet stopped. Any exit — a failed
+# command under `set -e`, an interrupt, a CI timeout — stops it and waits, so no
+# failure leaves it holding the Metal claim.
+LIVE_PID=""
+stop_live_server() {
+    if [[ -n "${LIVE_PID}" ]]; then
+        kill "${LIVE_PID}" 2>/dev/null || true
+        wait "${LIVE_PID}" 2>/dev/null || true
+        LIVE_PID=""
+    fi
+}
+trap stop_live_server EXIT
+
+usage_error() {
+    echo "ERROR: $1" >&2
+    exit 1
+}
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+source "${REPO_ROOT}/scripts/lib/args.sh"
+source "${REPO_ROOT}/scripts/lib/identity.sh"
+source "${REPO_ROOT}/scripts/lib/record_pending.sh"
+source "${REPO_ROOT}/scripts/lib/rmlx_home.sh"
+BINARY="$(rmlx_default_binary "${REPO_ROOT}" release-perf)"
+RMLX_HOME="$(rmlx_home "${REPO_ROOT}")" || exit 1
+LOG_DIR="${RMLX_HOME}/logs"
+BUFFER_DIR="${RMLX_HOME}/metrics/buffer/pending"
+DB_PATH="${RMLX_HOME}/metrics/runs.db"
+SCRATCH_DIR="${RMLX_HOME}/tmp"
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+PORT="${PORT:-8090}"
+WARMUP_RUNS=1
+MEASURED_RUNS=3
+# One unstreamed request with logprobs per phase. It reads the whole vocabulary
+# back to the host at every step, which the measured runs must never do, so it
+# is its own request and no rate is taken from it.
+LOGPROB_PASSES=1
+# That read-back is a larger thermal event than a measured run.
+LOGPROB_PASS_PAUSE_S=15
+MAX_TOKENS=128
+TEMPERATURE=0
+SEED=42
+# The drafter to bench. Every kind the engine ships goes through this one path;
+# set with --draft-kind / --draft-block-size. What the run is *recorded* as is
+# not read from here — the round loop names its own cell and this script records
+# what it said (see the `decode_config` the log carries).
+DRAFT_KIND="mtp"
+# Empty means "let the engine resolve one", which it does from the drafter's own
+# declared depth and the serve default, and names on its startup line. A number
+# here would be a second producer of that resolution, and a bench recorded under
+# a block the engine would not otherwise have run is a row about this script.
+DRAFT_BLOCK_SIZE=""
+# Empty means "let the engine resolve one", which it always does and always
+# names in its startup log. Either way the recorded kv_quant is read back from
+# that log, never assumed here. Set with --kv-quant.
+KV_QUANT=""
+# Passed to the server and recorded, so the ctx_max column describes the run
+# rather than the value this script was written against.
+MAX_CTX=8192
+HARDWARE_TAG="${RMLX_HARDWARE_TAG:-m5_max_128gb}"
+# How far the client-observed decode window may sit from the engine's own
+# reading of the same window before the run is refused. One network hop on
+# loopback, not a measurement difference.
+CROSS_CHECK_BAND_PCT=10
+
+VERIFIER_MODEL=""
+DRAFTER_MODEL=""
+DRAFT_KIND_SET=false
+DRAFT_BLOCK_SIZE_SET=false
+RECORD_CLASS=""
+PROMPT_FILE=""
+DRY_RUN=false
+SERVER_STAMPS_ARG=()
+CLIENT_CLOCK=client
+BENCH_TAG=""
+KV_QUANT_ARGS=()
+DRAFT_BLOCK_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run) DRY_RUN=true; shift ;;
+        --server-stamps) SERVER_STAMPS_ARG=(--server-stamps); CLIENT_CLOCK=server_stamps; shift ;;
+        --model=*) VERIFIER_MODEL="${1#--model=}"; shift ;;
+        --model) need_value "$1" $# 1; VERIFIER_MODEL="$2"; shift 2 ;;
+        --draft-model=*) DRAFTER_MODEL="${1#--draft-model=}"; shift ;;
+        --draft-model) need_value "$1" $# 1; DRAFTER_MODEL="$2"; shift 2 ;;
+        --prompt-file=*) PROMPT_FILE="${1#--prompt-file=}"; shift ;;
+        --prompt-file) need_value "$1" $# 1; PROMPT_FILE="$2"; shift 2 ;;
+        --binary=*) BINARY="${1#--binary=}"; shift ;;
+        --binary) need_value "$1" $# 1; BINARY="$2"; shift 2 ;;
+        --port=*) PORT="${1#--port=}"; shift ;;
+        --port) need_value "$1" $# 1; PORT="$2"; shift 2 ;;
+        --tag=*) BENCH_TAG="${1#--tag=}"; shift ;;
+        --tag) need_value "$1" $# 1; BENCH_TAG="$2"; shift 2 ;;
+        --kv-quant=*) KV_QUANT="${1#--kv-quant=}"; shift ;;
+        --kv-quant) need_value "$1" $# 1; KV_QUANT="$2"; shift 2 ;;
+        --max-ctx=*) MAX_CTX="${1#--max-ctx=}"; shift ;;
+        --max-ctx) need_value "$1" $# 1; MAX_CTX="$2"; shift 2 ;;
+        --draft-kind=*) DRAFT_KIND="${1#--draft-kind=}"; DRAFT_KIND_SET=true; shift ;;
+        --draft-kind) need_value "$1" $# 1; DRAFT_KIND="$2"; DRAFT_KIND_SET=true; shift 2 ;;
+        --draft-block-size=*) DRAFT_BLOCK_SIZE="${1#--draft-block-size=}"; DRAFT_BLOCK_SIZE_SET=true; shift ;;
+        --draft-block-size) need_value "$1" $# 1; DRAFT_BLOCK_SIZE="$2"; DRAFT_BLOCK_SIZE_SET=true; shift 2 ;;
+        --record=*) RECORD_CLASS="${1#--record=}"; shift ;;
+        --record) need_value "$1" $# 1; RECORD_CLASS="$2"; shift 2 ;;
+        *) echo "Unknown flag: $1" >&2; exit 1 ;;
+    esac
+done
+
+# The drafter kind reaches a buffer *filename* and the record's `notes`, both
+# before the engine ever sees it, so a value with a `/` or a space in it writes
+# outside `pending/` or files an unparseable note. That is the property this
+# script needs and the only one it checks: a list of the kinds the engine ships
+# would be a third copy of an enum this script cannot keep current, and would
+# reject a new drafter with a sentence that is false about it. Which kinds exist
+# is the engine's to say, in its own message.
+if ! [[ "${DRAFT_KIND}" =~ ^[a-z0-9_]+$ ]]; then
+    echo "ERROR: --draft-kind '${DRAFT_KIND}' is not a bare lower-case name;" \
+         "it reaches a buffer filename and the record's notes before the engine" \
+         "sees it" >&2
+    exit 1
+fi
+
+if [[ -z "${VERIFIER_MODEL}" || -z "${RECORD_CLASS}" ]]; then
+    cat >&2 <<USAGE
+ERROR: --model and --record are required.
+
+Resolve concrete absolute paths from LOCAL.md (gitignored). Example:
+
+  bash scripts/bench/serve_bench.sh \\
+    --model \$O_MODELS/mlx-community__gemma-4-e2b-it-mxfp8 \\
+    --draft-model \$O_MODELS/mlx-community__gemma-4-E2B-it-assistant-bf16 \\
+    --record gate
+
+USAGE
+    exit 1
+fi
+
+if [[ "${RECORD_CLASS}" != gate && "${RECORD_CLASS}" != diagnostic ]]; then
+    usage_error "--record '${RECORD_CLASS}' is not gate or diagnostic"
+fi
+
+if [[ -z "${DRAFTER_MODEL}" ]]; then
+    if $DRAFT_KIND_SET || $DRAFT_BLOCK_SIZE_SET; then
+        usage_error "--draft-kind and --draft-block-size need --draft-model"
+    fi
+    LOGPROB_PASSES=0
+fi
+REQUESTS_PER_PHASE=$((WARMUP_RUNS + LOGPROB_PASSES + MEASURED_RUNS))
+
+if [[ -n "${DRAFT_BLOCK_SIZE}" ]]; then
+    if ! [[ "${DRAFT_BLOCK_SIZE}" =~ ^[0-9]+$ ]] || (( DRAFT_BLOCK_SIZE < 2 )); then
+        echo "ERROR: --draft-block-size '${DRAFT_BLOCK_SIZE}' must be an integer >= 2:" \
+             "a block of 1 leaves no room for a draft token" >&2
+        exit 1
+    fi
+    DRAFT_BLOCK_ARGS=(--draft-block-size "${DRAFT_BLOCK_SIZE}")
+fi
+
+if [[ -n "${KV_QUANT}" ]]; then
+    KV_QUANT_ARGS=(--kv-quant "${KV_QUANT}")
+fi
+
+# ── Prompt body ───────────────────────────────────────────────────────────────
+#
+# A canonical JSON file in prompts/spec_bench/ carries `name` + `messages[0].content`.
+
+if [[ -n "${PROMPT_FILE}" ]]; then
+    if [[ ! -f "${PROMPT_FILE}" ]]; then
+        echo "ERROR: --prompt-file not found: ${PROMPT_FILE}" >&2
+        exit 1
+    fi
+    PROMPT_CONTENT="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['messages'][0]['content'])" "${PROMPT_FILE}")"
+    PROMPT_NAME="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['name'])" "${PROMPT_FILE}")"
+else
+    PROMPT_CONTENT="List 5 important features of the Rust programming language."
+    PROMPT_NAME="spec-bench-rust-5-features"
+fi
+
+# The server registers models by their full snapshot directory basename
+# (namespace__model), so the "model" field in OpenAI requests must use that.
+MODEL_ID="$(basename "${VERIFIER_MODEL%/}")"
+
+# JSON-escape PROMPT_CONTENT via python3 so quotes/backslashes in canonical
+# prompt files don't corrupt the request body.
+REQUEST_BODY=$(
+    MODEL_ID="${MODEL_ID}" PROMPT_CONTENT="${PROMPT_CONTENT}" \
+    MAX_TOKENS="${MAX_TOKENS}" TEMPERATURE="${TEMPERATURE}" SEED="${SEED}" \
+    python3 -c '
+import json, os
+print(json.dumps({
+    "model": os.environ["MODEL_ID"],
+    "messages": [{"role": "user", "content": os.environ["PROMPT_CONTENT"]}],
+    "max_tokens": int(os.environ["MAX_TOKENS"]),
+    "temperature": float(os.environ["TEMPERATURE"]),
+    "seed": int(os.environ["SEED"]),
+    "stream": True,
+    # The prompt length recorded with the run is the one the server counted,
+    # and it only says so when asked.
+    "stream_options": {"include_usage": True},
+}))
+'
+)
+
+# ── Snapshot identity ─────────────────────────────────────────────────────────
+#
+# Namespace, model and weight quant describe the checkpoint being served, and
+# the caller chooses that. Reading them from the snapshot is what keeps the row
+# in its own cell when this script is pointed at a different one.
+
+SNAPSHOT_ID="$(python3 "${REPO_ROOT}/scripts/lib/snapshot_identity.py" "${VERIFIER_MODEL}")" || {
+    echo "ERROR: cannot read the identity of ${VERIFIER_MODEL}" >&2
+    exit 1
+}
+MODEL_NAMESPACE="$(echo "${SNAPSHOT_ID}" | sed -n 's/^model_namespace=//p')"
+MODEL_NAME="$(echo "${SNAPSHOT_ID}" | sed -n 's/^model=//p')"
+WEIGHT_QUANT="$(echo "${SNAPSHOT_ID}" | sed -n 's/^weight_quant=//p')"
+
+# ── Sanity checks ─────────────────────────────────────────────────────────────
+
+if [[ ! -x "${BINARY}" ]]; then
+    echo "ERROR: binary not found at ${BINARY}. Run: make build-perf" >&2
+    exit 125
+fi
+
+# Run identity (backend / version / git sha / build profile / hardware tag)
+# comes from the measured binary — never hard-coded here.
+rmlx_export_identity "${BINARY}"
+GIT_SHA="$(rmlx_git_sha "${REPO_ROOT}")"
+
+if [[ ! -d "${VERIFIER_MODEL}" ]]; then
+    echo "ERROR: verifier model not found: ${VERIFIER_MODEL}" >&2
+    exit 1
+fi
+
+if [[ -n "${DRAFTER_MODEL}" && ! -d "${DRAFTER_MODEL}" ]]; then
+    echo "ERROR: drafter model not found: ${DRAFTER_MODEL}" >&2
+    exit 1
+fi
+
+if [[ "${CLIENT_CLOCK}" != "client" ]]; then
+    BUFFER_DIR="${SCRATCH_DIR}/stamped_records"
+fi
+mkdir -p "${LOG_DIR}" "${BUFFER_DIR}" "${SCRATCH_DIR}"
+REQUEST_BODY_FILE="${SCRATCH_DIR}/request_body.json"
+printf '%s\n' "${REQUEST_BODY}" > "${REQUEST_BODY_FILE}"
+# The logprob pass asks for the same answer as the measured runs, whole and
+# with the two best candidates of every position.
+LOGPROB_BODY_FILE="${SCRATCH_DIR}/logprob_request_body.json"
+if [[ -n "${DRAFTER_MODEL}" ]]; then
+    REQUEST_BODY="${REQUEST_BODY}" python3 -c '
+import json, os
+body = json.loads(os.environ["REQUEST_BODY"])
+del body["stream_options"]
+body.update({"stream": False, "logprobs": True, "top_logprobs": 2})
+print(json.dumps(body))
+' > "${LOGPROB_BODY_FILE}"
+fi
+
+echo "==> serve_bench.sh"
+echo "    verifier : ${VERIFIER_MODEL}"
+echo "    drafter  : ${DRAFTER_MODEL:-<none>}"
+echo "    port     : ${PORT}"
+echo "    git_sha  : ${GIT_SHA}"
+echo "    dry_run  : ${DRY_RUN}"
+echo ""
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+# Server lifecycle, log attribution and the resolved-codec reader are shared
+# with the other bench harnesses.
+# shellcheck source=scripts/lib/bench_server.sh
+. "${REPO_ROOT}/scripts/lib/bench_server.sh"
+
+# Fire one measured chat-completions request and report what the client saw.
+#
+# Prints the `key=value` block of scripts/lib/sse_decode_window.py: `tokens`,
+# `preview`, `answer_sha256` and `decode_tps` over the first-content-token to
+# last-content-token window. A rate over the whole request instead would count
+# the prefill and the client spawn and read low, and would not be comparable with
+# the rate the engine logs for the speculative arm.
+measured_request() {
+    local raw_file="$1" block
+    block="$(python3 "${REPO_ROOT}/scripts/lib/sse_decode_window.py" \
+        --url "http://127.0.0.1:${PORT}/v1/chat/completions" \
+        --body-file "${REQUEST_BODY_FILE}" --raw "${raw_file}" \
+        ${SERVER_STAMPS_ARG[@]+"${SERVER_STAMPS_ARG[@]}"})" || return $?
+    if [[ "$(field_of "${block}" clock)" != "${CLIENT_CLOCK}" ]]; then
+        echo "ERROR: a client reading says it was timed by something other than" \
+             "the ${CLIENT_CLOCK} clock" >&2
+        return 1
+    fi
+    printf '%s\n' "${block}"
+}
+
+# Fire the unstreamed logprob pass: the whole answer with the two best
+# candidates of every position, written to `$2` for the judge. Prints the digest
+# of its text, computed by the function that digests the streamed runs. A server
+# that does not answer it leaves nothing to bind or judge by: the caller stops.
+logprob_pass() {
+    local arm="$1" out_file="$2" block digest
+    rm -f "${out_file}"
+    block="$(python3 "${REPO_ROOT}/scripts/lib/sse_decode_window.py" \
+        --url "http://127.0.0.1:${PORT}/v1/chat/completions" \
+        --body-file "${LOGPROB_BODY_FILE}" --complete "${out_file}")" || block=""
+    digest="$(field_of "${block}" answer_sha256)"
+    if [[ -z "${digest}" ]]; then
+        echo "ERROR: ${arm}: the server did not answer the logprob pass" >&2
+        return 1
+    fi
+    echo "${digest}"
+}
+
+# How many ITL samples the server has recorded so far.
+ring_len() {
+    field_of "$(python3 "${REPO_ROOT}/scripts/bench/server_decode_tps.py" \
+        "http://127.0.0.1:${PORT}")" ring_len
+}
+
+# The rate the server measured for the request that just finished, given the
+# ring length observed before it. Empty when the server could not attribute one.
+server_rate_after() {
+    field_of "$(python3 "${REPO_ROOT}/scripts/bench/server_decode_tps.py" \
+        "http://127.0.0.1:${PORT}" --after "$1")" decode_tps
+}
+
+# Two readings of the same window, one from the engine and one from the client,
+# have to agree or one of them is not measuring what it claims. Refuse rather
+# than pick: the disagreement is the finding.
+cross_check() {
+    local arm="$1" engine="$2" client="$3"
+    LC_ALL=C python3 -c '
+import sys
+arm, engine, client, band = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
+off = abs(client - engine) / engine * 100.0
+if off > band:
+    sys.exit(
+        f"ERROR: {arm} engine rate {engine:.3f} and client-observed rate "
+        f"{client:.3f} differ by {off:.1f}%, past the {band:.0f}% band these "
+        "two readings of one window are allowed"
+    )
+print(f"  [{arm}] cross-check ok: engine {engine:.3f} vs client {client:.3f} ({off:.1f}%)")
+' "${arm}" "${engine}" "${client}" "${CROSS_CHECK_BAND_PCT}" >&2
+}
+
+# Whether the engine resolved a sampler for this phase's requests, read back
+# from its own per-request event. `true` or `false`; empty when the reader
+# refused, which it does for a phase whose requests did not all share one
+# sampling setup — and it says why on stderr.
+log_sampled() {
+    field_of "$(python3 "${REPO_ROOT}/scripts/lib/server_sampling.py" \
+        "$1" --expect-requests "$2")" sampled
+}
+
+# The digest every measured run of one arm produced, or `varied` when they were
+# not all the same.
+one_answer() {
+    local first="$1" digest
+    for digest in "$@"; do
+        if [[ "${digest}" != "${first}" ]]; then
+            echo "varied"
+            return 0
+        fi
+    done
+    echo "${first}"
+}
+
+# Compute median of space-separated values. LC_ALL=C so `sort -n` and awk read
+# the decimal point the same way this script writes it.
+median() {
+    echo "$@" | tr ' ' '\n' | LC_ALL=C sort -n | LC_ALL=C awk '
+    { a[NR]=$1 }
+    END {
+        n=NR
+        if (n % 2 == 1) print a[(n+1)/2]
+        else printf "%.6f\n", (a[n/2] + a[n/2+1]) / 2
+    }'
+}
+
+# Compute sample stddev.
+stddev() {
+    echo "$@" | tr ' ' '\n' | LC_ALL=C awk '
+    NR==1 { first=$1 }
+    { sum+=$1; sumsq+=$1*$1; n++ }
+    END {
+        if (n < 2) { print "0.000000"; exit }
+        mean = sum/n
+        variance = (sumsq - n*mean*mean) / (n-1)
+        if (variance < 0) variance = 0
+        printf "%.6f\n", sqrt(variance)
+    }'
+}
+
+# Emit a §8.5 RunRecord JSON and ingest it.
+# Args: config_name decode_tps stddev output_preview kv_quant prompt_tokens
+#       answer answer_check [spec_data [answer_notes]]
+#
+# `kv_quant` and `prompt_tokens` are measured facts about the run, not settings
+# this script may assume: the codec is whatever the engine resolved and said so
+# in its log, and the prompt length is whatever the server counted. A record
+# missing either is refused rather than filed under a guess.
+#
+# `answer` is the digest of what the arm generated and `answer_check` is what
+# comparing the two arms established, both in `notes`, with `answer_notes` (the
+# `key=value` figures the comparison read) beside the check. A row that was never
+# compared says so there rather than looking like one that was.
+#
+# `spec_data` is scripts/lib/spec_round_log.py's output for the speculative arm
+# and empty for the no-drafter one. Every speculative metric, the block the
+# engine ran and the cell the row belongs to come out of it: that reader is the
+# one place a round loop's numbers are turned into a row, so a new drafter or a
+# new block policy is recorded correctly without this script learning about it.
+emit_and_ingest() {
+    local config="$1"
+    local decode_tps="$2"
+    local decode_tps_stddev="$3"
+    local preview="$4"
+    local kv_quant="$5"
+    local prompt_tokens="$6"
+    local answer="$7"
+    local answer_check="$8"
+    local spec_data="${9:-}"
+    local answer_notes="${10:-}"
+
+    if [[ -z "${kv_quant}" ]]; then
+        echo "ERROR: ${config}: the run did not report which KV codec it resolved" >&2
+        return 1
+    fi
+    if [[ -z "${prompt_tokens}" ]]; then
+        echo "ERROR: ${config}: the server reported no prompt_tokens for this run" >&2
+        return 1
+    fi
+
+    local ts_utc
+    ts_utc="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+    # Build the RunRecord JSON using Python, passing all values via env vars to
+    # avoid shell quoting issues with numeric and text fields.
+    local record_json
+    record_json=$(
+        BENCH_CONFIG="${config}" \
+        BENCH_DECODE_TPS="${decode_tps}" \
+        BENCH_DECODE_TPS_STDDEV="${decode_tps_stddev}" \
+        BENCH_SPEC_DATA="${spec_data}" \
+        BENCH_PREVIEW="${preview}" \
+        BENCH_KV_QUANT="${kv_quant}" \
+        BENCH_PROMPT_TOKENS="${prompt_tokens}" \
+        BENCH_ANSWER="${answer}" \
+        BENCH_ANSWER_CHECK="${answer_check}" \
+        BENCH_ANSWER_NOTES="${answer_notes}" \
+        BENCH_MODEL_NAMESPACE="${MODEL_NAMESPACE}" \
+        BENCH_MODEL="${MODEL_NAME}" \
+        BENCH_WEIGHT_QUANT="${WEIGHT_QUANT}" \
+        BENCH_CTX_MAX="${MAX_CTX}" \
+        BENCH_TS_UTC="${ts_utc}" \
+        BENCH_GIT_SHA="${GIT_SHA}" \
+        BENCH_HARDWARE_TAG="${HARDWARE_TAG}" \
+        BENCH_MAX_TOKENS="${MAX_TOKENS}" \
+        BENCH_WARMUP_RUNS="${WARMUP_RUNS}" \
+        BENCH_MEASURED_RUNS="${MEASURED_RUNS}" \
+        BENCH_TEMPERATURE="${TEMPERATURE}" \
+        BENCH_SEED="${SEED}" \
+        BENCH_DRAFT_KIND="${DRAFT_KIND}" \
+        BENCH_TAG="${BENCH_TAG}" \
+        BENCH_PROMPT_CONTENT="${PROMPT_CONTENT}" \
+        BENCH_PROMPT_NAME="${PROMPT_NAME}" \
+        BENCH_RUN_CLASS="${RECORD_CLASS}" \
+        python3 - <<'PYEOF'
+import json, os
+
+config = os.environ["BENCH_CONFIG"]
+decode_tps = float(os.environ["BENCH_DECODE_TPS"])
+decode_tps_stddev = float(os.environ["BENCH_DECODE_TPS_STDDEV"])
+spec = dict(
+    line.split("=", 1)
+    for line in os.environ["BENCH_SPEC_DATA"].splitlines()
+    if "=" in line
+)
+preview = os.environ["BENCH_PREVIEW"]
+kv_quant = os.environ["BENCH_KV_QUANT"]
+prompt_tokens = int(os.environ["BENCH_PROMPT_TOKENS"])
+answer = os.environ["BENCH_ANSWER"]
+answer_check = os.environ["BENCH_ANSWER_CHECK"]
+answer_notes = os.environ["BENCH_ANSWER_NOTES"]
+model_namespace = os.environ["BENCH_MODEL_NAMESPACE"]
+model_name = os.environ["BENCH_MODEL"]
+weight_quant = os.environ["BENCH_WEIGHT_QUANT"]
+ctx_max = int(os.environ["BENCH_CTX_MAX"])
+ts_utc = os.environ["BENCH_TS_UTC"]
+git_sha = os.environ["BENCH_GIT_SHA"]
+hardware_tag = os.environ["BENCH_HARDWARE_TAG"]
+max_tokens = int(os.environ["BENCH_MAX_TOKENS"])
+warmup_runs = int(os.environ["BENCH_WARMUP_RUNS"])
+measured_runs = int(os.environ["BENCH_MEASURED_RUNS"])
+temperature = float(os.environ["BENCH_TEMPERATURE"])
+seed = int(os.environ["BENCH_SEED"])
+draft_kind = os.environ["BENCH_DRAFT_KIND"]
+bench_tag = os.environ.get("BENCH_TAG", "")
+tag_suffix = f" tag={bench_tag}" if bench_tag else ""
+# `answer_notes` is spaceless `key=value` pairs; none may spell a key the cell
+# reader looks for inside `notes` (`block_size=`, `config=`, `draft_kind=`).
+answer_check_notes = f"{answer_check} {answer_notes}" if answer_notes else answer_check
+
+prompt_content = os.environ["BENCH_PROMPT_CONTENT"]
+prompt_name = os.environ["BENCH_PROMPT_NAME"]
+prompt_body = [{"role": "user", "content": prompt_content}]
+
+# One name per figure the round loop reported, in the order they are derived.
+# The reader's key is the metric name, so a figure it stops reporting stops
+# being recorded rather than being recorded as a zero.
+SPEC_METRICS = (
+    ("accept_rate", "accept_rate", float),
+    ("draft_tokens_total", "draft_tokens_total", int),
+    ("accept_tokens_total", "accept_tokens_total", int),
+    ("draft_rounds_total", "rounds_total", int),
+    ("accepted_per_step", "accepted_per_step", float),
+    ("tokens_per_round", "tokens_per_round", float),
+    ("draft_ms_per_round", "draft_ms_per_round", float),
+    ("verify_ms_per_round", "verify_ms_per_round", float),
+    ("loop_ms_per_round", "loop_ms_per_round", float),
+)
+
+metrics = [
+    {"name": "decode_tps_warm", "value": decode_tps, "stddev": decode_tps_stddev}
+]
+if config == "normal":
+    # The no-drafter arm drafted nothing, which is a measured zero and not a
+    # missing value. It has no round loop, so it has no per-round figure at all.
+    metrics.append({"name": "draft_tokens_total", "value": 0})
+    decode_config = None
+    block_size = None
+else:
+    missing = [key for _, key, _ in SPEC_METRICS if key not in spec]
+    if missing:
+        raise SystemExit(
+            "serve_bench: the round-loop reader reported no "
+            + ", ".join(missing)
+            + " — refusing to file a speculative row without them"
+        )
+    metrics.extend(
+        {"name": name, "value": cast(spec[key])} for name, key, cast in SPEC_METRICS
+    )
+    decode_config = spec["decode_config"]
+    block_size = spec["block_size"]
+    # A charged run forces an evaluation at every phase boundary, draining a
+    # pipeline the round loop otherwise keeps full. Its decode_tps measures that
+    # engine and not this one. `observations` is append-only and `bests` is a
+    # view over it, so a charged row cannot be taken back out and would compete
+    # in its cell on a reading nobody wanted — and `--log info` below does not
+    # prevent it, because RUST_LOG takes precedence over the preset.
+    charged = spec["charged"]
+    if charged != "false":
+        raise SystemExit(
+            "serve_bench: the round loop reported charged=" + charged + " — this run "
+            "forced an evaluation at every phase boundary and its decode rate "
+            "describes a slower, differently scheduled engine. Unset RUST_LOG "
+            "(it overrides the --log info this script passes) and re-run; refusing "
+            "to file a row that an append-only store cannot take back out."
+        )
+
+obj = {
+    **json.loads(os.environ['RMLX_IDENTITY_JSON']),
+    # "unknown" is a fallback for the description label below, never
+    # provenance — a checkout without .git must not stamp git_sha at all.
+    **({"git_sha": git_sha} if not git_sha.startswith("unknown") else {}),
+    "model_namespace": model_namespace,
+    "model": model_name,
+    "weight_quant": weight_quant,
+    "kv_quant": kv_quant,
+    "ctx_max": ctx_max,
+    "prompt": {
+        "name": prompt_name,
+        "body": prompt_body,
+    },
+    # The bests cell key partitions on this: a speculative arm is a different
+    # configuration, not a better measurement of the plain-decode one. The
+    # round loop composed it and named it on its own `done` line; spelling it
+    # again here is how one configuration ends up in two cells.
+    "decode_config": decode_config,
+    "ts_utc": ts_utc,
+    "prompt_tokens": prompt_tokens,
+    "max_tokens": max_tokens,
+    "temperature": temperature,
+    "seed": seed,
+    "n_warmups": warmup_runs,
+    "n_measure": measured_runs,
+    "output_first_64": preview,
+    # `decode_window` names where this row's decode_tps_warm came from, so rows
+    # written while the script derived a prefill-inclusive rate of its own stay
+    # tellable apart from rows that carry the measured window
+    # (docs/METRICS_SCHEMA.md, "Known-bad rows already in the DB").
+    "notes": (
+        f"config={config} draft_kind=none{tag_suffix} decode_window=engine_itl "
+        f"answer_check={answer_check_notes} answer={answer}"
+        if config == "normal"
+        # `block_size` is the block the engine ran, which a sidecar can cap
+        # below the one asked for.
+        else f"config={config} draft_kind={draft_kind} "
+        f"block_size={block_size} charged={charged}{tag_suffix} "
+        f"decode_window=engine_round_loop "
+        f"answer_check={answer_check_notes} answer={answer}"
+    ),
+    "description": f"spec_bench {config} sha={git_sha}",
+    "run_class": os.environ["BENCH_RUN_CLASS"],
+    "metrics": metrics,
+}
+print(json.dumps(obj))
+PYEOF
+    )
+
+    local ts_tag
+    ts_tag="$(date -u +"%Y%m%dT%H%M%S%3N")"
+    local pid=$$
+    local buf_file="${BUFFER_DIR}/${ts_tag}-${pid}-${config}.json"
+
+    if $DRY_RUN; then
+        echo "  [dry-run] would write buffer: ${buf_file}" >&2
+        echo "  [dry-run] record: $(echo "${record_json}" | python3 -c "import sys,json; d=json.load(sys.stdin); d['metrics']=d.get('metrics',[]); print('model='+d['model'], 'kv_quant='+d['kv_quant'], 'metrics_count='+str(len(d['metrics'])))")" >&2
+        return 0
+    fi
+
+    if [[ -z "${record_json}" ]]; then
+        echo "  ERROR: record_json is empty; skipping ingest for config=${config}" >&2
+        return 1
+    fi
+
+    echo "${record_json}" > "${buf_file}"
+    if [[ "${CLIENT_CLOCK}" != "client" ]]; then
+        echo "  [not filed] --server-stamps: the client rate is the stub's own stamps, so" \
+             "this row is not a measurement: ${buf_file}" >&2
+        echo "${buf_file}"
+        return 0
+    fi
+    echo "  [ingest] buffer: ${buf_file}" >&2
+
+    echo "${buf_file}"
+    RMLX_HOME="${RMLX_HOME}" rmlx_record_file "${BINARY}" "${buf_file}" "${config}"
+}
+
+# The tool's exit status once every arm has run: RECORD_PENDING_EXIT if a record did not land.
+RECORD_STATUS=0
+
+# note_unrecorded <status of emit_and_ingest> — keep the reading and go on when only the
+# record was refused; any other failure ends the run.
+note_unrecorded() {
+    [[ "$1" -eq "${RECORD_PENDING_EXIT}" ]] || exit "$1"
+    RECORD_STATUS="${RECORD_PENDING_EXIT}"
+}
+
+# ── Phase 1: normal decode ─────────────────────────────────────────────────────
+
+echo "==> Phase 1: normal decode (no drafter)"
+echo ""
+
+snapshot_logs
+
+echo "  [server] starting..." >&2
+RMLX_HOME="${RMLX_HOME}" \
+RMLX_LOG_CAP_MB=200 \
+    "${BINARY}" serve \
+        --model "${VERIFIER_MODEL}" \
+        ${KV_QUANT_ARGS[@]+"${KV_QUANT_ARGS[@]}"} \
+        --max-ctx "${MAX_CTX}" \
+        --port "${PORT}" \
+        --log info \
+        > "${SCRATCH_DIR}/normal_stdout.txt" 2>&1 &
+
+SERVER_PID=$!
+LIVE_PID="${SERVER_PID}"
+echo "  [server] pid=${SERVER_PID}" >&2
+
+wait_for_server "${SERVER_PID}"
+
+echo "  [normal] warmup..." >&2
+for i in $(seq 1 ${WARMUP_RUNS}); do
+    measured_request "${SCRATCH_DIR}/warmup_resp.txt" > /dev/null || true
+    echo "  [normal] warmup ${i} done" >&2
+    sleep 5
+done
+
+NORMAL_PASS_FILE="${SCRATCH_DIR}/normal_logprobs.json"
+if [[ -n "${DRAFTER_MODEL}" ]]; then
+    echo "  [normal] logprob pass..." >&2
+    NORMAL_PASS_ANSWER="$(logprob_pass normal "${NORMAL_PASS_FILE}")" || exit 1
+    sleep "${LOGPROB_PASS_PAUSE_S}"
+fi
+
+echo "  [normal] measured runs..." >&2
+NORMAL_ENGINE_TPS_VALUES=()
+NORMAL_CLIENT_TPS_VALUES=()
+NORMAL_ANSWER_DIGESTS=()
+NORMAL_PREVIEW=""
+
+for i in $(seq 1 ${MEASURED_RUNS}); do
+    echo "  [normal] measured run ${i}/${MEASURED_RUNS}..." >&2
+
+    RING_BEFORE="$(ring_len)"
+    RUN_BLOCK="$(measured_request "${SCRATCH_DIR}/normal_resp.txt")" || RUN_BLOCK=""
+    N_TOKENS="$(field_of "${RUN_BLOCK}" tokens)"
+    CLIENT_TPS="$(field_of "${RUN_BLOCK}" decode_tps)"
+    PREVIEW="$(field_of "${RUN_BLOCK}" preview)"
+    NORMAL_PROMPT_TOKENS="$(field_of "${RUN_BLOCK}" prompt_tokens)"
+
+    if [[ -z "${CLIENT_TPS}" ]]; then
+        echo "ERROR: normal run ${i} produced no measurable decode window" \
+             "(tokens=${N_TOKENS:-0}); response head:" >&2
+        head -c 200 "${SCRATCH_DIR}/normal_resp.txt" >&2 || true
+        kill "${SERVER_PID}" 2>/dev/null || true
+        exit 1
+    fi
+
+    # The no-drafter arm has no round-loop record, but the server times every
+    # generation's inter-token gaps and publishes the aggregate. That is the
+    # same window, measured by the engine, so this arm is comparable with the
+    # speculative one rather than being a client stopwatch beside it.
+    ENGINE_TPS="$(server_rate_after "${RING_BEFORE:-0}")" || ENGINE_TPS=""
+    if [[ -z "${ENGINE_TPS}" ]]; then
+        echo "ERROR: normal run ${i}: the server attributed no decode rate to it" >&2
+        kill "${SERVER_PID}" 2>/dev/null || true
+        exit 1
+    fi
+
+    echo "  [normal] run ${i}: tokens=${N_TOKENS} decode_tps=${ENGINE_TPS}" \
+         "(client-observed: ${CLIENT_TPS})" >&2
+
+    if [[ -z "${NORMAL_PROMPT_TOKENS}" ]]; then
+        echo "ERROR: normal run ${i}: the response carried no usage.prompt_tokens," \
+             "so the prompt length is not a measured fact" >&2
+        kill "${SERVER_PID}" 2>/dev/null || true
+        exit 1
+    fi
+
+    NORMAL_ENGINE_TPS_VALUES+=("${ENGINE_TPS}")
+    NORMAL_CLIENT_TPS_VALUES+=("${CLIENT_TPS}")
+    NORMAL_ANSWER_DIGESTS+=("$(field_of "${RUN_BLOCK}" answer_sha256)")
+    [[ -n "${PREVIEW}" ]] && NORMAL_PREVIEW="${PREVIEW}"
+    sleep 5
+done
+
+echo "  [server] killing pid=${SERVER_PID}" >&2
+kill "${SERVER_PID}" 2>/dev/null || true
+wait "${SERVER_PID}" 2>/dev/null || true
+LIVE_PID=""
+sleep 3
+
+NORMAL_LOG="$(phase_log "${SERVER_PID}")" || NORMAL_LOG=""
+if [[ -z "${NORMAL_LOG}" ]]; then
+    echo "ERROR: no run log in ${LOG_DIR} is attributable to the no-drafter" \
+         "server (pid ${SERVER_PID})" >&2
+    exit 1
+fi
+NORMAL_KV_QUANT="$(log_kv_quant "${NORMAL_LOG}")" || NORMAL_KV_QUANT=""
+echo "  [normal] resolved kv_quant=${NORMAL_KV_QUANT:-<unreported>}" >&2
+
+if [[ ${#NORMAL_ENGINE_TPS_VALUES[@]} -ne ${MEASURED_RUNS} ]]; then
+    echo "ERROR: ${#NORMAL_ENGINE_TPS_VALUES[@]} normal decode rates for" \
+         "${MEASURED_RUNS} measured runs" >&2
+    exit 1
+fi
+
+NORMAL_SAMPLED="$(log_sampled "${NORMAL_LOG}" "${REQUESTS_PER_PHASE}")" \
+    || NORMAL_SAMPLED=""
+if [[ -z "${NORMAL_SAMPLED}" ]]; then
+    echo "ERROR: normal: ${NORMAL_LOG} does not say whether the engine ran a" \
+         "sampler for these requests, so whether the two arms are two ways of" \
+         "computing one answer is not knowable" >&2
+    exit 1
+fi
+
+# What the plain arm answered is the reference the speculative arm is held to.
+# Greedy decode of one prompt is one answer, so an arm that answered three
+# different things has no reference to offer and the run stops here — before a
+# median is taken over runs that were not answering the same question. Under a
+# sampler they may differ with nothing wrong, and then there is no comparison to
+# make; the row says so rather than looking like one that was compared.
+NORMAL_ANSWER="$(one_answer ${NORMAL_ANSWER_DIGESTS[@]+"${NORMAL_ANSWER_DIGESTS[@]}"})"
+if [[ "${NORMAL_SAMPLED}" == "true" ]]; then
+    NORMAL_ANSWER_CHECK="sampled"
+elif [[ "${NORMAL_ANSWER}" == "varied" ]]; then
+    echo "ERROR: normal: the ${MEASURED_RUNS} measured runs of the no-drafter arm" \
+         "answered differently from each other (${NORMAL_ANSWER_DIGESTS[*]+${NORMAL_ANSWER_DIGESTS[*]}}) on a" \
+         "run the engine says it resolved no sampler for" >&2
+    exit 1
+else
+    NORMAL_ANSWER_CHECK="plain_repeatable"
+fi
+echo "  [normal] answer_check=${NORMAL_ANSWER_CHECK} answer=${NORMAL_ANSWER}" >&2
+
+NORMAL_MEDIAN_TPS=$(median ${NORMAL_ENGINE_TPS_VALUES[@]+"${NORMAL_ENGINE_TPS_VALUES[@]}"})
+NORMAL_STDDEV_TPS=$(stddev ${NORMAL_ENGINE_TPS_VALUES[@]+"${NORMAL_ENGINE_TPS_VALUES[@]}"})
+cross_check normal "${NORMAL_MEDIAN_TPS}" \
+    "$(median ${NORMAL_CLIENT_TPS_VALUES[@]+"${NORMAL_CLIENT_TPS_VALUES[@]}"})"
+
+echo "  [normal] median_tps=${NORMAL_MEDIAN_TPS} stddev=${NORMAL_STDDEV_TPS}" >&2
+
+# Ingest normal record.
+NORMAL_BUF_PATH=$(emit_and_ingest \
+    "normal" \
+    "${NORMAL_MEDIAN_TPS}" \
+    "${NORMAL_STDDEV_TPS}" \
+    "${NORMAL_PREVIEW}" \
+    "${NORMAL_KV_QUANT}" \
+    "${NORMAL_PROMPT_TOKENS}" \
+    "${NORMAL_ANSWER}" \
+    "${NORMAL_ANSWER_CHECK}") || note_unrecorded $?
+
+echo ""
+echo "==> Phase 1 complete. Median decode TPS: ${NORMAL_MEDIAN_TPS}"
+echo ""
+
+if [[ -z "${DRAFTER_MODEL}" ]]; then
+    echo "  normal : ${NORMAL_BUF_PATH:-(dry-run or failed)}"
+    echo "  stddev : ${NORMAL_STDDEV_TPS}"
+    echo "DB: ${DB_PATH}"
+    echo "Done."
+    exit "${RECORD_STATUS}"
+fi
+
+# Judge a speculative answer that differs from the no-drafter one, when no
+# sampler ran. Reads both phases' logprob passes, each held to the digest its
+# arm's measured runs produced: a pass that answered something else carries
+# margins of an answer nobody is judging. Sets MTP_ANSWER_CHECK and
+# MTP_ANSWER_NOTES for a near tie; every other outcome stops the run.
+judge_difference() {
+    local verdict_block verdict status want_status stderr_file="${SCRATCH_DIR}/spec_answer_stderr.txt"
+    if [[ "${MTP_ANSWER}" == "varied" ]]; then
+        echo "ERROR: ${DRAFT_KIND}: the ${MEASURED_RUNS} measured runs answered differently" \
+             "from each other (${MTP_ANSWER_DIGESTS[*]+${MTP_ANSWER_DIGESTS[*]}}) and differently from the" \
+             "no-drafter arm (${NORMAL_ANSWER}), with no sampler on either arm; there is" \
+             "no one speculative answer to judge" >&2
+        exit 1
+    fi
+    if [[ "${NORMAL_PASS_ANSWER}" != "${NORMAL_ANSWER}" ]]; then
+        echo "ERROR: normal: the logprob pass of the no-drafter arm answered" \
+             "'${NORMAL_PASS_ANSWER}' where its measured runs answered" \
+             "'${NORMAL_ANSWER}', so its margins are not those of the answer the" \
+             "${DRAFT_KIND} arm differs from (${MTP_ANSWER}) and the difference cannot be" \
+             "judged" >&2
+        exit 1
+    fi
+    if [[ "${MTP_PASS_ANSWER}" != "${MTP_ANSWER}" ]]; then
+        echo "ERROR: ${DRAFT_KIND}: the logprob pass of the speculative arm answered" \
+             "'${MTP_PASS_ANSWER}' where its measured runs answered" \
+             "'${MTP_ANSWER}', so the answer that differs from the no-drafter arm" \
+             "(${NORMAL_ANSWER}) is not the one the judge would read" >&2
+        exit 1
+    fi
+    status=0
+    verdict_block="$(RMLX_HOME="${RMLX_HOME}" "${BINARY}" eval spec-answer \
+        --plain "${NORMAL_PASS_FILE}" --spec "${MTP_PASS_FILE}" \
+        2> "${stderr_file}")" || status=$?
+    verdict="$(field_of "${verdict_block}" verdict)"
+    if [[ -z "${verdict}" ]]; then
+        echo "ERROR: ${DRAFT_KIND}: 'rmlx eval spec-answer' exited ${status} with no" \
+             "verdict, so the difference from the no-drafter arm cannot be judged;" \
+             "stderr ends:" >&2
+        tail -n 3 "${stderr_file}" >&2 || true
+        exit 1
+    fi
+    # The exit status is the verdict's other spelling: 0 near tie, 1 refused, 2
+    # cannot judge. A pair that disagree is a judge this script does not know.
+    case "${verdict}" in
+        near_tie) want_status=0 ;;
+        refused) want_status=1 ;;
+        unjudgeable) want_status=2 ;;
+        *) want_status=-1 ;;
+    esac
+    if [[ "${status}" != "${want_status}" ]]; then
+        echo "ERROR: ${DRAFT_KIND}: 'rmlx eval spec-answer' exited ${status} but said" \
+             "verdict=${verdict}, so the difference from the no-drafter arm cannot be" \
+             "judged" >&2
+        exit 1
+    fi
+    case "${verdict}" in
+        near_tie)
+            MTP_ANSWER_CHECK="near_tie@$(field_of "${verdict_block}" position)"
+            MTP_ANSWER_NOTES="divergence_rank=$(field_of "${verdict_block}" rank)"
+            MTP_ANSWER_NOTES+=" divergence_margin=$(field_of "${verdict_block}" margin)"
+            echo "  [spec] $(field_of "${verdict_block}" reason)" >&2
+            ;;
+        refused)
+            echo "ERROR: ${DRAFT_KIND}: the answer differs from the no-drafter arm and the" \
+                 "difference is not a near tie: $(field_of "${verdict_block}" reason);" \
+                 "a greedy speculative loop emits the verifier's own argmax, so this arm" \
+                 "answered a different question and its throughput is not a rate for" \
+                 "this one" >&2
+            exit 1
+            ;;
+        *)
+            echo "ERROR: ${DRAFT_KIND}: the difference from the no-drafter arm cannot" \
+                 "be judged: $(field_of "${verdict_block}" reason)" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# ── Phase 2: speculative decode ──────────────────────────────────────────────
+
+echo "==> Phase 2: speculative decode (draft_kind=${DRAFT_KIND} block_size=${DRAFT_BLOCK_SIZE:-engine})"
+echo ""
+
+snapshot_logs
+
+echo "  [server] starting speculative server..." >&2
+RMLX_HOME="${RMLX_HOME}" \
+RMLX_LOG_CAP_MB=200 \
+    "${BINARY}" serve \
+        --model "${VERIFIER_MODEL}" \
+        --draft-model "${DRAFTER_MODEL}" \
+        --draft-kind "${DRAFT_KIND}" \
+        ${DRAFT_BLOCK_ARGS[@]+"${DRAFT_BLOCK_ARGS[@]}"} \
+        ${KV_QUANT_ARGS[@]+"${KV_QUANT_ARGS[@]}"} \
+        --max-ctx "${MAX_CTX}" \
+        --port "${PORT}" \
+        --log info \
+        > "${SCRATCH_DIR}/mtp_stdout.txt" 2>&1 &
+
+SERVER_PID=$!
+LIVE_PID="${SERVER_PID}"
+echo "  [server] pid=${SERVER_PID}" >&2
+
+wait_for_server "${SERVER_PID}"
+
+echo "  [spec] warmup..." >&2
+for i in $(seq 1 ${WARMUP_RUNS}); do
+    measured_request "${SCRATCH_DIR}/warmup_resp.txt" > /dev/null || true
+    echo "  [spec] warmup ${i} done" >&2
+    sleep 5
+done
+
+echo "  [spec] logprob pass..." >&2
+MTP_PASS_FILE="${SCRATCH_DIR}/mtp_logprobs.json"
+MTP_PASS_ANSWER="$(logprob_pass "${DRAFT_KIND}" "${MTP_PASS_FILE}")" || exit 1
+sleep "${LOGPROB_PASS_PAUSE_S}"
+
+echo "  [spec] measured runs..." >&2
+MTP_CLIENT_TPS_VALUES=()
+MTP_ANSWER_DIGESTS=()
+MTP_PREVIEW=""
+
+for i in $(seq 1 ${MEASURED_RUNS}); do
+    echo "  [spec] measured run ${i}/${MEASURED_RUNS}..." >&2
+
+    RUN_BLOCK="$(measured_request "${SCRATCH_DIR}/mtp_resp.txt")" || RUN_BLOCK=""
+    N_TOKENS="$(field_of "${RUN_BLOCK}" tokens)"
+    CLIENT_TPS="$(field_of "${RUN_BLOCK}" decode_tps)"
+    PREVIEW="$(field_of "${RUN_BLOCK}" preview)"
+    MTP_PROMPT_TOKENS="$(field_of "${RUN_BLOCK}" prompt_tokens)"
+
+    if [[ -z "${CLIENT_TPS}" ]]; then
+        echo "ERROR: spec run ${i} produced no measurable decode window" \
+             "(tokens=${N_TOKENS:-0}); response head:" >&2
+        head -c 200 "${SCRATCH_DIR}/mtp_resp.txt" >&2 || true
+        kill "${SERVER_PID}" 2>/dev/null || true
+        exit 1
+    fi
+
+    echo "  [spec] run ${i}: tokens=${N_TOKENS} client_decode_tps=${CLIENT_TPS}" >&2
+
+    if [[ -z "${MTP_PROMPT_TOKENS}" ]]; then
+        echo "ERROR: spec run ${i}: the response carried no usage.prompt_tokens," \
+             "so the prompt length is not a measured fact" >&2
+        kill "${SERVER_PID}" 2>/dev/null || true
+        exit 1
+    fi
+
+    MTP_CLIENT_TPS_VALUES+=("${CLIENT_TPS}")
+    MTP_ANSWER_DIGESTS+=("$(field_of "${RUN_BLOCK}" answer_sha256)")
+    [[ -n "${PREVIEW}" ]] && MTP_PREVIEW="${PREVIEW}"
+    sleep 5
+done
+
+echo "  [server] killing speculative server pid=${SERVER_PID}" >&2
+kill "${SERVER_PID}" 2>/dev/null || true
+wait "${SERVER_PID}" 2>/dev/null || true
+LIVE_PID=""
+sleep 3
+
+# The log this phase's server created. No fallback to "the newest one": a
+# different file would be read as this run's, and every number taken from it
+# would be somebody else's with nothing to show for it.
+sleep 2  # let log flush
+MTP_LOG="$(phase_log "${SERVER_PID}")" || MTP_LOG=""
+if [[ -z "${MTP_LOG}" ]]; then
+    echo "ERROR: no run log in ${LOG_DIR} is attributable to the speculative server" \
+         "(pid ${SERVER_PID})" >&2
+    exit 1
+fi
+
+echo "  [spec] parsing spec metrics from: ${MTP_LOG}" >&2
+
+MTP_KV_QUANT="$(log_kv_quant "${MTP_LOG}")" || MTP_KV_QUANT=""
+echo "  [spec] resolved kv_quant=${MTP_KV_QUANT:-<unreported>}" >&2
+
+# Round counts, draft/accept totals and the engine's own decode rate all come
+# off the round-loop `done` line, and scripts/lib/spec_round_log.py is the only
+# thing that reads it. Every request served against this log left one event, so
+# the total is the warmups plus the measured runs; anything else means the
+# events that survive do not line up with the runs being measured, and the last
+# MEASURED_RUNS of them are somebody else's.
+if ! MTP_SPEC_DATA=$(python3 "${REPO_ROOT}/scripts/lib/spec_round_log.py" \
+        "${MTP_LOG}" \
+        --expect-total "${REQUESTS_PER_PHASE}" \
+        --last "${MEASURED_RUNS}"); then
+    echo "ERROR: no usable speculative round-loop record in ${MTP_LOG}" >&2
+    exit 1
+fi
+
+echo "  [spec] spec metrics: $(echo "${MTP_SPEC_DATA}" | tr '\n' ' ')" >&2
+
+# Read back only for the comparison table below — the record itself takes the
+# whole block, so the two cannot describe different runs.
+MTP_DRAFT_TOTAL="$(field_of "${MTP_SPEC_DATA}" draft_tokens_total)"
+MTP_ACCEPT_RATE="$(field_of "${MTP_SPEC_DATA}" accept_rate)"
+MTP_ACCEPTED_PER_STEP="$(field_of "${MTP_SPEC_DATA}" accepted_per_step)"
+MTP_TOKENS_PER_ROUND="$(field_of "${MTP_SPEC_DATA}" tokens_per_round)"
+MTP_LOOP_MS_PER_ROUND="$(field_of "${MTP_SPEC_DATA}" loop_ms_per_round)"
+MTP_DECODE_CONFIG="$(field_of "${MTP_SPEC_DATA}" decode_config)"
+
+# The engine measures the speculative decode rate over the window from the first
+# emitted token to the last and reports it per request; the script's job is to
+# aggregate those, not to derive a rate of its own. An `emitted / elapsed_ms`
+# off the same line would count the prefill and read low.
+MTP_ENGINE_TPS_VALUES=()
+while IFS= read -r rate; do
+    MTP_ENGINE_TPS_VALUES+=("${rate}")
+done < <(echo "${MTP_SPEC_DATA}" | sed -n 's/^decode_tps=//p')
+
+if [[ ${#MTP_ENGINE_TPS_VALUES[@]} -ne ${MEASURED_RUNS} ]]; then
+    echo "ERROR: the round loop reported ${#MTP_ENGINE_TPS_VALUES[@]} measurable" \
+         "decode rates for ${MEASURED_RUNS} measured runs in ${MTP_LOG}" >&2
+    exit 1
+fi
+
+MTP_SAMPLED="$(log_sampled "${MTP_LOG}" "${REQUESTS_PER_PHASE}")" \
+    || MTP_SAMPLED=""
+if [[ -z "${MTP_SAMPLED}" ]]; then
+    echo "ERROR: ${DRAFT_KIND}: ${MTP_LOG} does not say whether the engine ran a" \
+         "sampler for these requests, so whether the two arms are two ways of" \
+         "computing one answer is not knowable" >&2
+    exit 1
+fi
+
+# A greedy speculative loop emits the verifier's own argmax at every position, so
+# with no sampler on either arm the two arms are two ways of computing one answer.
+# Equal digests are that. A difference is a near-tie flip or a defect in the loop,
+# and the oracle says which; anything it does not call a near tie stops the run
+# before the median: a rate measured while answering something else is not a
+# faster answer to the same question, and `observations` is append-only, so a row
+# filed here cannot be taken back out.
+MTP_ANSWER="$(one_answer ${MTP_ANSWER_DIGESTS[@]+"${MTP_ANSWER_DIGESTS[@]}"})"
+MTP_ANSWER_NOTES=""
+if [[ "${MTP_SAMPLED}" == "true" || "${NORMAL_SAMPLED}" == "true" ]]; then
+    MTP_ANSWER_CHECK="sampled"
+    echo "  [spec] answers not compared: the engine resolved a sampler (normal" \
+         "sampled=${NORMAL_SAMPLED}, ${DRAFT_KIND} sampled=${MTP_SAMPLED}), so the" \
+         "two arms are two draws and need not agree" >&2
+elif [[ "${MTP_ANSWER}" == "${NORMAL_ANSWER}" ]]; then
+    MTP_ANSWER_CHECK="matches_plain"
+else
+    judge_difference
+fi
+echo "  [spec] answer_check=${MTP_ANSWER_CHECK} answer=${MTP_ANSWER}" >&2
+
+MTP_MEDIAN_TPS=$(median ${MTP_ENGINE_TPS_VALUES[@]+"${MTP_ENGINE_TPS_VALUES[@]}"})
+MTP_STDDEV_TPS=$(stddev ${MTP_ENGINE_TPS_VALUES[@]+"${MTP_ENGINE_TPS_VALUES[@]}"})
+MTP_CLIENT_MEDIAN_TPS=$(median ${MTP_CLIENT_TPS_VALUES[@]+"${MTP_CLIENT_TPS_VALUES[@]}"})
+cross_check "${DRAFT_KIND}" "${MTP_MEDIAN_TPS}" "${MTP_CLIENT_MEDIAN_TPS}"
+
+echo "  [spec] median_tps=${MTP_MEDIAN_TPS} stddev=${MTP_STDDEV_TPS}" \
+     "(client-observed median: ${MTP_CLIENT_MEDIAN_TPS})" >&2
+
+MTP_BUF_PATH=$(emit_and_ingest \
+    "${DRAFT_KIND}" \
+    "${MTP_MEDIAN_TPS}" \
+    "${MTP_STDDEV_TPS}" \
+    "${MTP_PREVIEW}" \
+    "${MTP_KV_QUANT}" \
+    "${MTP_PROMPT_TOKENS}" \
+    "${MTP_ANSWER}" \
+    "${MTP_ANSWER_CHECK}" \
+    "${MTP_SPEC_DATA}" \
+    "${MTP_ANSWER_NOTES}") || note_unrecorded $?
+
+echo ""
+echo "==> Phase 2 complete. Median decode TPS: ${MTP_MEDIAN_TPS}"
+echo ""
+
+# ── Final SQL verify ──────────────────────────────────────────────────────────
+
+if ! $DRY_RUN; then
+    echo "==> DB verify (rows from last 30 minutes)"
+    sqlite3 "${DB_PATH}" \
+        "SELECT backend, model, kv_quant, metric, ROUND(value,3) as value
+         FROM observations
+         WHERE model='${MODEL_NAME}'
+           AND ts_utc >= datetime('now','-30 minutes')
+         ORDER BY metric, ts_utc;" \
+        2>/dev/null || echo "  (sqlite3 not available or DB empty)"
+    echo ""
+fi
+
+# ── Final comparison table ────────────────────────────────────────────────────
+
+TPS_DELTA=$(python3 -c "
+n=${NORMAL_MEDIAN_TPS}; m=${MTP_MEDIAN_TPS}
+if n > 0:
+    d = (m - n) / n * 100
+    sign = '+' if d >= 0 else ''
+    print(f'{sign}{d:.1f}%')
+else:
+    print('N/A')
+" 2>/dev/null || echo "N/A")
+
+NORMAL_SD_FMT=$(python3 -c "print(f'{float(\"${NORMAL_STDDEV_TPS}\"):.2f}')" 2>/dev/null || echo "${NORMAL_STDDEV_TPS}")
+MTP_SD_FMT=$(python3 -c "print(f'{float(\"${MTP_STDDEV_TPS}\"):.2f}')" 2>/dev/null || echo "${MTP_STDDEV_TPS}")
+
+echo "============================================================"
+echo "  SPEC BENCH RESULTS — ${MODEL_NAME}"
+echo "  answer check: ${MTP_ANSWER_CHECK}"
+echo "============================================================"
+SPEC_TABLE_FMT="%-14s  %-16s  %-12s  %-13s  %-14s  %-14s  %s\n"
+# shellcheck disable=SC2059  # the format lives in a variable on purpose
+printf "${SPEC_TABLE_FMT}" \
+    "Config" "decode_tps_warm" "accept_rate" "tokens/round" "accepted/step" "loop ms/round" "notes"
+# shellcheck disable=SC2059
+printf "${SPEC_TABLE_FMT}" \
+    "------" "---------------" "-----------" "------------" "-------------" "-------------" "-----"
+# shellcheck disable=SC2059
+printf "${SPEC_TABLE_FMT}" \
+    "normal" \
+    "$(printf '%.2f' "${NORMAL_MEDIAN_TPS}")" \
+    "N/A" "N/A" "N/A" "N/A" \
+    "baseline (±${NORMAL_SD_FMT})"
+# shellcheck disable=SC2059
+printf "${SPEC_TABLE_FMT}" \
+    "${MTP_DECODE_CONFIG}" \
+    "$(printf '%.2f' "${MTP_MEDIAN_TPS}")" \
+    "$(printf '%.4f' "${MTP_ACCEPT_RATE}")" \
+    "$(printf '%.3f' "${MTP_TOKENS_PER_ROUND}")" \
+    "$(printf '%.3f' "${MTP_ACCEPTED_PER_STEP}")" \
+    "$(printf '%.2f' "${MTP_LOOP_MS_PER_ROUND}")" \
+    "${TPS_DELTA} vs normal (±${MTP_SD_FMT}), ${MTP_DRAFT_TOTAL} drafted"
+echo "============================================================"
+echo ""
+echo "Buffer files:"
+[[ -n "${NORMAL_BUF_PATH}" ]] && echo "  normal : ${NORMAL_BUF_PATH}" || echo "  normal : (dry-run or failed)"
+[[ -n "${MTP_BUF_PATH}" ]] && echo "  spec   : ${MTP_BUF_PATH}" || echo "  spec   : (dry-run or failed)"
+echo ""
+echo "Logs:"
+echo "  normal server : ${SCRATCH_DIR}/normal_stdout.txt"
+echo "  spec server   : ${SCRATCH_DIR}/mtp_stdout.txt"
+[[ -n "${MTP_LOG}" ]] && echo "  spec run log  : ${MTP_LOG}"
+echo ""
+echo "DB: ${DB_PATH}"
+echo "Done."
+exit "${RECORD_STATUS}"

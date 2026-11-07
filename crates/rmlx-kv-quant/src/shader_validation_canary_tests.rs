@@ -1,6 +1,6 @@
 //! The gate's positive control.
 //!
-//! Run by `scripts/run_gpu_tests.sh` before it trusts a clean scan, never as
+//! Run by `scripts/suite/run_gpu_tests.sh` before it trusts a clean scan, never as
 //! part of the correctness suite — the runner excludes this name from the
 //! population it derives from the ignore-rule classifier.
 
@@ -8,7 +8,7 @@ use super::{dispatch_out_of_bounds_store, shader_validation_enabled};
 use rmlx_mlx::Device;
 
 #[test]
-#[ignore = "drives the GPU; run serialized via scripts/run_gpu_tests.sh"]
+#[ignore = "drives the GPU; run serialized via scripts/suite/run_gpu_tests.sh"]
 fn shader_validation_canary_emits_an_invalid_access_report() {
     // Refuses to dispatch uninstrumented. With validation on the store is
     // caught and dropped; without it, this would be a genuine out-of-bounds

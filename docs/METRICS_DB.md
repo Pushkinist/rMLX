@@ -70,8 +70,8 @@ error; a space inside a label is kept. `rmlx baseline`, `rmlx eval` and
 (`model_namespace`, `model` and the §5.2 `weight_quant`) before loading the
 model, so a refusal costs seconds and not the run.
 
-The Python ingesters (`scripts/ingest/llama_bench_ingest.py`,
-`codec_inertness_ingest.py`) split with `split_model_dir` in
+The Python ingest modes (`scripts/ingest/ingest.py llama-bench` and
+`codec-inertness`) split with `split_model_dir` in
 `scripts/lib/snapshot_identity.py`, reading only the snapshot directory name
 and never an ancestor. Before this rule they filed an unlisted namespace as
 `local/<name>`; new rows file as `<namespace>/<model>`, a separate `bests`
@@ -353,8 +353,6 @@ locked or missing DB.
 - `rmlx baseline --record` and `rmlx eval ppl` ingest in-process and delete
   the file on success. On failure they leave it in `pending/` and exit
   non-zero, naming the file, after printing the measurement.
-- A script that calls `record --file` moves a rejected file to
-  `buffer/failed/` for triage (`scripts/perf-iter/bench_decode_tps.sh`).
 - `rmlx metrics record --replay-pending` walks `pending/` in name order. It
   deletes each file that ingests and moves each one that fails to
   `buffer/failed/`. A file that states no class fails unless `--run-class`
@@ -433,7 +431,7 @@ rules: `RunRecord::validate` refuses it, and a row written around the
 recorder stores `NULL`, which is not `gate` (`METRICS_SCHEMA.md` §3.2).
 Producers outside this repo state it too: the Cross-Backend-Bench runner
 (`../Cross-Backend-Bench/runners/_common.py`, `_build_metrics_record`), which
-`scripts/bench_cell.sh` hands its non-rMLX cells to, writes `gate`.
+`scripts/bench/cross_backend.sh` hands its non-rMLX cells to, writes `gate`.
 
 **Optional keys**: `schema_version` (default `1`), `backend_version`,
 `git_sha`, `build_profile`, `prompt_tokens`, `max_tokens`, `temperature`,
@@ -500,8 +498,7 @@ supplies:
   (`rmlx_git_sha` in `scripts/lib/identity.sh`). A hex sha that resolves in
   that repo is filed in the short form HEAD is filed in; any other value is
   filed as given, and an `unknown...` value counts as none. This covers
-  `spec_bench.sh`, `ssd_canary.sh`, `perf_canary.sh`, `bench_cell.sh`,
-  `bench_cache_types.sh` and `perf-iter/bench_decode_tps.sh`.
+  `bench/serve_bench.sh`, `bench/ssd_canary.sh` and `bench/baseline_cells.sh`.
 - `rmlx baseline --git-sha <sha>` and `rmlx eval ppl --git-sha <sha>` stamp
   it. Without the flag it is `NULL`.
 
@@ -741,10 +738,10 @@ change to what `bests` publishes, such as a `METRICS_SCHEMA.md` §4.1 bounds cha
     never from a literal (§8.5.1).
 21. **Record every measurement run, under its class** (§8.5). `gate`: a
     canary, a release gate, the surviving arm of an A/B recorded once.
-    `ab_arm`: every A/B slot; `scripts/perf_ab.sh` records each slot, and
-    `scripts/bench_llama_ab.sh` each arm's medians. `diagnostic`: profiling,
+    `ab_arm`: every A/B slot; `scripts/bench/ab.sh` records each slot, and
+    `scripts/bench/llama_ab.sh` each arm's medians. `diagnostic`: profiling,
     traced and investigation runs, among them the canary's warmup and
-    measured calls, a GPU capture, a codec probe and the server's live
+    measured calls, a GPU capture, an inertness sweep and the server's live
     requests. Only `gate` rows reach `bests`, the gates and the exports.
     Bring a scratch DB's rows in with `rmlx metrics import` (§11). Not
     recorded, and why:
@@ -753,15 +750,16 @@ change to what `bests` publishes, such as a `METRICS_SCHEMA.md` §4.1 bounds cha
     - A run that measured nothing: the canary's one-token codec probe, a
       failed or skipped bench cell. The recorder refuses a record with no
       measurement.
-    - The `rmlx baseline` runs of a `scripts/bench_cell.sh` cache-type cell,
-      and the `rmlx bench` slots of `scripts/prefill_chunk_sweep.sh`: each
-      set is recorded once, as the aggregate the script computes.
-    - `scripts/schema_constraint_canary.sh`: a correctness proof run under
+    - The `rmlx baseline` runs of a `bench/baseline_cells.sh --preset
+      cache-types` cell, and the `rmlx bench` slots of
+      `scripts/bench/prefill_chunk_sweep.sh`: each set is recorded once, as the
+      aggregate the script computes.
+    - `scripts/bench/schema_constraint_canary.sh`: a correctness proof run under
       `--log verbose` in a hermetic `RMLX_HOME` per probe, so that probe's
       log holds its own records only. It measures no rate.
-    - A `scripts/mst_capture.sh` run its `--time-limit` stops: `baseline`
+    - A `scripts/profile/capture.sh mst` run its `--time-limit` stops: `baseline`
       records at exit.
-    - A `scripts/perf_ab.sh` arm whose binary predates `--run-class`, and any
+    - A `scripts/bench/ab.sh` arm whose binary predates `--run-class`, and any
       `--synthetic-arms` run: an old binary cannot state a class, and a stub
       measures nothing.
 22. **A new rule, metric or backend** updates this doc or `METRICS_SCHEMA.md`,

@@ -27,7 +27,10 @@ the MLX that Homebrew links on the user's machine at run time.
   `packaging/homebrew/rmlx.rb`.
 - The binary reads `events.mlx_nax` from the metallib it loaded at run time
   (`crates/rmlx-mlx/src/nax.rs`), so the value describes the user's MLX.
-- Run `make mlx-preflight` on the release machine before building.
+- After building, run `target/release/rmlx healthcheck --human` and read its
+  `mlx_pin` line. It compares the MLX that dyld loads for that binary with the
+  pinned pair, so it reads the pair the shipped binary uses, not the pair an
+  installed `rmlx` loads.
 
 ## The tarball's target CPU
 
@@ -40,7 +43,7 @@ so it runs on every Apple Silicon Mac whatever chip built it. It is also
   `brew install`. `install.sh` runs `cargo install --git`, which reads no repo
   config and so builds for the default CPU. The tarball and a bottle build
   override the config.
-- `package_binary.sh` builds with `CARGO_ENCODED_RUSTFLAGS` from
+- `release.sh package` builds with `CARGO_ENCODED_RUSTFLAGS` from
   `scripts/release/release_cpu.py rustflags`: config.toml's flags, with its
   target CPU replaced by `apple-m1`. `-dead_strip` is carried over, not
   restated. A `target-feature` in config.toml is refused: the release binary
@@ -62,7 +65,7 @@ so it runs on every Apple Silicon Mac whatever chip built it. It is also
 - A dependency's panic location is an absolute source path, and under the
   build machine's home directory it carries the builder's user name. The
   release rustflags add `--remap-path-prefix=<home>=~`, and
-  `package_binary.sh` refuses to package a binary whose bytes still contain
+  `release.sh package` refuses to package a binary whose bytes still contain
   the home directory. The check compares every flag but the remap, which
   changes recorded paths and not code.
 - The archive is written with uid and gid 0, empty owner names and no
@@ -114,7 +117,7 @@ bypass — the ruleset's target is `main` alone, so a tag ref is outside it.
    ```sh
    gh release create v<version> \
      --title "rMLX <version>" \
-     --notes-file <(scripts/release/changelog_section.sh <version>)
+     --notes-file <(scripts/release/release.sh notes <version>)
    gh release upload v<version> \
      dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz \
      dist/rmlx-v<version>-aarch64-apple-darwin.tar.gz.sha256
@@ -132,7 +135,7 @@ bypass — the ruleset's target is `main` alone, so a tag ref is outside it.
      personal OIDC login writes the signer's email into the bundle's
      certificate and into the public Rekor log, which is why it is not used.
 8. **Formula.** `make release-sha` prints the sha256 of the `v<version>`
-   source archive. `bash scripts/release/source_sha256.sh --write` also
+   source archive. `bash scripts/release/release.sh sha --write` also
    patches `url` and `sha256` in `packaging/homebrew/rmlx.rb`.
    - GitHub builds the archive on first access. Fetch it two or three more
      times and check that the digest is stable.
@@ -143,9 +146,9 @@ bypass — the ruleset's target is `main` alone, so a tag ref is outside it.
 10. **Verify** the install paths (§Verify the install paths).
 11. **Restore the pin.** The install check can move this host off the pinned
     MLX pair: Homebrew upgrades `mlx` and `mlx-c` to bottles that lack the
-    NAX GEMM kernels. Run `make mlx-restore-pin`, then `make mlx-preflight`.
-    Preflight prints the pinned pair. Check it before any GPU run on this
-    host. See [Restoring the pair: `make mlx-restore-pin`](MLX_PAIR.md#restoring-the-pair-make-mlx-restore-pin).
+    NAX GEMM kernels. Run `make mlx-restore-pin`, rebuild, then read the
+    `mlx_pin` line of `rmlx healthcheck --human`. Check it before any GPU run
+    on this host. See [Restoring the pair: `make mlx-restore-pin`](MLX_PAIR.md#restoring-the-pair-make-mlx-restore-pin).
 12. **Retrospective** over the diff from the previous tag to the new one
     (§Retrospective).
 
@@ -155,7 +158,7 @@ bypass — the ruleset's target is `main` alone, so a tag ref is outside it.
 A bottle links the builder's `mlx-c`, while the formula's `mlx-c` is
 unversioned. A mismatched mlx / mlx-c pair fails at load with a dyld
 `Symbol not found` (`crates/rmlx-mlx/mlx-pin.txt`). `make bottle`
-(`scripts/release/build_bottle.sh`) builds a bottle; no release step
+(`scripts/release/release.sh bottle`) builds a bottle; no release step
 runs it.
 
 A bottle also runs on Macs other than the one that built it. Under
@@ -267,14 +270,14 @@ The checklist:
    over both trees, and compare. A new file or fn pair in the report is a
    finding. It gets a const-generic or trait issue.
    ```sh
-   bash scripts/debt_report.sh --root ../rmlx-retro-prev > .rmlx/tmp/retro-prev.txt
-   bash scripts/debt_report.sh --root ../rmlx-retro-new --since "$PREV" > .rmlx/tmp/retro-new.txt
+   python3 scripts/report/debt_report.py --root ../rmlx-retro-prev > .rmlx/tmp/retro-prev.txt
+   python3 scripts/report/debt_report.py --root ../rmlx-retro-new --since "$PREV" > .rmlx/tmp/retro-new.txt
    diff .rmlx/tmp/retro-prev.txt .rmlx/tmp/retro-new.txt
-   pops=$(python3 -c 'import sys; sys.path.insert(0, "scripts/lib"); import debt_report; print(*sorted(debt_report.MATCHED_LINES_POPULATIONS))')
+   pops=$(python3 -c 'import sys; sys.path.insert(0, "scripts/report"); import debt_report; print(*sorted(debt_report.MATCHED_LINES_POPULATIONS))')
    for tree in prev new; do
      for p in $pops; do
        printf '%s: ' "$p"
-       bash scripts/debt_report.sh --root "../rmlx-retro-$tree" --matched-lines "$p" 2>&1 | tail -1
+       python3 scripts/report/debt_report.py --root "../rmlx-retro-$tree" --matched-lines "$p" 2>&1 | tail -1
      done > ".rmlx/tmp/retro-lines-$tree.txt"
    done
    diff .rmlx/tmp/retro-lines-prev.txt .rmlx/tmp/retro-lines-new.txt
@@ -366,12 +369,7 @@ git worktree remove ../rmlx-retro-new
 |---|---|
 | `CHANGELOG.md` | Release notes (Keep a Changelog); the release body |
 | `packaging/homebrew/rmlx.rb` | The formula; the tap holds a copy |
-| `scripts/release/package_binary.sh` | `make release-package` |
+| `scripts/release/release.sh` | The six release steps: `package` (`make release-package`), `sign [KEY]` (`make release-sign`), `sha [--write]` (`make release-sha`; `--write` patches the formula), `bottle` (`make bottle`; not part of the release flow), `tap-sync [DIR]` (`make tap-sync`), `notes [VER]` (prints one version's changelog section; refuses a version with none) |
 | `scripts/release/release_cpu.py` | The tarball's rustflags, and the check of its target CPU |
 | `scripts/release/release_cpu_selftest.sh` | `make release-cpu-selftest` |
-| `scripts/release/sign_artifact.sh` | `make release-sign` |
 | `cosign.pub` | The public half of the release signing key |
-| `scripts/release/source_sha256.sh` | `make release-sha`; `--write` patches the formula |
-| `scripts/release/sync_tap.sh` | `make tap-sync` |
-| `scripts/release/changelog_section.sh` | Prints one version's changelog section |
-| `scripts/release/build_bottle.sh` | `make bottle`; not part of the release flow |

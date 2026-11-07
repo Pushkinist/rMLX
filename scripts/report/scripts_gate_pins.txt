@@ -1,0 +1,143 @@
+# Accepted violations of the scripts/ rules: `<rule> <path> [<members>]`; a pin only shrinks.
+#
+# A pin accepts every violation of that rule in that file. Fix the file and delete its
+# line: a pin whose file now passes fails the gate (`pin-stale`). A rule whose violation
+# is a set pins the set (`exit-undeclared` the codes, `recall-missing` and `silenced` the modes, `lib-run`
+# the sites, `dead-path` the tokens, `name` the hyphen and the root variables, `lib-shadow`
+# the functions, `env-knob` the variables, `unguarded-array` the arrays); a rule whose violation is a measure pins the
+# measure (`size` the line count, `heredoc` the lengths of the over-limit bodies, `twin` the
+# matched lines of a pair written `<a>+<b>`, `binary-literal` the site count). A measure that
+# grew fails its `-pin` rule; one that shrank asks for the pin to be lowered.
+# Never pin a new file, a new member or a larger measure.
+#
+# pinnable: class purpose usage exit-undeclared caller recall-missing silenced lib-consumers lib-run shebang exec-bit dead-path set-mode name size heredoc twin lib-shadow binary-literal env-knob unguarded-array
+purpose bench/codec_matrix/runner_selftest.sh
+purpose lib/record_pending.sh
+usage bench/llama_ab.sh
+usage bench/llama_ab_selftest.sh
+usage check/eval_lock.sh
+usage check/gpu_device_census_selftest.sh
+usage bench/codec_matrix/runner_selftest.sh
+usage bench/wikitext2_ppl.py
+usage suite/eval_lock_stress.sh
+usage lib/published_run_log.py
+usage lib/run_log_for_pid.py
+usage lib/server_kv_quant.py
+usage lib/server_sampling.py
+usage lib/snapshot_identity.py
+usage lib/spec_round_log.py
+usage bench/ab.sh
+usage release/release_cpu.py
+usage release/release_cpu_selftest.sh
+usage suite/run_gpu_tests.sh
+usage suite/run_gpu_tests_selftest.sh
+usage bench/schema_constraint_canary.sh
+usage bench/serve_bench_selftest.sh
+usage spec/broken_engine.sh
+usage spec/round_stream_compare.py
+usage spec/round_stream_compare_selftest.sh
+exit-undeclared profile/aggregate_decode_profile.py 2
+exit-undeclared bench/llama_ab.sh 0,4,125
+exit-undeclared bench/llama_ab_selftest.sh 1
+exit-undeclared check/eval_lock.sh 1
+exit-undeclared check/gpu_device_census.sh 2
+exit-undeclared bench/codec_matrix/runner_selftest.sh 0,1
+exit-undeclared bench/wikitext2_ppl.py 1
+exit-undeclared suite/eval_lock_stress.sh 1
+exit-undeclared gen/lloyd_codebook.py 1
+exit-undeclared bench/ab.sh 0,1,125
+exit-undeclared bench/codec_matrix/runner.sh 0,1,2,3
+exit-undeclared bench/codec_matrix/niah_long_context.sh 1,2
+exit-undeclared suite/run_gpu_tests.sh 0,1
+exit-undeclared bench/serve_bench_selftest.sh 1,2
+exit-undeclared spec/broken_engine.sh 2,3
+exit-undeclared spec/round_stream_compare.py 2
+exit-undeclared spec/round_stream_compare_selftest.sh 1
+exit-undeclared bench/ssd_canary_selftest.sh 2
+caller profile/aggregate_decode_profile.py
+caller gen/lloyd_codebook.py
+caller bench/codec_matrix/niah_long_context.sh
+caller bench/sdpa_headdim.py
+caller spec/broken_engine.sh
+recall-missing bench/llama_ab_selftest.sh default
+recall-missing bench/codec_matrix/runner_selftest.sh default
+silenced published/table.py default
+silenced report/debt_report.py --file-sizes,default
+lib-consumers lib/run_log_for_pid.py
+lib-run lib/published_run_log.py published/bench.sh
+lib-run lib/run_log_for_pid.py lib/bench_server.sh
+lib-run lib/server_kv_quant.py lib/bench_server.sh,bench/ssd_canary.sh
+lib-run lib/server_sampling.py bench/serve_bench.sh
+lib-run lib/snapshot_identity.py bench/serve_bench.sh,published/bench.sh
+lib-run lib/spec_round_log.py bench/serve_bench.sh
+lib-run lib/sse_decode_window.py bench/serve_bench.sh,bench/serve_bench_selftest.sh,published/bench.sh
+shebang lib/snapshot_identity.py
+shebang lib/record_pending.sh
+exec-bit profile/perf_ceiling.py
+set-mode bench/cross_backend.sh
+set-mode bench/llama_ab.sh
+set-mode bench/llama_ab_selftest.sh
+set-mode check/gpu_device_census.sh
+set-mode bench/codec_matrix/runner_selftest.sh
+set-mode bench/ab.sh
+set-mode bench/prefill_chunk_sweep.sh
+set-mode bench/schema_constraint_canary.sh
+set-mode bench/serve_bench_selftest.sh
+set-mode spec/broken_engine.sh
+set-mode spec/round_stream_compare_selftest.sh
+name bench/llama_ab_selftest.sh ROOT
+name lib/kv_boundary_default.py _REPO_ROOT
+name profile/rmlx-capture.entitlements hyphen
+name suite/run_gpu_tests_selftest.sh ROOT
+name spec/broken_engine.sh ROOT
+size bench/ab.sh 1058
+size profile/perf_ceiling.py 1110
+size report/debt_report_selftest.sh 1598
+size report/kv_census_selftest.sh 1212
+size suite/run_gpu_tests.sh 1325
+size bench/serve_bench.sh 1225
+size published/bench.sh 1169
+size published/bench_selftest.sh 2830
+size bench/serve_bench_selftest.sh 2121
+size bench/ssd_canary.sh 1268
+heredoc bench/llama_ab.sh 30,27
+heredoc published/samples_selftest.sh 23
+heredoc ingest/ab_selftest.sh 29
+heredoc bench/prefill_chunk_sweep.sh 162
+heredoc ingest/published_selftest.sh 198
+heredoc published/table_selftest.sh 31
+heredoc report/debt_report_selftest.sh 26,24,24
+heredoc bench/schema_constraint_canary.sh 140,27
+heredoc bench/serve_bench.sh 139
+heredoc published/bench.sh 56
+heredoc published/bench_selftest.sh 33,23
+heredoc bench/ssd_canary.sh 65,50,38
+twin lib/published_run_log.py+lib/spec_round_log.py 42
+twin ingest/published_selftest.sh+published/table_selftest.sh 89
+twin ingest/published_selftest.sh+published/bench_selftest.sh 66
+twin bench/serve_bench_selftest.sh+ingest/published_selftest.sh 68
+twin published/bench_selftest.sh+published/table_selftest.sh 82
+twin bench/serve_bench_selftest.sh+published/table_selftest.sh 81
+twin bench/serve_bench.sh+published/bench.sh 51
+twin bench/serve_bench.sh+bench/ssd_canary.sh 98
+twin bench/serve_bench_selftest.sh+published/bench_selftest.sh 203
+binary-literal bench/wikitext2_ppl.py 2
+env-knob bench/cross_backend.sh CROSS_BENCH_ROOT,LLAMA_CPP_ROOT,LLAMA_CPP_TURBOQUANT_ROOT,MLX_LM_ROOT,MLX_LM_TURBOQUANT_ROOT,OMLX_ROOT,PAROQUANT_ROOT
+env-knob bench/llama_ab_selftest.sh FORCE_UNMEASURED_ROWS,NO_RECORD_ARGS
+env-knob bench/codec_matrix/runner_selftest.sh GATE_BIN
+env-knob suite/eval_lock_stress.sh RUNS,TIMEOUT_SECS
+env-knob lib/server_wait.sh PORT
+env-knob lib/cpu_snapshot.sh CPU_SNAPSHOT_MIN_ROWS,SYNTHETIC_ARMS
+env-knob lib/identity.sh RMLX_IDENTITY_JSON
+env-knob lib/kv_boundary_default.py RMLX_REPO_ROOT
+env-knob lib/selftest_support.sh TOOL
+env-knob host/mlx_restore_pin.sh HOMEBREW_PREFIX
+env-knob bench/ab.sh RMLX_O_MODELS_ROOT
+env-knob published/table_selftest.sh MAKE_ENV
+env-knob bench/codec_matrix/runner.sh RMLX_O_MODELS_ROOT
+env-knob suite/run_gpu_tests.sh RMLX_O_MODELS_ROOT,RMLX_SKIP_GPU
+env-knob bench/schema_constraint_canary.sh BONSAI_MODEL,GEMMA_E2B_MODEL,PORT,RMLX_O_MODELS_ROOT
+env-knob bench/serve_bench.sh PORT,RMLX_HARDWARE_TAG
+env-knob bench/serve_bench_selftest.sh OUT_PATH
+env-knob bench/ssd_canary.sh PORT,SSD_GB,VERIFIER_MODEL
+env-knob lib/rmlx_home.py RMLX_HOME

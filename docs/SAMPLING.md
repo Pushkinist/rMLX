@@ -280,7 +280,7 @@ over the steps that took the host path. A greedy run emits nothing.
 | `sample_share_pct` | `sample / step`. |
 
 `rmlx bench --temperature`, `--top-p`, `--top-k` and `--repetition-penalty`
-drive the path. `scripts/perf_canary.sh` is greedy-only and cannot see it.
+drive the path. `scripts/bench/baseline_cells.sh --preset canary` is greedy-only and cannot see it.
 
 `sample_share_pct` is not a bound in either direction:
 
@@ -419,7 +419,7 @@ Both engines refuse raw C0 control bytes inside any string, keys included
 before the root value. The `json_object` engine accepts it there, under the
 same cap.
 
-`make schema-constraint-canary` (`scripts/schema_constraint_canary.sh`) is the
+`make schema-constraint-canary` (`scripts/bench/schema_constraint_canary.sh`) is the
 real-model check, on Bonsai and gemma-4-e2b with two probes each. Its PASS and
 FAIL rule is fixed at the top of the script. `EXPECT=baseline` asserts a
 per-cell table, so a harness too weak to see a defect fails too. Each probe

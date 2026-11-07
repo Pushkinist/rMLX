@@ -11,7 +11,7 @@
 //! - Decoder: 1-layer LSTM (hidden=128) + 1x1 Conv + Sigmoid
 //!
 //! Weights are vendored in crates/rmlx-audio/assets/silero_vad_16k.safetensors.
-//! Convert script: scripts/convert_silero_vad.py (run once at asset-prep time).
+//! Convert script: scripts/gen/silero_vad.py (run once at asset-prep time).
 
 use rmlx_mlx::{
     add, conv1d, matmul, maximum, multiply, scalar_f32, sigmoid, sqrt, tanh, Array, Device, Dtype,

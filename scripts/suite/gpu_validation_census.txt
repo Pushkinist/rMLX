@@ -1,0 +1,215 @@
+# The Metal shader-validation hits suite/run_gpu_tests.sh accepts, per (kernel, kind, crate, test).
+#
+# `scripts/suite/run_gpu_tests.sh` instruments every Metal pipeline and scans for
+# invalid-access diagnostics. Some of them come from a kernel this repo neither
+# compiles nor can fix, and failing every run on those teaches their readers to
+# read `Error 1` as background noise — at which point the next real hit is
+# invisible. This file is what makes the two distinguishable.
+#
+# ONE ENTRY PER (KERNEL, KIND, CRATE, TEST), carrying that test's own hit count
+# for that kernel. A test that drives two instantiations of one template — two
+# checkpoints at different bit widths, say — therefore carries one entry per
+# instantiation, and the runner refuses a second entry for the same four.
+#
+# The runner expects, for a given (crate, kind, kernel), the sum of the counts
+# whose test actually ran in this run — a test the selection dropped, or one that
+# announced its own skip for want of a model, contributes 0. So a narrowed run
+# and a machine with no snapshots are compared exactly, against a smaller number,
+# rather than waived. Then:
+#
+#   * observed == expected, with no unpinned hit and no store, passes and prints
+#     the census it accepted;
+#   * a new kernel, a count above the expectation, a count below it, a kernel
+#     that stopped firing, a hit in a different crate, or any store at all,
+#     fails and names the delta.
+#
+# A count that came in low is a failure because a pin that drifts downward one
+# hit at a time ends up describing whatever the tree does today rather than what
+# was validated. Re-derive it from a full run instead.
+#
+# Fields, `|`-separated, six of them:
+#
+#   kernel    | the kernel function named in the diagnostic, verbatim
+#   kind      | the access as the layer worded it (`device load`); a store is
+#             | never pinnable — an invalid write is corruption, not a
+#             | validated-benign read, so the runner refuses such an entry
+#   count     | this test's own number of diagnostics. Derive it either by
+#             | running that test alone (`make gpu-test CRATE=<crate>
+#             | FILTER=<test>`), or by attributing a full run's diagnostics to
+#             | the test libtest last announced — the suite runs
+#             | `--test-threads=1 --nocapture`, so the `test <name> ... ` marker
+#             | is the running test until the next one. The second way is what
+#             | keeps a sum over entries equal to the total a full run prints.
+#             | `<=N` instead of a number is for a count that is not
+#             | reproducible, and for nothing else: any count from 0 to N
+#             | passes, and N is the largest count the named derivation runs
+#             | observed. An exact entry on the same kernel stays a floor,
+#             | but on the sum per (crate, kind, kernel): hits of the `<=N`
+#             | test can stand in for missing hits of the exact one. A `<=N`
+#             | entry has no stale verdict, so the runner's selftest holds
+#             | the number of them in this file (4).
+#             | A `<=N` entry is a waiver, not an analysis of a cause. It
+#             | still refuses a store, a kernel it does not name, a hit in
+#             | another crate or from another test, and a count above N.
+#             | It cannot see a fall to 0, the same count from another
+#             | cause, or a report that moves between two dispatches of
+#             | the named kernel in the named test.
+#   crate     | the workspace member the test belongs to
+#   test      | exactly one test fn name. It must be a classified GPU test, and
+#             | it must print a NAMED `SKIP <test>: <why>` notice when it skips,
+#             | or its count will be expected on a machine that cannot produce it
+#   reference | where the analysis lives that says this hit is benign
+#
+# The reference field is the one place in this repo where an issue link is
+# deliberate rather than forbidden: an accepted invalid access has to carry the
+# evidence that accepted it, the runtime output prints that field so the reader
+# never has to go looking, and a URL — unlike a bare ticket number — still
+# resolves once the ticket is out of anyone's working memory.
+#
+# TO ADD OR CHANGE AN ENTRY you need one of two things, and nothing else counts:
+# a linked upstream reference showing the defect is not ours and not reachable
+# into our output, or an analysis of the same standard as the one below —
+# provenance of the symbol, a load/store census over every diagnostic, and a
+# demonstration that the loaded lanes do not reach the output. Neither a passing
+# test suite nor a quiet run is evidence: the validation layer bounds the
+# MTLBuffer rather than the array, so absence of a diagnostic is not absence of
+# an out-of-bounds access.
+#
+# kernel | kind | count | crate | test | reference
+#
+# A GPU test that reaches a kernel no entry names, or that makes a load an
+# existing entry does not count — a new snapshot, a new shape, a longer sweep —
+# derives its own entry in the SAME change, from a run of its own. Landing it
+# without one moves the failure to the next `make ci-perf` on `main`, where it
+# arrives as a delta nobody can attribute. A reviewer checks the census line
+# against the test the change adds or touches.
+#
+# The entries below are MLX's own kernels, not ones this repo compiles or can
+# specialise. Every diagnostic is a device load; no store has been observed.
+#
+# NO SPLIT-K ENTRY. On MLX 0.31.2, 0.32.1 and 0.32.2 the `*_qmm_t_splitk_*`
+# kernels report: `QuantizedBlockLoader::load_safe` in
+# `mlx/backend/metal/kernels/quantized.h` bounds the row index of a transposed
+# weight against the tile's COLUMN extent, `bi >= src_tile_dim.x`, so a
+# transposed quantized matmul whose N is not a multiple of the output tile
+# width reads the out-of-range rows of the packed weight and the scales. MLX
+# 0.32.3, the pinned release, has one guard, `bi >= src_tile_dim.y`. The
+# derivation run below reported no split-K diagnostic in any crate, so this
+# file pins none. On an MLX before 0.32.3 each of them reads `not pinned`.
+# `rmlx-mlx`'s `split_k_tail_row_reads_never_reach_the_output` holds that
+# those rows never reach a kept column, on any MLX.
+#
+# IMPLICIT-GEMM CONV, `implicit_gemm_conv_2d_float32_*_channel_l_filter_s`. The
+# weight loader in `loader_channel_l.h` checks the output-channel bound only for
+# 8-wide N tiles (`if (BN != 8 || do_read)`); with a 64-wide tile a 96-channel
+# weight has its second tile read rows 96..127. Each output channel is computed
+# from its own weight row only and the store clips channels at or above 96.
+# `rmlx-mlx`'s `implicit_gemm_conv_tail_channel_reads_never_reach_the_output`
+# is bit-identical with the tail rows at NaN, +3e4 and -3e4.
+#
+# The hits in `rmlx-server` come from the Qwen3-TTS codec decoder, 3 for each
+# codec pass. A pass decodes at most 300 frames, so a synthesis of up to 300
+# frames is one pass and 3 hits. The two thread-boundary tests speak a text of
+# one pass: they run their steps once on one thread for the oracle and once
+# across two threads (2 syntheses and 6 hits, 4 syntheses and 12). The offsets
+# are two (268800 and 279552, against an MTLBuffer of 262144 bytes).
+#
+# The gone-request test makes four requests: a short text of 33 frames (1 pass,
+# 3 hits), a long text that runs to its end with 762 frames (3 passes: 300,
+# 300 and 162 frames, 9 hits), the same long text with a client that goes
+# away (0 hits: it stops in its frame loop, before any codec pass) and the
+# short text again (3 hits). 3 + 9 + 0 + 3 = 15, as in each of three runs.
+#
+# WIDE GEMV, `gemv_wide_bfloat16_nv5_kl32_nc0_axpby0` and
+# `gemv_wide_bfloat16_nv4_kl32_nc0_axpby0` (MLX 0.32.1 and later). Two
+# instantiations of one template, on one pair: gemma-4-e2b and its assistant
+# drafter. The nv5 call is the verifier's per-layer projection in the
+# assistant round loop: five bf16 rows of width 1536 against a bf16 weight of
+# [8960, 1536], one row per drafted token and one more. The nv4 report comes
+# from the sampled sidecar arm on the same pair; its operands were not
+# measured.
+#
+# The reports are not reads the kernel can make. `GemvWide::run` in
+# `mlx/backend/metal/kernels/gemv.h` clamps its row index to the last output
+# row and its vector index to the last vector, and the batch index is 0. The
+# reported offsets are about 2.9e9 bytes before or after a buffer of 27525120
+# bytes (the weight), and in one run three of four reports name `Out of bounds
+# of user address space, length:1` and no buffer. 1500 dispatches of the same
+# product in pure MLX, under the same validation, gave no report. In the first
+# whole `make ci-perf` the ten reports were five at about 7.0e8 bytes that
+# name `Out of bounds of user address space, length:1`, and five at about
+# 6.7e8 bytes before the buffer of 27525120 bytes.
+#
+# The count is not reproducible. Five runs of the test under validation on mlx
+# 0.32.3 / mlx-c 0.7.0 gave 6, 3, 4, 1 and 4, and the derivation run below gave
+# 4. The first whole `make ci-perf` gave 10, and a run of the test alone after
+# it gave 5, so the entry is `<=10`. In four of the first five the run was
+# compared with an unvalidated run of the same binary: the six round streams
+# (746 lines) are byte-identical and so are the twelve output strings, at each
+# count. At the count of 10, the lines the test prints (round counts, stream
+# byte counts, oracle figures and the twelve output strings) are identical in
+# the validated and the unvalidated run. So the zero-filled lanes reached no
+# token and no round decision.
+#
+# The nv4 count is not reproducible either. The derivation run below reported
+# no nv4 diagnostic. The first whole `make ci-perf` gave 1, and three runs of
+# `a_sampled_sidecar_arm_draws_from_the_verifiers_distribution` alone after it
+# gave 0, 1 and 0, so the entry is `<=1`. Each report is one device load at
+# about 2.88e9 bytes that names `Out of bounds of user address space,
+# length:1` and no buffer. The figures the test prints for its two arms (the
+# token counts, the z scores, the mean top probability) are identical in each
+# of the four validated runs and in the unvalidated runs, so the report
+# changed no drawn token.
+#
+# Two more tests drive the nv5 call on gemma-4-e2b, and their counts are not
+# reproducible either. `a_gone_request_frees_the_gpu_on_the_round_loop_with_the_assistant`
+# in `rmlx-server` (the assistant pair through the server) gave 5, 1 and 0 in
+# three runs, so its entry is `<=5`; the test passed in each validated and
+# each unvalidated run, and it holds the tokens after the stop equal to the
+# tokens of the cold run. `print_the_seeded_stochastic_streams_for_a_cross_commit_diff`
+# in `rmlx-models` (the sampled two-model pair) gave 1 in one run of the
+# branch that added the stop of a request, then 0 and 0 on that branch and 0
+# and 0 on its base, so its entry is `<=1`. The 16 seeded streams it prints are
+# identical in the run with the report, in its unvalidated run and in the four
+# later validated runs, so the report changed no drawn token.
+#
+# What produces these reports inside the validation layer is not known. It is
+# not known if they show a defect of the MLX kernel or an artifact of the
+# instrument, or if the same access occurs without the instrument. The four
+# entries waive a count that is not reproducible; they explain nothing.
+#
+# The buffer length beside each diagnostic is the MTLBuffer MLX allocated from a
+# size bucket, not the tensor, so it does not identify the operand; the
+# arguments above do not depend on which operand overruns.
+#
+# DERIVED ON one complete `make gpu-test` on mlx 0.32.3 / mlx-c 0.7.0, every
+# diagnostic attributed to the test libtest last announced, on a host holding
+# every snapshot the suite resolves by slug, with threadgroup-memory validation
+# split per test (`scripts/suite/gpu_test_classes.sh threadgroup`); every entry below comes
+# from a test that ran with it off. Totals: 4 conv in
+# `rmlx-mlx`, 18 conv in `rmlx-server`, 4 gemv in `rmlx-models`.
+#
+# That run left cells standing down for want of `RMLX_KV_TEST_MODEL` or
+# `RMLX_TEST_MODEL_JINA_V4`, and `integration_*` cells of `rmlx-models` for want
+# of their `RMLX_TEST_MODEL_*` variable. The runner lists the stand-downs of
+# every run, and the list depends on the snapshots the host holds. Filtered
+# runs on the same tree armed each of them and reported no diagnostic, so they
+# pin nothing.
+# `RMLX_KV_TEST_MODEL` was not set in the complete run on purpose: it outranks
+# the slug of every golden-rule cell of its architecture (docs/TESTING.md).
+#
+# NOT YET SHOWN. No run has printed `census matches the pin` against this file
+# for the whole suite, or for `rmlx-models` whole. The derivation run read the
+# hits; it was not compared with these entries. One whole `make ci-perf`, on
+# the commit before the two wide-gemv entries got their present counts, passed
+# every test in both halves and ended red on the census with those two deltas
+# and no other. No whole run has been made since. Delete this paragraph when a
+# whole run matches.
+implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 4 | rmlx-mlx | implicit_gemm_conv_tail_channel_reads_never_reach_the_output | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
+implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 6 | rmlx-server | tts_first_synthesis_runs_on_a_thread_that_did_not_load_it | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
+implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 12 | rmlx-server | tts_synthesizes_on_a_thread_that_did_not_load_it | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
+implicit_gemm_conv_2d_float32_bm64_bn64_bk16_wm2_wn2_channel_l_filter_s | device load | 15 | rmlx-server | a_gone_speech_request_frees_the_gpu_and_the_next_one_speaks_the_same_audio | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/562
+gemv_wide_bfloat16_nv5_kl32_nc0_axpby0 | device load | <=10 | rmlx-models | the_assistant_round_loop_reproduces_plain_greedy | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/638
+gemv_wide_bfloat16_nv4_kl32_nc0_axpby0 | device load | <=1 | rmlx-models | a_sampled_sidecar_arm_draws_from_the_verifiers_distribution | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/638
+gemv_wide_bfloat16_nv5_kl32_nc0_axpby0 | device load | <=1 | rmlx-models | print_the_seeded_stochastic_streams_for_a_cross_commit_diff | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/638
+gemv_wide_bfloat16_nv5_kl32_nc0_axpby0 | device load | <=5 | rmlx-server | a_gone_request_frees_the_gpu_on_the_round_loop_with_the_assistant | docs/GPU_TESTS.md + https://github.com/Pushkinist/rMLX/issues/638

@@ -107,7 +107,7 @@ under `layers/`.
 3. **Update the NaN gate.** `make check-no-decode-swallow` RULE 4 pins the
    number of `count_nan_in_bytes` and guard call sites. Each must propagate
    before `step_fn`. A new arch moves both counts; update them in
-   `scripts/check_no_decode_swallow.sh`.
+   `scripts/check/no_decode_swallow.sh`.
 4. **Pass the f32-leak gate**, `make check-no-scalar-f32-leak`. It scans
    `rmlx-kv-quant`, `rmlx-models` and `rmlx-mlx` source, minus `laguna/`,
    for `scalar_f32(` with no guard. An f32 scalar combined with a bf16

@@ -130,7 +130,7 @@ strings "$(brew --prefix mlx)/lib/mlx.metallib" | grep -c steel_gemm_fused_nax
 and measured on. It does not limit `rmlx serve`. On M5 and later, and on a
 Mac whose chip cannot be identified, `rmlx bench` and `rmlx baseline` refuse
 to measure when the loaded pair is not the pinned one with the NAX kernels.
-`rmlx healthcheck` and `make mlx-preflight` report the same verdict.
+`rmlx healthcheck` reports the same verdict as its `mlx_pin` line.
 
 rMLX builds against the mlx-c 0.6 and the 0.7 C API. When Homebrew moves
 `mlx-c` to the other C API under an installed `rmlx`, rMLX does not make the

@@ -1,7 +1,7 @@
 # Synthetic KV_ROTATION_CODECS.md
 
 Stand-in for `docs/KV_ROTATION_CODECS.md`, the second doc the gate lists in
-`BANNER_DOCS`, read only by `scripts/check_kv_codec_disposition_fixtures.sh`.
+`BANNER_DOCS`, read only by `scripts/check/engine_parity_selftest.sh`.
 
 ### fixinert2
 

@@ -1,5 +1,7 @@
 """The engine's default KV boundary-layer counts, read from the engine.
 
+Module of: ingest/ingest.py
+
 `rmlx_core::kv_boundary` is the one definition of these numbers — it exists so
 that `rmlx-models` (which applies them) and `rmlx-metrics` (which has to
 recognise a `decode_config` spelling them out) cannot drift apart. A Python
@@ -9,7 +11,7 @@ non-default sweep under the default cell, permanently, in an append-only table.
 So this reads the constants rather than restating them, and raises when it
 cannot. A parse that silently falls back to a literal would be the copy again.
 
-`scripts/check_kv_boundary_default_parity.sh` (in `make ci`) checks the other
+`scripts/check/engine_parity.sh kv-boundary-default` (in `make ci`) checks the other
 direction: that the CLI help and `docs/CLI.md` still name the same pair.
 """
 

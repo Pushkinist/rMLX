@@ -1,0 +1,64 @@
+# Planted scan roots for check/kernel_dispatch.sh input-eval: the exit code and the reason for each.
+#
+# Columns, tab-separated, none empty ("-" for none): fixture (a directory beside this
+# table), args (gate arguments, "{}" is the fixture path), stream (both, out or err: the
+# gate's output the needles are read from), exit (exact), has (strings that must all
+# appear), lacks (strings none of which may appear), is (the whole output; "\t" is a
+# tab), what (what the case proves). Needles are fixed strings separated by ";;".
+# In has, "A;>B" is one needle: B must appear after the first A.
+#
+# A source gate is only worth its runtime if it still fires when the thing it
+# looks for is spelled differently, moved, or hidden one call deep. Each
+# fixture under `scripts/fixtures/no_kernel_input_eval/` is a synthetic scan
+# root paired with the exit code the gate must produce for it. A gate change
+# that loses recall fails here instead of passing silently on the real tree.
+# A row that must fail also names the call it is about and lacks the dispatcher floor's
+# message: the floor fails with the same exit code, so the code alone proves nothing.
+
+clean	--root {} --min 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL	-	a dispatcher with no eval passes
+plain_eval	--root {} --min 1	both	1	check-no-kernel-input-eval: FAIL;;plain_eval/alpha_msl.rs:3: q.eval()?;	expected at least	-	the plain x.eval() spelling is caught
+ufcs_eval	--root {} --min 1	both	1	check-no-kernel-input-eval: FAIL;;ufcs_eval/alpha_msl.rs:3: Array::eval(q)?;	expected at least	-	the UFCS Array::eval(&x) spelling is caught
+common_helper	--root {} --min 2	both	1	check-no-kernel-input-eval: FAIL;;common_helper/flash_decode_common.rs:4: a.eval()	expected at least	-	an eval hidden in a shared _common.rs scaffold is caught
+nested_dir	--root {} --min 1	both	1	check-no-kernel-input-eval: FAIL;;nested_dir/sub/alpha_msl.rs:4: q.eval()?;	expected at least	-	a dispatcher in a sub-directory is still scanned
+marker_same_line	--root {} --min 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL	-	a same-line eval-ok marker exempts its own call
+marker_same_line_does_not_leak	--root {} --min 1	both	1	check-no-kernel-input-eval: FAIL;;marker_same_line_does_not_leak/alpha_msl.rs:4: b.eval()?;	expected at least;;marker_same_line_does_not_leak/alpha_msl.rs:3:	-	a same-line marker exempts its own call, not the call on the next line
+marker_above	--root {} --min 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL	-	an eval-ok marker on the lines above exempts one call
+marker_leaks_to_loop	--root {} --min 1	both	1	check-no-kernel-input-eval: FAIL;;marker_leaks_to_loop/alpha_msl.rs:7: arr.eval()?;	expected at least;;marker_leaks_to_loop/alpha_msl.rs:5:	-	one marker exempts one call, not a following loop
+marker_then_statement	--root {} --min 1	both	1	check-no-kernel-input-eval: FAIL;;marker_then_statement/alpha_msl.rs:5: q.eval()?;	expected at least	-	a marker does not survive a plain statement between it and the call
+trailing_comment	--root {} --min 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL	-	a comment naming .eval() is not itself a call
+empty_tree	--root {} --min 1	both	1	found 0 dispatcher/scaffold files under;;but expected at least 1.	check-no-kernel-input-eval: FAIL;;check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	-	an empty scan root fails on the pinned floor instead of passing vacuously
+clean	--root {} --min 2	both	1	found 1 dispatcher/scaffold files under;;but expected at least 2.	check-no-kernel-input-eval: FAIL;;check-no-kernel-input-eval: ok	-	fewer dispatchers than the pinned floor fails
+tests_excluded	--root {} --min 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL	-	a *_tests.rs and a tests.rs dispatcher are out of scope, and only the one in-scope file is counted
+clean	--root {}	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL	-	with --root and no --min the floor is 1, not the floor of the derived roots
+clean	--root {}/absent --min 1	both	2	scan root does not exist	check-no-kernel-input-eval: ok	-	a scan root that does not exist is refused, not scanned as empty
+clean	--root {} --min 0	both	2	usage: bash scripts/check/kernel_dispatch.sh	check-no-kernel-input-eval: ok	-	a floor of zero is a usage error, since a floor of zero is no floor
+clean	--root {} --min	both	2	usage: bash scripts/check/kernel_dispatch.sh	check-no-kernel-input-eval: ok	-	--min without a value is a usage error
+clean	--root {} --min 1 --min 1	both	2	usage: bash scripts/check/kernel_dispatch.sh	check-no-kernel-input-eval: ok	-	a repeated --min is a usage error, not last-one-wins
+string_slashes_before_eval	--root {} --min 1	both	1	check-no-kernel-input-eval: FAIL;;string_slashes_before_eval/alpha_msl.rs:4: let url = "a//b"; q.eval()?;	expected at least	-	two slashes inside a string literal do not start a comment that hides the call after them
+string_holds_marker_text	--root {} --min 1	both	1	check-no-kernel-input-eval: FAIL;;string_holds_marker_text/alpha_msl.rs:4: let note = "// eval-ok: not a comment"; q.eval()?;	expected at least	-	marker text inside a string literal is no marker
+string_then_marker	--root {} --min 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL	-	a real marker after a string literal with two slashes still exempts its call
+string_then_comment	--root {} --min 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL	-	a comment after a string literal with two slashes is still a comment
+char_quote_marker	--root {} --min 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL	-	a quote inside the character literals '"' and '\"' opens no string, so the marker after them is still a comment
+char_quote_hides_eval	--root {} --min 1	both	1	check-no-kernel-input-eval: FAIL;;char_quote_hides_eval/alpha_msl.rs:4: let c = '"'; let s = "a//b"; q.eval();;char_quote_hides_eval/alpha_msl.rs:5: let d = '\"'; let s = "a//b"; q.eval()	expected at least	-	a quote inside the character literals '"' and '\"' does not flip the string state, so the call behind a later string is still code
+common_without_dispatcher	--root {} --min 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL;;x_common.rs;;y_common.rs;;parent_common.rs	-	a _common.rs with no dispatcher in its own directory is not scanned, whether the dispatcher is elsewhere, one level down or in a directory whose name starts the same
+common_beside_nested	--root {} --min 2	both	1	check-no-kernel-input-eval: FAIL;;common_beside_nested/sub/deep/deep_common.rs:3: a.eval()	expected at least	-	a _common.rs beside a dispatcher in a sub-directory is scanned
+self_dispatching_common	--root {} --min 2	both	1	check-no-kernel-input-eval: FAIL;;self_dispatching_common/flash_common.rs:4: q.eval();;self_dispatching_common/other_common.rs:3: a.eval()	expected at least	-	a _common.rs that is itself a dispatcher is scanned, and so is the _common.rs beside it
+two_roots	--root {}/crate_a/src --root {}/crate_b/src --min 3	both	1	check-no-kernel-input-eval: FAIL;;two_roots/crate_b/src/b_msl.rs:4: q.eval();;two_roots/crate_b/src/b_common.rs:3: a.eval()	expected at least	-	a dispatcher in a second crate root is scanned, and so is the _common.rs beside it
+two_roots	--root {}/crate_a/src --min 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL;;crate_b	-	a root that is not given is not scanned
+two_roots	--root {}/crate_a/src --root {}/crate_a/src --min 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL	-	a root given twice is scanned once
+eval_space	--root {} --min 1	both	1	check-no-kernel-input-eval: FAIL;;eval_space/alpha_msl.rs:4: q.eval ()	expected at least	-	a space between eval and its parenthesis does not hide the call
+marker_no_colon	--root {} --min 1	both	1	check-no-kernel-input-eval: FAIL;;marker_no_colon/alpha_msl.rs:4: q.eval()?; // eval-ok	expected at least	-	an eval-ok marker without a reason after its colon exempts nothing
+common_name_suffix	--root {} --min 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL;;xcommon.rs	-	only a name ending in _common.rs makes a scaffold, not one that ends in common.rs
+kernel_word_only	--root {} --min 1	both	0	check-no-kernel-input-eval: ok (1 dispatcher/scaffold files scanned)	check-no-kernel-input-eval: FAIL;;other.rs	-	a file that names MetalKernel and constructs no MetalKernelInvoke is not a dispatcher
+clean	--root {} --min abc	both	2	usage: bash scripts/check/kernel_dispatch.sh	check-no-kernel-input-eval: ok	-	a non-numeric --min is a usage error
+clean	--root {} --min 00	both	2	usage: bash scripts/check/kernel_dispatch.sh	check-no-kernel-input-eval: ok	-	a --min with a leading zero is a usage error, not a floor of zero
+clean	--root {} --min 05	both	2	usage: bash scripts/check/kernel_dispatch.sh	check-no-kernel-input-eval: ok	-	a --min with a leading zero is a usage error even when the number is not zero
+clean	--root {} --min 99999999999999999999	both	2	usage: bash scripts/check/kernel_dispatch.sh	check-no-kernel-input-eval: ok	-	a --min of more than nine digits is a usage error, not a floor the shell's integer test cannot read
+clean	--root {} --min 1000000000	both	2	usage: bash scripts/check/kernel_dispatch.sh	check-no-kernel-input-eval: ok	-	a --min of ten digits is a usage error
+clean	--root {} --min 999999999	both	1	found 1 dispatcher/scaffold files under;;but expected at least 999999999.	check-no-kernel-input-eval: ok	-	a --min of nine digits is a floor
+clean	--root {}/alpha_msl.rs --min 1	both	2	scan root is not a directory	scan root does not exist;;check-no-kernel-input-eval: ok	-	a scan root that is a file is refused as not a directory, not scanned and not reported as missing
+clean	--root {} --root {}/absent --min 1	both	2	scan root does not exist	check-no-kernel-input-eval: ok	-	every root given is checked, not only the first
+clean	!bogus --root {} --min 1	both	2	usage: bash scripts/check/kernel_dispatch.sh	check-no-kernel-input-eval: ok	-	an unknown mode is a usage error
+clean	! --root {} --min 1	both	2	usage: bash scripts/check/kernel_dispatch.sh	check-no-kernel-input-eval: ok	-	no mode at all is a usage error
+clean	!scalar-f32 --root {}	both	0	check-no-scalar-f32-leak: ok (1 files scanned)	check-no-kernel-input-eval	-	a leading !mode replaces the mode of the table
+two_roots	--root {}/crate_b/src --root {}/crate_a/src --min 3	both	1	check-no-kernel-input-eval: FAIL;;two_roots/crate_b/src/b_msl.rs:4: q.eval();;two_roots/crate_b/src/b_common.rs:3: a.eval()	expected at least	-	the first root given is scanned too, not only the last

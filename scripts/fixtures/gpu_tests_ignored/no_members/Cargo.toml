@@ -1,0 +1,5 @@
+# Synthetic workspace for scripts/check/rust_gates_fixtures.sh.
+# Never built — the member list is empty, which is what a layout the parser cannot read looks like.
+[workspace]
+members = [
+]

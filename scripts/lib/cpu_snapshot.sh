@@ -1,7 +1,7 @@
-#!/usr/bin/env bash
-# cpu_snapshot.sh — per-process cumulative CPU seconds, for interference gates.
+# Per-process cumulative CPU seconds, for interference gates; source it.
 #
-# Defines one function. Source it; do not execute it.
+# Defines `cpu_snapshot`, `snapshot_ok`, `window_not_sampled` and `classify_window`, which
+# every A/B and sweep harness shares. Source it; do not execute it.
 #
 #     source "$REPO_ROOT/scripts/lib/cpu_snapshot.sh"
 #     cpu_snapshot /tmp/before
@@ -83,9 +83,9 @@ cpu_snapshot() {
 # and one exercising its own logic against stub arms. A stub arm is not a
 # workload, so no fact about this machine belongs in that run's answer -- and a
 # gate whose result depends on what else the machine is doing teaches everyone
-# to re-run it until it goes green. Both harnesses (`perf_ab.sh`,
-# `bench_llama_ab.sh`) set it from their own `--synthetic-arms` flag; it is read
-# here and in each harness's window classifier, via `window_not_sampled`.
+# to re-run it until it goes green. Both harnesses (`bench/ab.sh`,
+# `bench/llama_ab.sh`) set it from their own `--synthetic-arms` flag; it is read
+# here and in `classify_window`, via `window_not_sampled`.
 snapshot_ok() {
 	if ${SYNTHETIC_ARMS:-false}; then
 		: >"$1.not-sampled"
@@ -101,4 +101,41 @@ snapshot_ok() {
 # True when the window between snapshots $1 and $2 was deliberately not sampled.
 window_not_sampled() {
 	[ -e "$1.not-sampled" ] || [ -e "$2.not-sampled" ]
+}
+
+# "<state> <pct> <comm>" for the window between snapshots $1 and $2, $3 seconds apart.
+# state is one of busy | quiet | unmeasured | not-sampled. The caller sets AWK_BUSIEST (the path of
+# busiest_between.awk) and BUSY_PCT (the share of one core, in percent, at which a foreign process is busy).
+#
+# `unmeasured` stays distinct from `quiet` all the way into the report, and it
+# covers three different ways of not knowing: the window was too short to divide
+# by, a snapshot was empty, or `ps` failed outright. Folding any of them into
+# "nothing was running" is how an interference gate quietly stops gating.
+classify_window() {
+	local raw pct
+	if window_not_sampled "$1" "$2"; then
+		echo "not-sampled - -"
+		return
+	fi
+	if [[ -e "$1.failed" || -e "$2.failed" ]]; then
+		echo "unmeasured - -"
+		return
+	fi
+	raw="$(awk -v window="$3" -f "$AWK_BUSIEST" "$1" "$2")"
+	case "${raw%% *}" in
+	unmeasured)
+		echo "unmeasured - -"
+		;;
+	idle)
+		echo "quiet 0.0 -"
+		;;
+	*)
+		pct="$(echo "$raw" | awk '{print $2}')"
+		if awk -v p="$pct" -v t="$BUSY_PCT" 'BEGIN { exit !(p >= t) }'; then
+			echo "busy ${raw#* }"
+		else
+			echo "quiet ${raw#* }"
+		fi
+		;;
+	esac
 }
