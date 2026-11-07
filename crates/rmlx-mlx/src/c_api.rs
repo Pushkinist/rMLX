@@ -2,17 +2,20 @@
 //! loaded.
 //!
 //! mlx-c 0.7.0 adds `bool force_fused` in front of the stream argument of
-//! `mlx_fast_scaled_dot_product_attention` and keeps the symbol name. dyld
-//! links a binary built against one C API to a `libmlxc.dylib` of the other
-//! with no error, and the call then reads its stream from the wrong register.
+//! `mlx_fast_scaled_dot_product_attention`, and mlx-c 0.8.0 adds a
+//! `global_scale` argument to `mlx_gather_qmm`. Both keep the symbol name. dyld
+//! links a binary built against one C API to a `libmlxc.dylib` of another with
+//! no error, and the call then reads its arguments from the wrong registers.
 //! This happens when Homebrew moves `mlx-c` under an installed `rmlx`, and to
-//! a release tarball on a Mac with the other `mlx-c`.
+//! a release tarball on a Mac with another `mlx-c`.
 //!
-//! [`verdict`] compares the two once per process. The SDPA wrapper refuses the
-//! call on a mismatch, and the one-shot MLX init logs it as an error.
+//! [`verdict`] compares the two once per process. The SDPA and `gather_qmm`
+//! wrappers refuse the call on a mismatch, and the one-shot MLX init logs it as
+//! an error.
 //!
-//! The probe tells the 0.6 C API from the 0.7 one and nothing else. A later
-//! mlx-c that keeps the 0.7 marker and changes another signature reads as 0.7.
+//! The probe tells the 0.6, 0.7 and 0.8 C APIs apart by one marker export each
+//! and nothing else. A later mlx-c that keeps the 0.8 marker and changes another
+//! signature reads as 0.8.
 
 use std::ffi::{c_char, c_void, CString};
 use std::sync::OnceLock;
@@ -26,29 +29,30 @@ pub(crate) enum CApi {
     V0_6,
     /// mlx-c 0.7: the same function takes 10, with `force_fused`.
     V0_7,
+    /// mlx-c 0.8: `mlx_gather_qmm` takes 14 arguments where 0.6 and 0.7 take
+    /// 13, with `global_scale`.
+    V0_8,
 }
 
 impl CApi {
     /// The C API of the headers `build.rs` compiled this crate against.
-    pub(crate) const COMPILED: Self = if cfg!(mlxc_c_api_0_7) {
+    pub(crate) const COMPILED: Self = if cfg!(mlxc_c_api_0_8) {
+        Self::V0_8
+    } else if cfg!(mlxc_c_api_0_7) {
         Self::V0_7
     } else {
         Self::V0_6
     };
 
-    /// The other C API.
+    /// Every C API, for tests that cover each of them.
     #[cfg(test)]
-    pub(crate) const fn other(self) -> Self {
-        match self {
-            Self::V0_6 => Self::V0_7,
-            Self::V0_7 => Self::V0_6,
-        }
-    }
+    pub(crate) const ALL: [Self; 3] = [Self::V0_6, Self::V0_7, Self::V0_8];
 
     const fn name(self) -> &'static str {
         match self {
             Self::V0_6 => "mlx-c 0.6",
             Self::V0_7 => "mlx-c 0.7",
+            Self::V0_8 => "mlx-c 0.8",
         }
     }
 }
@@ -58,7 +62,7 @@ impl CApi {
 pub(crate) enum CApiVerdict {
     /// The loaded `libmlxc.dylib` has the C API this crate was compiled for.
     Match(CApi),
-    /// It has the other one. The SDPA call must not be made.
+    /// It has another one. The SDPA and `gather_qmm` calls must not be made.
     Mismatch { compiled: CApi, loaded: CApi },
 }
 
@@ -85,12 +89,13 @@ impl CApiVerdict {
 pub(crate) fn mismatch_message(compiled: CApi, loaded: CApi) -> String {
     format!(
         "mlx-c C API mismatch: this binary was compiled against the {} C API, but the \
-         loaded libmlxc.dylib has the {} C API. mlx_fast_scaled_dot_product_attention takes \
-         a different argument list in the two, so rMLX does not call it. Rebuild rMLX \
+         loaded libmlxc.dylib has the {} C API. mlx_fast_scaled_dot_product_attention \
+         (0.6 against later) and mlx_gather_qmm (0.8 against earlier) take a different \
+         argument list across the C APIs, so rMLX calls neither. Rebuild rMLX \
          against the loaded mlx-c (in a checkout, `cargo clean -p rmlx-mlx` and build \
          again; a Homebrew install, `brew reinstall rmlx`), or load the mlx-c it was \
          built against, which is the only fix for a release tarball. See \
-         docs/MLX_PAIR.md, \"Two mlx-c C APIs\".",
+         docs/MLX_PAIR.md, \"Three mlx-c C APIs\".",
         compiled.name(),
         loaded.name(),
     )
@@ -102,10 +107,13 @@ pub(crate) fn verdict() -> CApiVerdict {
     *VERDICT.get_or_init(|| CApiVerdict::classify(CApi::COMPILED, loaded()))
 }
 
-/// The C API of the loaded `libmlxc.dylib`, from whether it exports the
-/// marker function of the 0.7 C API (declared once, in `build_support.rs`).
+/// The C API of the loaded `libmlxc.dylib`, from whether it exports the marker
+/// function of the 0.8 C API, then of the 0.7 one (declared once, in
+/// `build_support.rs`).
 fn loaded() -> CApi {
-    if process_exports(env!("RMLX_MLXC_0_7_MARKER")) {
+    if process_exports(env!("RMLX_MLXC_0_8_MARKER")) {
+        CApi::V0_8
+    } else if process_exports(env!("RMLX_MLXC_0_7_MARKER")) {
         CApi::V0_7
     } else {
         CApi::V0_6

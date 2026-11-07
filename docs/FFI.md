@@ -92,11 +92,10 @@ So no decode path on any codec reaches NAX. `mpp::tensor_ops::matmul2d`
 allows an `M` below MLX's shipped tile, so the tile is not what keeps decode
 off NAX.
 
-### Two mlx-c C APIs
+### Three mlx-c C APIs
 
-rMLX compiles against the mlx-c 0.6 and the 0.7 C API, and refuses the one
-call whose argument list differs when the loaded `libmlxc.dylib` has the
-other C API: [`docs/MLX_PAIR.md`](MLX_PAIR.md#two-mlx-c-c-apis).
+rMLX compiles against the mlx-c 0.6, 0.7 and 0.8 C API, and refuses the calls
+whose argument lists differ when the loaded `libmlxc.dylib` has another: [`docs/MLX_PAIR.md`](MLX_PAIR.md#three-mlx-c-c-apis).
 
 ### Runtime version skew
 
@@ -141,14 +140,14 @@ The warning names prefill and TTFT only, because NAX is unreachable at decode.
 3. Inner attributes (`#![...]`) that bindgen emits at the file head are
    stripped; they are illegal at the `include!` site in `sys.rs`.
 4. The MLX version from `version.h` is baked in as `RMLX_MLX_BUILD_VERSION`,
-   and the mlx-c C API of the bindings as `cfg(mlxc_c_api_0_7)`.
+   and the mlx-c C API of the bindings as `cfg(mlxc_c_api_0_7)` (0.7 or
+   later) and `cfg(mlxc_c_api_0_8)`.
 5. Rebuild triggers: `MLX_C_PREFIX`, `MLX_PREFIX`, `wrapper.h`,
    `build_support.rs`, and a *newer* `mlx/version.h` of mlx or
-   `mlx/c/fast.h` / `mlx/c/compile.h` of mlx-c, the two headers that decide
-   `cfg(mlxc_c_api_0_7)`. Each file trigger is registered only when the file
+   `mlx/c/{fast,compile,ops}.h` of mlx-c, which decide the cfgs. Each file trigger is registered only when the file
    exists. Repointing `opt` to an older keg does not re-run the script; use
    `cargo clean -p rmlx-mlx`. A stale C API choice then fails at run time
-   ([Two mlx-c C APIs](#two-mlx-c-c-apis)).
+   ([Three mlx-c C APIs](#three-mlx-c-c-apis)).
 6. rpath entries for both prefixes let the binary run without
    `DYLD_LIBRARY_PATH`.
 

@@ -710,7 +710,7 @@ fn a_c_api_mismatch_names_the_restore_only_when_the_pair_also_needs_it() {
 
 /// `pin_check` hands the C API verdict to its callers, which is how a mismatch
 /// reaches the hosts the pin does not bind. On a matched pair both sides are
-/// true; only a cross-pair run (docs/MLX_PAIR.md, "Two mlx-c C APIs") makes
+/// true; only a cross-pair run (docs/MLX_PAIR.md, "Three mlx-c C APIs") makes
 /// them false.
 #[test]
 fn the_pin_check_carries_the_c_api_verdict() {

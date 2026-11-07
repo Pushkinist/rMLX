@@ -20,7 +20,7 @@ do not change.
 
 | Mac | What to do |
 |---|---|
-| M1–M4, any macOS | Nothing for the kernels: `brew install mlx-c` gives a pair rMLX compiles against, and the pin does not bind. On that pair `rmlx healthcheck` reports `mlx_pin` info, and `rmlx baseline` and `rmlx bench` run. They stop on an mlx-c C API mismatch, as on every Mac ([Two mlx-c C APIs](#two-mlx-c-c-apis)). |
+| M1–M4, any macOS | Nothing for the kernels: `brew install mlx-c` gives a pair rMLX compiles against, and the pin does not bind. On that pair `rmlx healthcheck` reports `mlx_pin` info, and `rmlx baseline` and `rmlx bench` run. They stop on an mlx-c C API mismatch, as on every Mac ([Three mlx-c C APIs](#three-mlx-c-c-apis)). |
 | M5 and later, macOS 27 or later | The Homebrew bottle for macOS 27 carries the kernels, so `brew upgrade mlx mlx-c` (or `brew reinstall mlx` at the same version) gives `rmlx serve` the NAX kernels. While Homebrew ships the versions that `mlx-pin.txt` names, that bottle also passes the pin gate. When Homebrew ships another version, `rmlx baseline` and `rmlx bench` refuse it and `rmlx healthcheck` reports `mlx_pin` red. To measure then, build the pinned pair from source ([below](#building-the-pinned-pair)). |
 | M5 and later, macOS 26.2 to 26.x | `rmlx serve` runs on the Homebrew bottle, with slower prefill and the startup warning. For the kernels, build the pair from source ([below](#building-the-pinned-pair)). The macOS 26 bottle has no NAX kernels, and a plain `brew install --build-from-source mlx` has none either: the formula sets the deployment target to `26`. `rmlx baseline` and `rmlx bench` refuse the bottle. |
 | M5 and later, below macOS 26.2 | No fix. Update macOS. Until then `rmlx serve` runs with slower prefill and the warning, and `rmlx baseline` and `rmlx bench` refuse. |
@@ -193,7 +193,7 @@ restore script interpolates them into Cellar paths and Ruby text.
 kernels buy nothing there. A host whose chip cannot be identified is held to
 the pin, so that it cannot pass without a check, and
 `the_gate_can_tell_which_host_it_is_on` fails there. The C API verdict is not
-scoped: a mismatch fails on every host ([Two mlx-c C APIs](#two-mlx-c-c-apis)).
+scoped: a mismatch fails on every host ([Three mlx-c C APIs](#three-mlx-c-c-apis)).
 
 **It runs where numbers are made.** `PinCheck::refusal` is the one verdict,
 and it names its cause: a C API mismatch, or a pair that is not the pinned
@@ -218,32 +218,42 @@ mlx's version comes from `include/mlx/version.h`. mlx-c ships no version
 header; its identity is the keg directory name, the only place the revision
 suffix appears.
 
-## Two mlx-c C APIs
+## Three mlx-c C APIs
 
-rMLX compiles against the mlx-c 0.6 and the 0.7 C API. Of the functions it
-calls, one differs: 0.7 adds `bool force_fused` in front of the stream of
-`mlx_fast_scaled_dot_product_attention`. `build.rs` classifies the generated
-bindings (9 parameters and no `mlx_compile_cache_new`, or 10 parameters and
-that function; anything else stops the build) and sets `cfg(mlxc_c_api_0_7)`
-for the call. rMLX passes `force_fused = false`, which keeps MLX's own
-routing.
+rMLX compiles against the mlx-c 0.6, 0.7 and 0.8 C API. Of the functions it
+calls, two differ: 0.7 adds `bool force_fused` in front of the stream of
+`mlx_fast_scaled_dot_product_attention`, and 0.8 adds `global_scale` in front
+of `sorted_indices` in `mlx_gather_qmm`. `build.rs` classifies the generated
+bindings by the two arities and two marker functions, and anything else stops
+the build:
 
-The symbol name is the same in both, so dyld links a binary built against
-one C API to a `libmlxc.dylib` of the other with no error. This happens when
-Homebrew moves `mlx-c` under an installed `rmlx`, and to a release tarball on
-a Mac with the other `mlx-c`. The call then reads its stream from the wrong
-argument slot: measured, a 0.7 binary on the 0.6 library fails with
+| C API | SDPA parameters | `mlx_compile_cache_new` | `mlx_gather_qmm` parameters | `mlx_matrix_transpose` |
+|---|---|---|---|---|
+| 0.6 | 9 | not declared | 13 | not declared |
+| 0.7 | 10 | declared | 13 | not declared |
+| 0.8 | 10 | declared | 14 | declared |
+
+`cfg(mlxc_c_api_0_7)` means 0.7 or later and `cfg(mlxc_c_api_0_8)` means 0.8.
+rMLX passes `force_fused = false`, which keeps MLX's own routing, and a null
+`global_scale`, which is upstream's `std::nullopt`.
+
+The symbol names are the same in all three, so dyld links a binary built
+against one C API to a `libmlxc.dylib` of another with no error. This happens
+when Homebrew moves `mlx-c` under an installed `rmlx`, and to a release tarball
+on a Mac with another `mlx-c`. The call then reads its arguments from the wrong
+slots: measured, a 0.7 binary on the 0.6 library fails with
 `expected a non-empty mlx_stream`, and a 0.6 binary on the 0.7 library reads
 `force_fused = true`.
 
 `src/c_api.rs` finds the C API of the loaded library from whether it exports
-`mlx_compile_cache_new`, which the same upstream mlx-c commit adds. That tells
-the 0.6 C API from the 0.7 one and nothing else: a later mlx-c that keeps the
-function and changes another signature reads as 0.7. The verdict is taken
-once per process, and a mismatch fails on every Mac, M1–M4 included:
+`mlx_matrix_transpose` (0.8) or `mlx_compile_cache_new` (0.7), which the
+upstream releases add. That tells the three C APIs apart and nothing else: a
+later mlx-c that keeps the 0.8 function and changes another signature reads as
+0.8. The verdict is taken once per process, and a mismatch fails on every Mac,
+M1–M4 included:
 
-- the SDPA wrapper returns `Err` naming both C APIs and does not call mlx-c,
-  so any command fails at its first attention call;
+- the SDPA and `gather_qmm` wrappers return `Err` naming both C APIs and do
+  not call mlx-c, so any command fails at its first attention call;
 - the one-shot MLX init logs the mismatch as an error;
 - `rmlx healthcheck` reports `mlx_pin` red, `rmlx baseline` and `rmlx bench`
   refuse before a model loads.
@@ -264,7 +274,8 @@ build against one pair, then run with `DYLD_LIBRARY_PATH` set to the `lib`
 directories of both kegs of the other pair (set it on the command itself;
 macOS drops `DYLD_*` at a protected binary such as `/usr/bin/env`).
 Measured on an M5 Max, macOS 26.6, with a binary built against mlx 0.32.1 +
-mlx-c 0.6.0_4 run on the pinned mlx 0.32.3 + mlx-c 0.7.0, and the reverse:
+mlx-c 0.6.0_4 run on the pinned mlx 0.32.3 + mlx-c 0.7.0, and the reverse. No
+cross-pair run involving 0.8 was measured; a 0.8 build was only compiled:
 
 | Check | 0.6 binary on the pinned pair | 0.7 binary on 0.32.1 + 0.6.0_4 |
 |---|---|---|
@@ -333,7 +344,7 @@ the mask at the padded rows, the HTTP server path, and speculative prefill.
    names (`brew list --versions mlx mlx-c`).
 3. `cargo clean -p rmlx-mlx` and build. `cargo build -p rmlx-mlx -vv` shows
    whether `build.rs` ran. A new mlx-c C API stops the build in `build.rs`
-   until [Two mlx-c C APIs](#two-mlx-c-c-apis) knows it.
+   until [Three mlx-c C APIs](#three-mlx-c-c-apis) knows it.
 4. Re-derive the evaluation-lock reach set (`scripts/check/eval_lock.sh`
    header), re-run `layout_flag_classifies_views_once_they_are_evaluated` and
    the JIT language probe (`docs/FFI.md`), and derive the GPU census again

@@ -111,7 +111,10 @@ fn a_c_api_mismatch_refuses_sdpa_before_the_mlx_c_call() {
     let (q, k, v) = one_head_attention_inputs().expect("attention inputs");
     let mismatch = CApiVerdict::Mismatch {
         compiled: CApi::COMPILED,
-        loaded: CApi::COMPILED.other(),
+        loaded: CApi::ALL
+            .into_iter()
+            .find(|api| *api != CApi::COMPILED)
+            .expect("three C APIs include one that is not the compiled one"),
     };
     let err = sdpa_under(mismatch, &q, &k, &v, 1.0, "", None, Device::Cpu)
         .expect_err("a C API mismatch must refuse the call");
