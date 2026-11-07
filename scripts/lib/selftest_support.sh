@@ -140,9 +140,9 @@ st_init() {
 st_cleanup() {
 	local rc=$?
 	[ -z "${ST_WORK:-}" ] || rm -rf "$ST_WORK"
-	if [ "$rc" -eq 0 ] && [ -z "${ST_FINISHED:-}" ]; then
+	if [ "$rc" -ne 2 ] && [ -z "${ST_FINISHED:-}" ]; then
 		echo "${ST_SUITE}: the harness ended before its summary" >&2
-		exit 1
+		[ "$rc" -ne 0 ] || exit 1
 	fi
 }
 
